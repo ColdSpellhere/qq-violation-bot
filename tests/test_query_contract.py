@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import sqlite3
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -8,22 +9,34 @@ from unittest.mock import patch
 
 from plugins.violation_record import db, service
 from plugins.violation_record.config import CONFIG
+from plugins.violation_record.reply_models import StructuredReply
+
+
+def flatten_reply(reply: str | StructuredReply) -> str:
+    if isinstance(reply, str):
+        return reply
+    return "\n".join(record.text for record in reply.records)
 
 
 class QueryContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         database_path = Path(self.temp.name) / "business.db"
-        self.config_patch = patch.object(
+        test_config = replace(
+            CONFIG,
+            database_path=database_path,
+            database_url=f"sqlite:///{database_path}",
+            evidence_database_path=Path(self.temp.name) / "evidence.db",
+            evidence_root=Path(self.temp.name) / "evidence",
+        )
+        self.db_config_patch = patch.object(
             db,
             "CONFIG",
-            replace(
-                CONFIG,
-                database_path=database_path,
-                database_url=f"sqlite:///{database_path}",
-            ),
+            test_config,
         )
-        self.config_patch.start()
+        self.service_config_patch = patch.object(service, "CONFIG", test_config)
+        self.db_config_patch.start()
+        self.service_config_patch.start()
         db.init_db()
         with db.connect() as conn:
             conn.execute(
@@ -51,22 +64,45 @@ class QueryContractTests(unittest.TestCase):
                 )
 
     def tearDown(self) -> None:
-        self.config_patch.stop()
+        self.service_config_patch.stop()
+        self.db_config_patch.stop()
         self.temp.cleanup()
 
-    def test_member_query_text_and_order_are_locked(self) -> None:
-        intent = {
+    def _member_intent(self) -> dict:
+        return {
             "group_area": "蜂巢",
             "target": {"qq_number": "123456", "qq_nickname": None},
             "query": {"recent_days": 14},
         }
-        result = service.query_member(intent, "90001", "记录员", False, "m1")
-        self.assertEqual(
+
+    @staticmethod
+    def _member_golden() -> str:
+        return (
             "小明（123456）\n\n当前次数：2\n状态：正常\n\n具体记录：\n\n"
             "1. 2026/7/2 10:00，刷屏，禁言10分钟\n"
-            "2. 2026/7/1 09:00，引战，警告",
-            result,
+            "2. 2026/7/1 09:00，引战，警告"
         )
+
+    def test_member_query_text_and_order_are_locked(self) -> None:
+        intent = self._member_intent()
+        result = service.query_member(intent, "90001", "记录员", False, "m1")
+        self.assertIsInstance(result, StructuredReply)
+        self.assertEqual(self._member_golden(), flatten_reply(result))
+        self.assertTrue(all(record.images == () for record in result.records))
+
+    def test_member_query_fails_open_when_evidence_store_is_unavailable(self) -> None:
+        with (
+            patch.object(service, "EvidenceStore", side_effect=sqlite3.DatabaseError("fixture")),
+            patch.object(service.logger, "warning") as warning,
+        ):
+            result = service.query_member(
+                self._member_intent(), "90001", "记录员", False, "m1"
+            )
+
+        self.assertIsInstance(result, StructuredReply)
+        self.assertEqual(self._member_golden(), flatten_reply(result))
+        self.assertTrue(all(record.images == () for record in result.records))
+        warning.assert_called_once_with("证据查询降级 stage=query error=DatabaseError")
 
     def test_area_query_text_and_order_are_locked(self) -> None:
         intent = {
@@ -75,12 +111,14 @@ class QueryContractTests(unittest.TestCase):
             "_raw": "蜂巢违规记录",
         }
         result = service.query_area_records(intent, "90001", "记录员", "m2")
+        self.assertIsInstance(result, StructuredReply)
         self.assertEqual(
             "蜂巢全部违规记录\n\n记录数：2\n\n具体记录：\n\n"
             "1. 小明（123456） 2026/7/2 10:00，刷屏，禁言10分钟\n"
             "2. 小明（123456） 2026/7/1 09:00，引战，警告",
-            result,
+            flatten_reply(result),
         )
+        self.assertTrue(all(record.images == () for record in result.records))
 
 
 if __name__ == "__main__":

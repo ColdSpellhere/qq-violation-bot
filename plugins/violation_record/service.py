@@ -14,6 +14,7 @@ from .db import connect, dump_json, now_str
 from .evidence_store import EvidenceStore, write_binding_queue
 from .formatter import HELP_TEXT, ambiguous_admins, ambiguous_members, violation_detail
 from .member_resolver import format_member, get_member_by_id, get_or_create_member, resolve_member
+from .reply_models import RecordMessage, StructuredReply
 from .validators import display_time, first_missing, is_countable_action, normalize_action, normalize_status, normalize_time
 
 PENDING_TTL_SECONDS = 180
@@ -198,7 +199,7 @@ def _require_area(intent: dict[str, Any]) -> str | None:
     return None
 
 
-async def handle_intent(intent: dict[str, Any], group_id: str, operator_qq: str, operator_nickname: str | None, message_id: str | None = None) -> str:
+async def handle_intent(intent: dict[str, Any], group_id: str, operator_qq: str, operator_nickname: str | None, message_id: str | None = None) -> str | StructuredReply:
     name = intent["intent"]
     if name == "help":
         return HELP_TEXT
@@ -302,7 +303,7 @@ def _query_range(intent: dict[str, Any]) -> tuple[str, str | None, str | None]:
     return "全部", None, None
 
 
-def query_area_records(intent: dict[str, Any], operator_qq: str, operator_nickname: str | None, message_id: str | None) -> str:
+def query_area_records(intent: dict[str, Any], operator_qq: str, operator_nickname: str | None, message_id: str | None) -> str | StructuredReply:
     area = _require_area(intent)
     label, start, end = _query_range(intent)
     try:
@@ -343,22 +344,36 @@ def query_area_records(intent: dict[str, Any], operator_qq: str, operator_nickna
             {"range": label, "start": start, "end": end, "total": total},
             message_id,
         )
-    lines = [f"{area}{label}违规记录", "", f"记录数：{total}"]
+    header = [f"{area}{label}违规记录", "", f"记录数：{total}"]
     if not rows:
-        lines.extend(["", "无记录。"])
-        return "\n".join(lines)
-    lines.extend(["", "具体记录：", ""])
+        return "\n".join([*header, "", "无记录。"])
+
+    violation_ids = [int(row["id"]) for row in rows]
+    try:
+        evidence = EvidenceStore(
+            CONFIG.evidence_database_path, CONFIG.evidence_root
+        ).paths_for_violations(violation_ids)
+    except Exception as exc:
+        logger.warning(f"证据查询降级 stage=query error={type(exc).__name__}")
+        evidence = {violation_id: () for violation_id in violation_ids}
+
+    header.extend(["", "具体记录：", ""])
+    records = []
     for index, row in enumerate(rows, 1):
         nickname = row["qq_nickname"] or "未知昵称"
-        lines.append(
+        line = (
             f"{index}. {nickname}（{row['qq_number']}） {display_time(row['violation_time'])}，{row['judgement']}，{row['action']}"
         )
+        text = "\n".join([*header, line]) if index == 1 else line
+        records.append(RecordMessage(text, evidence[int(row["id"])]))
     if total > len(rows):
-        lines.extend(["", f"仅显示最近 {len(rows)} 条。需要完整数据请发送：导出{area}{label}违规记录"])
-    return "\n".join(lines)
+        footer = f"仅显示最近 {len(rows)} 条。需要完整数据请发送：导出{area}{label}违规记录"
+        last = records[-1]
+        records[-1] = RecordMessage(f"{last.text}\n\n{footer}", last.images)
+    return StructuredReply(tuple(records))
 
 
-def query_member(intent: dict[str, Any], operator_qq: str, operator_nickname: str | None, recent: bool, message_id: str | None) -> str:
+def query_member(intent: dict[str, Any], operator_qq: str, operator_nickname: str | None, recent: bool, message_id: str | None) -> str | StructuredReply:
     area = _require_area(intent)
     status, member = _resolve_target_for_read(intent)
     problem = _member_problem(status, member)
@@ -391,12 +406,25 @@ def query_member(intent: dict[str, Any], operator_qq: str, operator_nickname: st
             ).fetchall()
         operator = resolve_operator(operator_qq, operator_nickname)
         _log(conn, "查询", "手动", operator, member["id"], area, None, {"recent": recent}, message_id)
-        lines = [format_member(member), "", f"当前次数：{current}", f"状态：{state['status']}", "", "具体记录：", ""]
-        if not rows:
-            lines.append("无记录。")
-        for i, row in enumerate(rows, 1):
-            lines.append(f"{i}. {display_time(row['violation_time'])}，{row['judgement']}，{row['action']}")
-        return "\n".join(lines)
+    header = [format_member(member), "", f"当前次数：{current}", f"状态：{state['status']}", "", "具体记录：", ""]
+    if not rows:
+        return "\n".join([*header, "无记录。"])
+
+    violation_ids = [int(row["id"]) for row in rows]
+    try:
+        evidence = EvidenceStore(
+            CONFIG.evidence_database_path, CONFIG.evidence_root
+        ).paths_for_violations(violation_ids)
+    except Exception as exc:
+        logger.warning(f"证据查询降级 stage=query error={type(exc).__name__}")
+        evidence = {violation_id: () for violation_id in violation_ids}
+
+    records = []
+    for index, row in enumerate(rows, 1):
+        line = f"{index}. {display_time(row['violation_time'])}，{row['judgement']}，{row['action']}"
+        text = "\n".join([*header, line]) if index == 1 else line
+        records.append(RecordMessage(text, evidence[int(row["id"])]))
+    return StructuredReply(tuple(records))
 
 
 def preview_create(intent: dict[str, Any], group_id: str, operator_qq: str, operator_nickname: str | None, message_id: str | None) -> str:

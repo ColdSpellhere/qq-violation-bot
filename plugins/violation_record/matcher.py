@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 from nonebot import logger, on_message
-from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
+from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, MessageSegment
 from nonebot.rule import Rule
 
 from .admin_resolver import grant_admin, grant_admins
@@ -13,6 +13,7 @@ from .config import CONFIG
 from .evidence_capture import capture_referenced_images
 from .evidence_store import EvidenceStore
 from .moderation import handle_mute_intent
+from .reply_models import StructuredReply
 from .service import handle_intent
 
 
@@ -104,6 +105,31 @@ async def _referenced_message_time(bot: Bot, event: GroupMessageEvent) -> str | 
     if isinstance(message, dict):
         return _format_unix_time(message.get("time"))
     return None
+
+
+async def _send_structured_reply(bot: Bot, group_id: int, reply: StructuredReply) -> None:
+    for record in reply.records:
+        message = Message(record.text)
+        existing_images = [path for path in record.images if path.is_file()]
+        for path in existing_images:
+            message += MessageSegment.image(file=f"file://{path}")
+        try:
+            await bot.send_group_msg(group_id=group_id, message=message)
+        except Exception as exc:
+            logger.warning(
+                f"证据混合消息发送失败 stage=query group={group_id} error={type(exc).__name__}"
+            )
+            await bot.send_group_msg(group_id=group_id, message=record.text)
+            for path in existing_images:
+                try:
+                    await bot.send_group_msg(
+                        group_id=group_id,
+                        message=MessageSegment.image(file=f"file://{path}"),
+                    )
+                except Exception as image_exc:
+                    logger.warning(
+                        f"单张证据发送失败 stage=query group={group_id} error={type(image_exc).__name__}"
+                    )
 
 
 async def _upload_export_files(bot: Bot, group_id: int, reply: str) -> str:
@@ -226,5 +252,8 @@ async def _(bot: Bot, event: GroupMessageEvent):
     except Exception as exc:
         logger.exception(f"处理群消息失败：{exc}")
         reply = "处理失败，请稍后重试或联系维护者查看日志。"
+    if isinstance(reply, StructuredReply):
+        await _send_structured_reply(bot, int(event.group_id), reply)
+        await matcher.finish()
     reply = await _upload_export_files(bot, int(event.group_id), reply)
     await matcher.finish(reply)
