@@ -50,6 +50,7 @@ class AppConfig:
     napcat_access_token: str = os.getenv("NAPCAT_ACCESS_TOKEN", "")
     database_url: str = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'violation_records.db'}")
     database_path: Path = _database_path(os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'violation_records.db'}"))
+    chat_archive_path: Path = DATA_DIR / "chat_archive.db"
     ai_base_url: str = os.getenv("AI_BASE_URL", "https://api.deepseek.com").rstrip("/")
     ai_api_key: str = os.getenv("AI_API_KEY", "")
     ai_model: str = os.getenv("AI_MODEL", "deepseek-chat")
