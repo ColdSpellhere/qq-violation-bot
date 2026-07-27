@@ -186,7 +186,10 @@ async def _sync_group_admins(bot: Bot, group_id: int) -> None:
 
 
 async def only_allowed_group(event: Event) -> bool:
-    return isinstance(event, GroupMessageEvent) and int(event.group_id) in CONFIG.allowed_group_ids
+    return (
+        isinstance(event, GroupMessageEvent)
+        and int(event.group_id) == CONFIG.target_group_id
+    )
 
 
 matcher = on_message(rule=Rule(only_allowed_group), priority=10, block=True)
@@ -195,9 +198,6 @@ matcher = on_message(rule=Rule(only_allowed_group), priority=10, block=True)
 @matcher.handle()
 async def _(bot: Bot, event: GroupMessageEvent):
     at_me = _is_at_me(event)
-    logger.info(
-        f"收到允许群消息 group={event.group_id} user={event.user_id} at_me={at_me} message={event.get_plaintext()[:80]!r}"
-    )
     if not at_me:
         return
     grant_admin(str(event.user_id), _sender_name(event))

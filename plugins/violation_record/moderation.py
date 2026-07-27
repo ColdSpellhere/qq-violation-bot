@@ -5,6 +5,7 @@ from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot
 
 from .admin_resolver import resolve_operator
+from .config import CONFIG
 from .db import connect, dump_json, now_str
 from .validators import format_duration, normalize_duration_seconds
 
@@ -140,6 +141,9 @@ async def handle_mute_intent(
     operator_nickname: str | None,
     message_id: str | None = None,
 ) -> str:
+    if not CONFIG.mute_enabled:
+        return "禁言功能未启用。"
+
     try:
         confidence = float((intent.get("operation") or {}).get("confidence") or 0)
     except (TypeError, ValueError):

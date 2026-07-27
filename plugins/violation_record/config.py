@@ -61,6 +61,7 @@ class AppConfig:
     evidence_database_path: Path = DATA_DIR / "evidence.db"
     evidence_root: Path = BASE_DIR / "evidence"
     evidence_required: bool = _bool_env("EVIDENCE_REQUIRED", False)
+    mute_enabled: bool = _bool_env("MUTE_ENABLED", False)
     evidence_max_bytes: int = _int_env("EVIDENCE_MAX_BYTES", 20 * 1024 * 1024)
     ai_base_url: str = os.getenv("AI_BASE_URL", "https://api.deepseek.com").rstrip("/")
     ai_api_key: str = os.getenv("AI_API_KEY", "")
