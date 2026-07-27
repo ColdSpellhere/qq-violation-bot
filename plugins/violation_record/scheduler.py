@@ -6,6 +6,7 @@ from nonebot import get_bot, get_bots, get_driver, logger
 
 from .config import CONFIG
 from .db import backup_database, init_db
+from .evidence_store import EvidenceStore
 from .exporter import weekly_report
 from .service import automatic_maintenance
 
@@ -56,6 +57,9 @@ async def _maintenance_loop() -> None:
                 last_weekly = now.date()
                 await _send_group(f"周报已生成：{path}")
                 await _send_group_file(path)
+            evidence_store = EvidenceStore(CONFIG.evidence_database_path, CONFIG.evidence_root)
+            evidence_store.retry_binding_queue()
+            evidence_store.cleanup_transient()
         except Exception as exc:
             logger.exception(f"后台任务失败：{exc}")
         await asyncio.sleep(60)

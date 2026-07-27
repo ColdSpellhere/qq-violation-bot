@@ -2,17 +2,28 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from nonebot import logger
+
 from .admin_resolver import resolve_admin_by_name, resolve_admin_by_qq, resolve_operator
-from .config import CANCEL_WORDS, CONFIRM_WORDS, GROUP_AREAS, LOCKED_STATUSES
+from .config import CANCEL_WORDS, CONFIG, CONFIRM_WORDS, GROUP_AREAS, LOCKED_STATUSES
 from .db import connect, dump_json, now_str
+from .evidence_store import EvidenceStore, write_binding_queue
 from .formatter import HELP_TEXT, ambiguous_admins, ambiguous_members, violation_detail
 from .member_resolver import format_member, get_member_by_id, get_or_create_member, resolve_member
 from .validators import display_time, first_missing, is_countable_action, normalize_action, normalize_status, normalize_time
 
 PENDING_TTL_SECONDS = 180
+
+
+@dataclass(frozen=True)
+class InsertedViolation:
+    detail: str
+    violation_id: int
+    target_qq: str
 
 
 def _state(conn, member_id: int, area: str) -> dict[str, Any]:
@@ -123,9 +134,10 @@ def _pop_pending(group_id: str, operator_qq: str) -> tuple[str, dict[str, Any]] 
         if not row:
             return None
         conn.execute("DELETE FROM pending_operations WHERE id=?", (row["id"],))
+        payload = json.loads(row["payload_json"])
         if datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S") < datetime.now():
-            return ("expired", {})
-        return row["operation_type"], json.loads(row["payload_json"])
+            return "expired", payload
+        return row["operation_type"], payload
 
 
 def _operator_or_message(operator_qq: str, nickname: str | None) -> dict[str, Any] | str:
@@ -444,15 +456,29 @@ def preview_create(intent: dict[str, Any], group_id: str, operator_qq: str, oper
         "count_delta": 1 if is_countable_action(action) else 0,
         "is_test": 1 if "测试" in (judgement + action) else 0,
     }
-    _set_pending(group_id, operator_qq, "create_violation", {"record": record, "message_id": message_id})
-    return violation_detail(record, member, handler, operator) + "\n\n请回复“确认”入库，或回复“取消”放弃。"
+    evidence_batch_id = intent.get("_evidence_batch_id")
+    evidence_count = int(intent.get("_evidence_count") or 0)
+    if CONFIG.evidence_required and not evidence_batch_id:
+        return "请引用至少一张证据图片后重新记录。"
+
+    pending_payload = {"record": record, "message_id": message_id}
+    if evidence_batch_id:
+        pending_payload["evidence_batch_id"] = evidence_batch_id
+    _set_pending(group_id, operator_qq, "create_violation", pending_payload)
+
+    evidence_note = (
+        f"\n\n已暂存证据图片：{evidence_count} 张。"
+        if evidence_batch_id
+        else "\n\n未引用证据图片；当前为提醒模式，仍可确认入库。"
+    )
+    return violation_detail(record, member, handler, operator) + evidence_note + "\n\n请回复“确认”入库，或回复“取消”放弃。"
 
 
-def _insert_violation(conn, record: dict[str, Any], operator: dict[str, Any], message_id: str | None) -> str:
+def _insert_violation(conn, record: dict[str, Any], operator: dict[str, Any], message_id: str | None) -> InsertedViolation:
     before = _state(conn, record["member_id"], record["group_area"])
     previous_last_time = _effective_record_summary(conn, record["member_id"], record["group_area"])[1]
     ts = now_str()
-    conn.execute(
+    cursor = conn.execute(
         """
         INSERT INTO violation_records(member_id, group_area, violation_time, judgement, action, handler_admin_id,
             recorder_admin_id, remark, is_countable, count_delta, is_test, created_at, updated_at)
@@ -474,6 +500,7 @@ def _insert_violation(conn, record: dict[str, Any], operator: dict[str, Any], me
             ts,
         ),
     )
+    violation_id = int(cursor.lastrowid)
     if (
         record["is_countable"]
         and not record["is_test"]
@@ -490,7 +517,28 @@ def _insert_violation(conn, record: dict[str, Any], operator: dict[str, Any], me
     after = _sync_state_counts(conn, record["member_id"], record["group_area"])
     _log(conn, "新增记录", "手动", operator, record["member_id"], record["group_area"], before, after, message_id)
     member = get_member_by_id(record["member_id"])
-    return violation_detail(record, member, _admin(conn, record["handler_admin_id"]), _admin(conn, record["recorder_admin_id"]))
+    return InsertedViolation(
+        detail=violation_detail(
+            record,
+            member,
+            _admin(conn, record["handler_admin_id"]),
+            _admin(conn, record["recorder_admin_id"]),
+        ),
+        violation_id=violation_id,
+        target_qq=str(member["qq_number"]),
+    )
+
+
+def _mark_evidence_batch(payload: dict[str, Any], state: str) -> None:
+    batch_id = payload.get("evidence_batch_id")
+    if not batch_id:
+        return
+    try:
+        EvidenceStore(CONFIG.evidence_database_path, CONFIG.evidence_root).mark_batch(batch_id, state)
+    except Exception as exc:
+        logger.warning(
+            f"证据批次状态更新失败 stage={state} batch={batch_id} error={type(exc).__name__}"
+        )
 
 
 def confirm_pending(group_id: str, operator_qq: str, operator_nickname: str | None, message_id: str | None) -> str:
@@ -498,15 +546,53 @@ def confirm_pending(group_id: str, operator_qq: str, operator_nickname: str | No
     if not pending:
         return "没有待确认操作。"
     if pending[0] == "expired":
+        _mark_evidence_batch(pending[1], "expired")
         return "待确认操作已过期，请重新发起。"
     operation_type, payload = pending
     operator = _operator_or_message(operator_qq, operator_nickname)
     if isinstance(operator, str):
         return operator
+    if operation_type == "create_violation":
+        with connect() as conn:
+            inserted = _insert_violation(
+                conn,
+                payload["record"],
+                operator,
+                payload.get("message_id") or message_id,
+            )
+        batch_id = payload.get("evidence_batch_id")
+        if batch_id:
+            try:
+                store = EvidenceStore(CONFIG.evidence_database_path, CONFIG.evidence_root)
+                try:
+                    store.bind_batch(batch_id, inserted.violation_id, inserted.target_qq)
+                except Exception as exc:
+                    try:
+                        store.queue_binding(batch_id, inserted.violation_id, inserted.target_qq)
+                    except Exception as queue_exc:
+                        logger.warning(
+                            f"证据绑定队列写入失败 stage=queue batch={batch_id} record={inserted.violation_id} error={type(queue_exc).__name__}"
+                        )
+                    logger.warning(
+                        f"证据绑定延后 stage=bind batch={batch_id} record={inserted.violation_id} error={type(exc).__name__}"
+                    )
+            except Exception as exc:
+                try:
+                    write_binding_queue(
+                        CONFIG.evidence_root,
+                        batch_id,
+                        inserted.violation_id,
+                        inserted.target_qq,
+                    )
+                except Exception as queue_exc:
+                    logger.warning(
+                        f"证据应急队列写入失败 stage=queue batch={batch_id} record={inserted.violation_id} error={type(queue_exc).__name__}"
+                    )
+                logger.warning(
+                    f"证据存储不可用 stage=store batch={batch_id} record={inserted.violation_id} error={type(exc).__name__}"
+                )
+        return inserted.detail.replace("\n\n时间", "\n\n已记录。\n\n时间", 1)
     with connect() as conn:
-        if operation_type == "create_violation":
-            detail = _insert_violation(conn, payload["record"], operator, payload.get("message_id") or message_id)
-            return detail.replace("\n\n时间", "\n\n已记录。\n\n时间", 1)
         if operation_type == "consultation":
             return _apply_consultation(conn, payload, operator, message_id)
         if operation_type == "withdraw_latest":
@@ -523,7 +609,9 @@ def cancel_pending(group_id: str, operator_qq: str) -> str:
     if not pending:
         return "没有待取消操作。"
     if pending[0] == "expired":
+        _mark_evidence_batch(pending[1], "expired")
         return "待确认操作已过期，请重新发起。"
+    _mark_evidence_batch(pending[1], "cancelled")
     return "已取消。"
 
 

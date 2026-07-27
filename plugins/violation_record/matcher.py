@@ -10,6 +10,8 @@ from nonebot.rule import Rule
 from .admin_resolver import grant_admin, grant_admins
 from .ai_router import AIRouterError, parse_intent
 from .config import CONFIG
+from .evidence_capture import capture_referenced_images
+from .evidence_store import EvidenceStore
 from .moderation import handle_mute_intent
 from .service import handle_intent
 
@@ -181,6 +183,22 @@ async def _(bot: Bot, event: GroupMessageEvent):
         referenced_time = await _referenced_message_time(bot, event)
         intent = await parse_intent(text, referenced_time=referenced_time)
         intent["_raw"] = text
+        if intent.get("intent") == "create_violation":
+            try:
+                batch_id, evidence_count = await capture_referenced_images(
+                    bot,
+                    event,
+                    EvidenceStore(CONFIG.evidence_database_path, CONFIG.evidence_root),
+                    operator_qq=str(event.user_id),
+                    command_message_id=str(event.message_id),
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"证据采集降级 stage=capture message_id={event.message_id} error={type(exc).__name__}"
+                )
+                batch_id, evidence_count = None, 0
+            intent["_evidence_batch_id"] = batch_id
+            intent["_evidence_count"] = evidence_count
         mentioned_qq_numbers = _mentioned_user_ids(event)
         if mentioned_qq_numbers:
             intent["_mentioned_qq_numbers"] = mentioned_qq_numbers
