@@ -228,31 +228,59 @@ class EvidenceStore:
         current = now or datetime.now()
         removed_parts = 0
         for path in self.root.rglob("*.part"):
-            if datetime.fromtimestamp(path.stat().st_mtime) < current - timedelta(hours=1):
-                path.unlink()
-                removed_parts += 1
+            try:
+                if datetime.fromtimestamp(path.stat().st_mtime) < current - timedelta(hours=1):
+                    path.unlink()
+                    removed_parts += 1
+            except OSError:
+                continue
         cutoff = _now(current - timedelta(days=7))
         removed_files = 0
-        with self._connect() as conn:
-            batches = conn.execute(
-                "SELECT id FROM evidence_batches WHERE violation_id IS NULL AND state IN ('staging','cancelled','expired','error') AND created_at<?",
-                (cutoff,),
-            ).fetchall()
-            for batch in batches:
-                evidence_ids = [
-                    int(row[0])
-                    for row in conn.execute("SELECT evidence_id FROM evidence_batch_items WHERE batch_id=?", (batch["id"],))
-                ]
-                conn.execute("DELETE FROM evidence_batch_items WHERE batch_id=?", (batch["id"],))
-                conn.execute("DELETE FROM evidence_batches WHERE id=?", (batch["id"],))
-                for evidence_id in evidence_ids:
-                    bound = conn.execute("SELECT 1 FROM violation_evidence WHERE evidence_id=?", (evidence_id,)).fetchone()
-                    pending = conn.execute("SELECT 1 FROM evidence_batch_items WHERE evidence_id=?", (evidence_id,)).fetchone()
-                    if bound or pending:
-                        continue
-                    row = conn.execute("SELECT relative_path FROM evidence_files WHERE id=?", (evidence_id,)).fetchone()
-                    if row:
-                        (self.root / row["relative_path"]).unlink(missing_ok=True)
-                        conn.execute("DELETE FROM evidence_files WHERE id=?", (evidence_id,))
-                        removed_files += 1
+        conn = self._connect()
+        try:
+            batch_ids = [
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM evidence_batches WHERE violation_id IS NULL AND state IN ('staging','cancelled','expired','error') AND created_at<?",
+                    (cutoff,),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        for batch_id in batch_ids:
+            conn = None
+            batch_removed_files = 0
+            try:
+                conn = self._connect()
+                with conn:
+                    evidence_ids = [
+                        int(row[0])
+                        for row in conn.execute(
+                            "SELECT evidence_id FROM evidence_batch_items WHERE batch_id=?", (batch_id,)
+                        )
+                    ]
+                    conn.execute("DELETE FROM evidence_batch_items WHERE batch_id=?", (batch_id,))
+                    conn.execute("DELETE FROM evidence_batches WHERE id=?", (batch_id,))
+                    for evidence_id in evidence_ids:
+                        bound = conn.execute(
+                            "SELECT 1 FROM violation_evidence WHERE evidence_id=?", (evidence_id,)
+                        ).fetchone()
+                        pending = conn.execute(
+                            "SELECT 1 FROM evidence_batch_items WHERE evidence_id=?", (evidence_id,)
+                        ).fetchone()
+                        if bound or pending:
+                            continue
+                        row = conn.execute(
+                            "SELECT relative_path FROM evidence_files WHERE id=?", (evidence_id,)
+                        ).fetchone()
+                        if row:
+                            (self.root / row["relative_path"]).unlink(missing_ok=True)
+                            conn.execute("DELETE FROM evidence_files WHERE id=?", (evidence_id,))
+                            batch_removed_files += 1
+            except (OSError, sqlite3.Error):
+                continue
+            finally:
+                if conn is not None:
+                    conn.close()
+            removed_files += batch_removed_files
         return {"parts": removed_parts, "files": removed_files}
