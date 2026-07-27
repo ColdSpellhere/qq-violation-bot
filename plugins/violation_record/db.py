@@ -1,5 +1,5 @@
 import json
-import shutil
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -19,12 +19,28 @@ def compact_time() -> str:
 
 def backup_database(reason: str = "manual") -> Path | None:
     ensure_dirs()
-    db_path = CONFIG.database_path
-    if not db_path.exists():
+    source_path = CONFIG.database_path
+    if not source_path.exists():
         return None
-    dest = BACKUP_DIR / f"db_backup_{reason}_{compact_time()}.sqlite3"
-    shutil.copy2(db_path, dest)
-    return dest
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    destination = BACKUP_DIR / f"db_backup_{reason}_{compact_time()}.sqlite3"
+    temporary = destination.with_suffix(destination.suffix + f".{os.getpid()}.part")
+    try:
+        temporary.unlink(missing_ok=True)
+        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+        with sqlite3.connect(source_path) as source, sqlite3.connect(temporary) as target:
+            source.backup(target)
+        with sqlite3.connect(temporary) as check:
+            result = check.execute("PRAGMA integrity_check").fetchone()[0]
+        if result != "ok":
+            raise sqlite3.DatabaseError(f"backup integrity_check returned {result!r}")
+        temporary.chmod(0o600)
+        temporary.replace(destination)
+        return destination
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 @contextmanager
