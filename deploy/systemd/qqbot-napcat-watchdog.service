@@ -1,0 +1,9 @@
+[Unit]
+Description=QQ Bot NapCat resource watchdog
+After=napcat.service qq-violation-bot.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/qq-violation-bot
+ExecStart=/opt/qq-violation-bot/.venv/bin/python /opt/qq-violation-bot/scripts/napcat_watchdog.py
+TimeoutStartSec=150
