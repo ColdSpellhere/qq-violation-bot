@@ -21,6 +21,13 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _target_group_id_env() -> int:
     raw = str(os.getenv("TARGET_GROUP_ID") or "").strip()
     if not raw.isdigit():
@@ -51,6 +58,10 @@ class AppConfig:
     database_url: str = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'violation_records.db'}")
     database_path: Path = _database_path(os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'violation_records.db'}"))
     chat_archive_path: Path = DATA_DIR / "chat_archive.db"
+    evidence_database_path: Path = DATA_DIR / "evidence.db"
+    evidence_root: Path = BASE_DIR / "evidence"
+    evidence_required: bool = _bool_env("EVIDENCE_REQUIRED", False)
+    evidence_max_bytes: int = _int_env("EVIDENCE_MAX_BYTES", 20 * 1024 * 1024)
     ai_base_url: str = os.getenv("AI_BASE_URL", "https://api.deepseek.com").rstrip("/")
     ai_api_key: str = os.getenv("AI_API_KEY", "")
     ai_model: str = os.getenv("AI_MODEL", "deepseek-chat")
