@@ -57,9 +57,13 @@ cp .env.example .env
 DRIVER=~fastapi
 HOST=127.0.0.1
 PORT=6199
+LOG_LEVEL=WARNING
 TARGET_GROUP_ID=123456789
 BOT_SELF_ID=1234567890
 NAPCAT_ACCESS_TOKEN=replace-with-random-token
+EVIDENCE_REQUIRED=false
+EVIDENCE_MAX_BYTES=20971520
+MUTE_ENABLED=false
 DATABASE_URL=sqlite:////opt/qq-violation-bot/data/violation_records.db
 AI_BASE_URL=https://api.deepseek.com
 AI_API_KEY=你的 DeepSeek Key
@@ -68,6 +72,12 @@ ADMIN_SEED=123456:ColdSpell:冷|spell;654321:企鹅
 ```
 
 `AI_API_KEY` 缺失时，机器人会回复：`AI 未启用或缺少 AI_API_KEY，无法进行自然语言解析。`
+
+`TARGET_GROUP_ID` 只允许配置一个群号。其他群的消息在框架接收入口后立即丢弃，不进入 NLP、业务查询、数据库写入、消息归档、图片下载、管理员同步或自定义日志。目标群的全部消息都会归档，不要求必须 @ 机器人；归档保存消息及相关元数据，但不会因此下载消息中的普通图片。
+
+`EVIDENCE_REQUIRED=false` 表示新增违规记录未引用证据图片时只提醒、不阻止现有记录流程；改为 `true` 后才要求提供证据。只有新增违规命令所引用消息中的图片会被下载并持久化，每张图片最大允许 `EVIDENCE_MAX_BYTES` 字节。查询时，每条违规记录的文字和该记录映射的全部图片会尽量通过同一条 OneBot 混合消息发送；混合消息发送失败时会回退为文字和图片分别发送。旧记录没有证据图片时仍可正常查询。
+
+`MUTE_ENABLED=false` 默认关闭群禁言执行；启用后才会调用 OneBot/Napcat 的群管理接口。该开关不改变现有违规记录、查询和确认流程。
 
 ## Napcat 与 Nonebot 连接
 
@@ -136,7 +146,7 @@ cd /opt/qq-violation-bot
 
 新增记录：AI 解析自然语言，后端校验群聊分区、成员、时间、原因、处理措施。写入前返回预览，操作人回复 `@机器人 确认` 后入库，回复 `@机器人 取消` 放弃。禁言未写时长默认 `禁言10分钟`，警告不计入次数。时间支持 `刚刚`、`5分钟前`、`两分钟前`、`半小时前`、`1小时20分钟前`、`昨天晚上8点`、`今天下午3点`、`今晚8点` 等相对表达，并按当前服务器时间格式化；`几分钟前` 这类没有精确数值或精确时刻的表达不会被编造，会提示补充准确时间。
 
-群禁言：机器人 QQ 号必须已经是当前群的管理员。管理员 @ 机器人后，用自然语言表达要禁言谁和多久即可；目标支持 @ 成员或 QQ号，时长支持 `10分钟`、`半小时`、`1小时20分钟`、`一天` 等表达，未写时长默认 10 分钟，最长 30 天。执行时调用 OneBot v11 `set_group_ban`，成功后写入 `operation_logs`。
+群禁言：默认由 `MUTE_ENABLED=false` 关闭。启用后，机器人 QQ 号必须已经是当前群的管理员。管理员 @ 机器人后，用自然语言表达要禁言谁和多久即可；目标支持 @ 成员或 QQ号，时长支持 `10分钟`、`半小时`、`1小时20分钟`、`一天` 等表达，未写时长默认 10 分钟，最长 30 天。执行时调用 OneBot v11 `set_group_ban`，成功后写入 `operation_logs`。
 
 查询：支持 QQ号 直查和 QQ昵称模糊查询。命中多人会返回候选项，不会误操作。回复展示当前次数、状态和倒序记录，不展示后台的总次数和减数。也支持不带 QQ号的分区查询，例如 `蜂巢本月违规记录`，用于查看该分区某个时间范围内的记录。
 
