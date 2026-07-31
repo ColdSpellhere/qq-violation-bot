@@ -554,15 +554,18 @@ def preview_create(intent: dict[str, Any], group_id: str, operator_qq: str, oper
         if problem:
             return problem
 
-    target_fields_resolved = (
+    nickname_resolved_missing_qq = (
         status == "ok"
-        and bool(operation_fields)
-        and set(operation_fields).issubset(TARGET_CORRECTION_FIELDS)
+        and not target.get("qq_number")
+        and bool(target.get("qq_nickname"))
+        and set(operation_fields) == {"target.qq_number"}
+        and set(operation.get("missing_fields") or []) == {"target.qq_number"}
+        and not operation.get("ambiguous_fields")
     )
     if (
         confidence < 0.55
         and not only_time_was_filled_by_reply
-        and not target_fields_resolved
+        and not nickname_resolved_missing_qq
         and not _handler_needs_clarification(intent)
     ):
         return "这条记录我理解得不够确定，请补充 QQ号、时间、原因和处理措施。"

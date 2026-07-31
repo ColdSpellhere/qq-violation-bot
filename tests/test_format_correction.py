@@ -363,6 +363,41 @@ class CreateCorrectionServiceTests(unittest.TestCase):
         write_resolver.assert_not_called()
         set_pending.assert_called_once()
 
+    def test_low_confidence_ambiguous_nonempty_qq_keeps_guard(self) -> None:
+        intent = complete_create_intent()
+        intent["target"] = {"qq_number": "123456", "qq_nickname": "小红"}
+        intent["operation"]["confidence"] = 0.4
+        intent["operation"]["ambiguous_fields"] = ["target.qq_number"]
+        with (
+            patch.object(
+                service, "_resolve_target_for_read", return_value=("ok", MEMBER)
+            ) as read_resolver,
+            patch.object(
+                service, "_operator_or_message", return_value=OPERATOR
+            ) as operator,
+            patch.object(service, "_resolve_target_for_write") as write_resolver,
+            patch.object(
+                service, "_resolve_handler_admin", return_value=("ok", HANDLER)
+            ) as handler_resolver,
+            patch.object(
+                service, "connect", return_value=nullcontext(MagicMock())
+            ) as connect,
+            patch.object(
+                service, "_state", return_value={"status": "正常", "locked": 0}
+            ),
+            patch.object(service, "_set_pending") as set_pending,
+        ):
+            text = service.preview_create(
+                intent, "123456789", "90001", "记录员", "m-ambiguous-qq"
+            )
+        self.assertIn("这条记录我理解得不够确定", text)
+        read_resolver.assert_called_once_with(intent)
+        operator.assert_not_called()
+        write_resolver.assert_not_called()
+        handler_resolver.assert_not_called()
+        connect.assert_not_called()
+        set_pending.assert_not_called()
+
     def test_complete_unknown_qq_and_nickname_still_creates_preview(self) -> None:
         intent = complete_create_intent()
         intent["target"] = {"qq_number": "654321", "qq_nickname": "新成员"}
