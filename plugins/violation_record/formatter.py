@@ -1,7 +1,7 @@
 from typing import Any
 
 from .member_resolver import format_member
-from .validators import display_time
+from .validators import display_time, normalize_time
 
 
 def admin_name(admin: dict[str, Any] | None, fallback: str | None = None) -> str:
@@ -59,20 +59,49 @@ def format_create_correction(intent: dict[str, Any], missing_fields: list[str]) 
     target = intent.get("target") or {}
     violation = intent.get("violation") or {}
 
-    area = _clean(intent.get("group_area")) or "<分区：蜂巢/蜂窝/蜂箱>"
-    nickname = _clean(target.get("qq_nickname")) or "<成员昵称>"
-    qq = _clean(target.get("qq_number"))
+    area = (
+        "<分区：蜂巢/蜂窝/蜂箱>"
+        if "group_area" in missing_set
+        else _clean(intent.get("group_area")) or "<分区：蜂巢/蜂窝/蜂箱>"
+    )
+    nickname_required = bool(
+        missing_set & {"target", "target.qq_nickname"}
+    )
+    nickname = (
+        "<成员昵称>"
+        if nickname_required
+        else _clean(target.get("qq_nickname")) or "<成员昵称>"
+    )
     qq_required = "target.qq_number" in missing_set or "target" in missing_set
+    qq = None if qq_required else _clean(target.get("qq_number"))
     member = nickname
     if qq:
         member = f"{member}（{qq}）"
-    elif qq_required:
+    if qq_required:
         member = f"{member}（<QQ号>）"
 
-    event_time = _clean(violation.get("time")) or _clean(intent.get("_reply_time"))
+    if "violation.time" in missing_set:
+        reply_time = _clean(intent.get("_reply_time"))
+        event_time = (
+            reply_time
+            if not _clean(violation.get("time")) and normalize_time(reply_time)
+            else None
+        )
+    else:
+        event_time = _clean(violation.get("time")) or _clean(
+            intent.get("_reply_time")
+        )
     event_time = event_time or "<时间，24小时制，如03:30或15:30>"
-    judgement = _clean(violation.get("judgement")) or "<违规行为>"
-    action = _clean(violation.get("action")) or "<处理措施>"
+    judgement = (
+        "<违规行为>"
+        if "violation.judgement" in missing_set
+        else _clean(violation.get("judgement")) or "<违规行为>"
+    )
+    action = (
+        "<处理措施>"
+        if "violation.action" in missing_set
+        else _clean(violation.get("action")) or "<处理措施>"
+    )
     handler = _clean(violation.get("handler_admin_nickname")) or _clean(
         violation.get("handler_admin_qq")
     )
@@ -85,10 +114,10 @@ def format_create_correction(intent: dict[str, Any], missing_fields: list[str]) 
     )
 
     line = f"{area} {member} {event_time} {judgement}，{action}"
-    if handler:
-        line += f"，{handler}处理"
-    elif handler_required:
+    if handler_required:
         line += "，<处理人QQ号或昵称>处理"
+    elif handler:
+        line += f"，{handler}处理"
 
     labels = list(
         dict.fromkeys(CORRECTION_LABELS.get(field, field) for field in missing)

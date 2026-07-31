@@ -12,7 +12,12 @@ from .admin_resolver import resolve_admin_by_name, resolve_admin_by_qq, resolve_
 from .config import CANCEL_WORDS, CONFIG, CONFIRM_WORDS, GROUP_AREAS, LOCKED_STATUSES
 from .db import connect, dump_json, now_str
 from .evidence_store import EvidenceStore, write_binding_queue
-from .formatter import HELP_TEXT, ambiguous_admins, ambiguous_members, violation_detail
+from .formatter import (
+    HELP_TEXT,
+    ambiguous_members,
+    format_create_correction,
+    violation_detail,
+)
 from .member_resolver import format_member, get_member_by_id, get_or_create_member, resolve_member
 from .reply_models import RecordMessage, StructuredReply
 from .validators import display_time, first_missing, is_countable_action, normalize_action, normalize_status, normalize_time
@@ -157,6 +162,28 @@ HANDLER_FIELD_NAMES = {
     "violation.handler_admin_qq",
     "violation.handler_admin_nickname",
 }
+CREATE_CORRECTION_FIELD_ALIASES = {
+    "handler_admin": "violation.handler_admin_nickname",
+    "handler_admin_qq": "violation.handler_admin_qq",
+    "handler_admin_nickname": "violation.handler_admin_nickname",
+    "violation.handler_admin": "violation.handler_admin_nickname",
+}
+CREATE_CORRECTION_FIELDS = {
+    "group_area",
+    "target",
+    "target.qq_number",
+    "target.qq_nickname",
+    "violation.time",
+    "violation.judgement",
+    "violation.action",
+    "violation.handler_admin_qq",
+    "violation.handler_admin_nickname",
+}
+TARGET_CORRECTION_FIELDS = {
+    "target",
+    "target.qq_number",
+    "target.qq_nickname",
+}
 
 
 def _clean_optional_text(value: Any) -> str | None:
@@ -168,6 +195,28 @@ def _handler_needs_clarification(intent: dict[str, Any]) -> bool:
     operation = intent.get("operation") or {}
     fields = set(operation.get("missing_fields") or []) | set(operation.get("ambiguous_fields") or [])
     return bool(fields & HANDLER_FIELD_NAMES)
+
+
+def _operation_create_correction_fields(intent: dict[str, Any]) -> list[str]:
+    operation = intent.get("operation") or {}
+    raw_fields = [
+        *(operation.get("missing_fields") or []),
+        *(operation.get("ambiguous_fields") or []),
+    ]
+    fields = []
+    for raw_field in raw_fields:
+        field = CREATE_CORRECTION_FIELD_ALIASES.get(str(raw_field), str(raw_field))
+        if field in CREATE_CORRECTION_FIELDS and field not in fields:
+            fields.append(field)
+
+    violation = intent.get("violation") or {}
+    if (
+        "violation.time" in fields
+        and not _clean_optional_text(violation.get("time"))
+        and normalize_time(intent.get("_reply_time"))
+    ):
+        fields.remove("violation.time")
+    return fields
 
 
 def _resolve_handler_admin(intent: dict[str, Any], operator: dict[str, Any]) -> tuple[str, Any]:
@@ -210,6 +259,10 @@ async def handle_intent(intent: dict[str, Any], group_id: str, operator_qq: str,
     if name in {"unknown"}:
         return "我没有理解这条业务操作，请换一种更明确的说法。"
     if name not in {"help", "confirm", "cancel"} and not _require_area(intent):
+        if name == "create_violation":
+            return preview_create(
+                intent, group_id, operator_qq, operator_nickname, message_id
+            )
         return "请标明群聊：蜂巢 / 蜂窝 / 蜂箱。"
     if name in {"query_member", "query_recent"} and _looks_like_area_record_query(intent):
         return query_area_records(intent, operator_qq, operator_nickname, message_id)
@@ -254,6 +307,16 @@ def _member_problem(status: str, data: Any) -> str | None:
     if status in {"not_found", "need_member_info"}:
         return "未找到该成员，请补充 QQ号 和 QQ昵称。"
     return "请提供违规者 QQ号 或 QQ昵称。"
+
+
+def _format_create_problem(intent: dict[str, Any], fields: list[str]) -> str:
+    try:
+        return format_create_correction(intent, fields)
+    except Exception as exc:
+        logger.warning(
+            f"新增记录纠正模板降级 stage=create error={type(exc).__name__}"
+        )
+        return f"缺少必要信息：{first_missing(fields)}。"
 
 
 def _looks_like_area_record_query(intent: dict[str, Any]) -> bool:
@@ -428,13 +491,12 @@ def query_member(intent: dict[str, Any], operator_qq: str, operator_nickname: st
 
 
 def preview_create(intent: dict[str, Any], group_id: str, operator_qq: str, operator_nickname: str | None, message_id: str | None) -> str:
-    operator = _operator_or_message(operator_qq, operator_nickname)
-    if isinstance(operator, str):
-        return operator
     area = _require_area(intent)
     violation = intent["violation"]
     target = intent["target"]
     missing = []
+    if not area:
+        missing.append("group_area")
     if not target.get("qq_number") and not target.get("qq_nickname"):
         missing.append("target")
     raw_time = violation.get("time") or intent.get("_reply_time")
@@ -447,26 +509,89 @@ def preview_create(intent: dict[str, Any], group_id: str, operator_qq: str, oper
     action = normalize_action(violation.get("action"))
     if not action:
         missing.append("violation.action")
-    if missing:
-        return f"缺少必要信息：{first_missing(missing)}。"
-    confidence = intent["operation"].get("confidence", 0)
-    ai_missing = set(intent["operation"].get("missing_fields") or [])
+    operation_fields = _operation_create_correction_fields(intent)
+    immediate_fields = [
+        *missing,
+        *[
+            field
+            for field in operation_fields
+            if field not in TARGET_CORRECTION_FIELDS
+        ],
+    ]
+    immediate_fields = list(dict.fromkeys(immediate_fields))
+    if immediate_fields:
+        return _format_create_problem(intent, immediate_fields)
+
+    operation = intent.get("operation") or {}
+    confidence = operation.get("confidence", 0)
+    ai_missing = set(operation.get("missing_fields") or [])
     only_time_was_filled_by_reply = bool(intent.get("_reply_time")) and ai_missing.issubset({"violation.time"})
-    if confidence < 0.55 and not only_time_was_filled_by_reply and not _handler_needs_clarification(intent):
+
+    status, member = _resolve_target_for_read(intent)
+    create_member = False
+    if status == "ambiguous":
+        return _format_create_problem(intent, ["target.qq_number"])
+    if status in {"not_found", "need_member_info"}:
+        has_qq = bool(target.get("qq_number"))
+        has_nickname = bool(target.get("qq_nickname"))
+        if has_qq and has_nickname:
+            target_fields = [
+                field
+                for field in operation_fields
+                if field in TARGET_CORRECTION_FIELDS
+            ]
+            if target_fields:
+                return _format_create_problem(intent, target_fields)
+            create_member = True
+        elif has_qq and not has_nickname:
+            return _format_create_problem(intent, ["target.qq_nickname"])
+        elif has_nickname and not has_qq:
+            return _format_create_problem(intent, ["target.qq_number"])
+        else:
+            return _format_create_problem(intent, ["target"])
+    elif status != "ok":
+        problem = _member_problem(status, member)
+        if problem:
+            return problem
+
+    target_fields_resolved = (
+        status == "ok"
+        and bool(operation_fields)
+        and set(operation_fields).issubset(TARGET_CORRECTION_FIELDS)
+    )
+    if (
+        confidence < 0.55
+        and not only_time_was_filled_by_reply
+        and not target_fields_resolved
+        and not _handler_needs_clarification(intent)
+    ):
         return "这条记录我理解得不够确定，请补充 QQ号、时间、原因和处理措施。"
-    status, member = _resolve_target_for_write(intent)
-    problem = _member_problem(status, member)
-    if problem:
-        return problem
-    admin_status, handler = _resolve_handler_admin(intent, operator)
+
+    admin_status, handler = _resolve_handler_admin(intent, {})
     if admin_status == "ambiguous":
-        return ambiguous_admins(handler)
+        return _format_create_problem(
+            intent, ["violation.handler_admin_nickname"]
+        )
     if admin_status == "needs_clarification":
-        return "这条记录看起来处理人不是记录人，但没有明确处理人。请补充处理人 QQ号或昵称。"
+        return _format_create_problem(
+            intent, ["violation.handler_admin_nickname"]
+        )
     if admin_status == "not_found_qq":
         return f"未找到处理人 QQ号：{handler}。请先让处理人在允许群里 @ 机器人触发同步，或维护管理员。"
     if admin_status == "not_found":
         return "未找到处理人，请提供处理人 QQ号，或先让处理人在允许群里 @ 机器人触发同步并维护昵称/别名。"
+
+    operator = _operator_or_message(operator_qq, operator_nickname)
+    if isinstance(operator, str):
+        return operator
+    if not handler:
+        handler = operator
+    if create_member:
+        status, member = _resolve_target_for_write(intent)
+        problem = _member_problem(status, member)
+        if problem:
+            return problem
+
     with connect() as conn:
         state = _state(conn, member["id"], area)
         if state["status"] in LOCKED_STATUSES or state["locked"]:
