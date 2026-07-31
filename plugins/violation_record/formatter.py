@@ -35,6 +35,88 @@ def ambiguous_admins(items: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+CORRECTION_LABELS = {
+    "group_area": "分区",
+    "target": "成员",
+    "target.qq_number": "QQ号",
+    "target.qq_nickname": "成员昵称",
+    "violation.time": "时间",
+    "violation.judgement": "违规行为",
+    "violation.action": "处理措施",
+    "violation.handler_admin_qq": "处理人",
+    "violation.handler_admin_nickname": "处理人",
+}
+
+
+def _clean(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def format_create_correction(intent: dict[str, Any], missing_fields: list[str]) -> str:
+    missing = list(dict.fromkeys(missing_fields))
+    missing_set = set(missing)
+    target = intent.get("target") or {}
+    violation = intent.get("violation") or {}
+
+    area = _clean(intent.get("group_area")) or "<分区：蜂巢/蜂窝/蜂箱>"
+    nickname = _clean(target.get("qq_nickname")) or "<成员昵称>"
+    qq = _clean(target.get("qq_number"))
+    qq_required = "target.qq_number" in missing_set or "target" in missing_set
+    member = nickname
+    if qq:
+        member = f"{member}（{qq}）"
+    elif qq_required:
+        member = f"{member}（<QQ号>）"
+
+    event_time = _clean(violation.get("time")) or _clean(intent.get("_reply_time"))
+    event_time = event_time or "<时间，24小时制，如03:30或15:30>"
+    judgement = _clean(violation.get("judgement")) or "<违规行为>"
+    action = _clean(violation.get("action")) or "<处理措施>"
+    handler = _clean(violation.get("handler_admin_nickname")) or _clean(
+        violation.get("handler_admin_qq")
+    )
+    handler_required = bool(
+        missing_set
+        & {
+            "violation.handler_admin_qq",
+            "violation.handler_admin_nickname",
+        }
+    )
+
+    line = f"{area} {member} {event_time} {judgement}，{action}"
+    if handler:
+        line += f"，{handler}处理"
+    elif handler_required:
+        line += "，<处理人QQ号或昵称>处理"
+
+    labels = list(
+        dict.fromkeys(CORRECTION_LABELS.get(field, field) for field in missing)
+    )
+    notes = [
+        "记录人：自动取当前发送者",
+        "未写处理人时：默认等于记录人",
+        "备注：未写时默认为“无”",
+        "证据图片：当前为提醒模式，可不提供",
+    ]
+    if "target.qq_number" in missing_set:
+        notes.insert(0, "QQ号：昵称无法唯一确定时必填")
+    if "violation.time" in missing_set:
+        notes.insert(0, "当天记录可只写时间；非当天请补日期")
+
+    return "\n".join(
+        [
+            f"格式缺少：{'、'.join(labels)}",
+            "",
+            "请替换尖括号内容后重新发送：",
+            line,
+            "",
+            "说明：",
+            *[f"- {note}" for note in notes],
+        ]
+    )
+
+
 HELP_TEXT = """可用示例：
 
 记录：蜂巢小明（123456）2026/6/14 0:00刷屏，禁言，企鹅处理
