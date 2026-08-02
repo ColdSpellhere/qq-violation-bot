@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import unittest
+import zipfile
 from pathlib import Path
 
 from dotenv import dotenv_values
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PUBLIC_FILES = (
+FALLBACK_PUBLIC_FILES = (
     ROOT / ".env.example",
     ROOT / "README.md",
     ROOT / "plugins/violation_record/config.py",
@@ -23,22 +26,53 @@ SENSITIVE_KEYS = (
 )
 
 
+def _tracked_paths() -> list[Path]:
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return list(FALLBACK_PUBLIC_FILES)
+    return [ROOT / item for item in result.stdout.decode().split("\0") if item]
+
+
 def _public_text() -> str:
-    return "\n".join(path.read_text(encoding="utf-8") for path in PUBLIC_FILES)
+    chunks: list[str] = []
+    for path in _tracked_paths():
+        try:
+            chunks.append(path.read_text(encoding="utf-8"))
+            continue
+        except (UnicodeDecodeError, OSError):
+            pass
+        if path.suffix.lower() not in {".docx", ".xlsx", ".pptx"}:
+            continue
+        try:
+            with zipfile.ZipFile(path) as archive:
+                for name in archive.namelist():
+                    if name.endswith((".xml", ".rels")):
+                        chunks.append(archive.read(name).decode("utf-8"))
+        except (OSError, UnicodeDecodeError, zipfile.BadZipFile):
+            continue
+    return "\n".join(chunks)
 
 
 class PublicSourceBoundaryTests(unittest.TestCase):
     def test_live_runtime_values_are_absent_from_public_files(self) -> None:
         env_path = ROOT / ".env"
-        if not env_path.exists():
-            self.skipTest("production .env is not present")
         public_text = _public_text()
-        values = dotenv_values(env_path)
+        values = dotenv_values(env_path) if env_path.exists() else {}
+        runtime_values = {
+            key: str(os.getenv(key) or values.get(key) or "").strip()
+            for key in SENSITIVE_KEYS
+        }
+        if not any(runtime_values.values()):
+            self.skipTest("runtime values are not available")
         leaked = [
             key
             for key in SENSITIVE_KEYS
-            if str(values.get(key) or "").strip()
-            and str(values[key]).strip() in public_text
+            if runtime_values[key] and runtime_values[key] in public_text
         ]
         self.assertEqual([], leaked, f"runtime values leaked for keys: {leaked}")
 

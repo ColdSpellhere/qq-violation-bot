@@ -13,6 +13,7 @@ from .config import CONFIG
 from .evidence_capture import capture_referenced_images
 from .evidence_store import EvidenceStore
 from .moderation import handle_mute_intent
+from .policy_commands import PolicyCommandError, handle_policy_text
 from .reply_models import StructuredReply
 from .service import handle_intent
 
@@ -81,6 +82,19 @@ def _reply_segment(event: GroupMessageEvent) -> dict[str, Any] | None:
         if seg.type == "reply":
             return dict(seg.data)
     return None
+
+
+def _referenced_message_id(event: GroupMessageEvent) -> str | None:
+    if event.reply:
+        for name in ("message_id", "id"):
+            value = getattr(event.reply, name, None)
+            if value not in (None, ""):
+                return str(value)
+    reply_data = _reply_segment(event)
+    if not reply_data:
+        return None
+    value = reply_data.get("id") or reply_data.get("message_id")
+    return str(value) if value not in (None, "") else None
 
 
 async def _referenced_message_time(bot: Bot, event: GroupMessageEvent) -> str | None:
@@ -206,6 +220,27 @@ async def _(bot: Bot, event: GroupMessageEvent):
     if not text:
         await matcher.finish("请发送业务内容。")
     try:
+        policy_reply = handle_policy_text(
+            text,
+            group_id=str(event.group_id),
+            operator_qq=str(event.user_id),
+            operator_nickname=_sender_name(event),
+            message_id=str(event.message_id),
+        )
+    except PolicyCommandError as exc:
+        await matcher.finish(str(exc))
+    except Exception as exc:
+        logger.exception(f"处理减数固定命令失败：{exc}")
+        await matcher.finish("减数命令处理失败，请联系维护者查看日志。")
+    if policy_reply is not None:
+        if isinstance(policy_reply, StructuredReply):
+            await _send_structured_reply(bot, int(event.group_id), policy_reply)
+            await matcher.finish()
+        policy_reply = await _upload_export_files(
+            bot, int(event.group_id), policy_reply
+        )
+        await matcher.finish(policy_reply)
+    try:
         referenced_time = await _referenced_message_time(bot, event)
         intent = await parse_intent(text, referenced_time=referenced_time)
         intent["_raw"] = text
@@ -230,6 +265,9 @@ async def _(bot: Bot, event: GroupMessageEvent):
             intent["_mentioned_qq_numbers"] = mentioned_qq_numbers
         if referenced_time:
             intent["_reply_time"] = referenced_time
+        referenced_message_id = _referenced_message_id(event)
+        if referenced_message_id:
+            intent["_reply_message_id"] = referenced_message_id
         if intent.get("intent") == "mute_member":
             reply = await handle_mute_intent(
                 bot,

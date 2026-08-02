@@ -28,6 +28,7 @@ class QueryContractTests(unittest.TestCase):
             database_url=f"sqlite:///{database_path}",
             evidence_database_path=Path(self.temp.name) / "evidence.db",
             evidence_root=Path(self.temp.name) / "evidence",
+            deduction_policy_v102_enabled=False,
         )
         self.db_config_patch = patch.object(
             db,

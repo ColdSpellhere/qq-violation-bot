@@ -11,6 +11,12 @@ from nonebot import logger
 from .admin_resolver import resolve_admin_by_name, resolve_admin_by_qq, resolve_operator
 from .config import CANCEL_WORDS, CONFIG, CONFIRM_WORDS, GROUP_AREAS, LOCKED_STATUSES
 from .db import connect, dump_json, now_str
+from .deduction_policy import (
+    ensure_policy_scope_snapshot,
+    effective_record_summary as policy_effective_record_summary,
+    effective_total,
+    sync_count_state,
+)
 from .evidence_store import EvidenceStore, write_binding_queue
 from .formatter import (
     HELP_TEXT,
@@ -23,6 +29,7 @@ from .reply_models import RecordMessage, StructuredReply
 from .validators import display_time, first_missing, is_countable_action, normalize_action, normalize_status, normalize_time
 
 PENDING_TTL_SECONDS = 180
+_RECORD_LOG_REMARK_RE = re.compile(r"^record_id=(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -53,49 +60,24 @@ def _admin(conn, admin_id: int | None) -> dict[str, Any] | None:
 
 
 def _current_count(conn, member_id: int, area: str) -> int:
-    row = conn.execute(
-        """
-        SELECT COALESCE(SUM(count_delta), 0) AS c
-        FROM violation_records
-        WHERE member_id=? AND group_area=? AND is_withdrawn=0 AND is_test=0 AND is_countable=1
-        """,
-        (member_id, area),
-    ).fetchone()
-    total = int(row["c"] or 0)
+    total = effective_total(conn, member_id, area)
     state = _state(conn, member_id, area)
     return max(0, total - int(state["deduct_count"] or 0))
 
 
 def _effective_record_summary(conn, member_id: int, area: str) -> tuple[int, str | None]:
-    row = conn.execute(
-        """
-        SELECT COALESCE(SUM(count_delta), 0) AS total, MAX(violation_time) AS last_time
-        FROM violation_records
-        WHERE member_id=? AND group_area=? AND is_withdrawn=0 AND is_test=0 AND is_countable=1
-        """,
-        (member_id, area),
-    ).fetchone()
-    return int(row["total"] or 0), row["last_time"]
+    return policy_effective_record_summary(conn, member_id, area)
 
 
 def _sync_state_counts(conn, member_id: int, area: str) -> dict[str, Any]:
-    total, last_time = _effective_record_summary(conn, member_id, area)
-    state = _state(conn, member_id, area)
-    deduct_count = max(0, min(int(state["deduct_count"] or 0), total))
-    current = total - deduct_count
-    conn.execute(
-        """
-        UPDATE member_group_states
-        SET total_count=?, deduct_count=?, current_count_cache=?, last_effective_violation_time=?, updated_at=?
-        WHERE id=?
-        """,
-        (total, deduct_count, current, last_time, now_str(), state["id"]),
-    )
-    return dict(conn.execute("SELECT * FROM member_group_states WHERE id=?", (state["id"],)).fetchone())
+    _state(conn, member_id, area)
+    if CONFIG.deduction_policy_v102_enabled:
+        ensure_policy_scope_snapshot(conn, member_id, area, now_str())
+    return dict(sync_count_state(conn, member_id, area, updated_at=now_str()))
 
 
-def _log(conn, operation_type: str, source: str, operator: dict[str, Any] | None, target_member_id: int | None, area: str | None, before: Any, after: Any, message_id: str | None = None, remark: str | None = None) -> None:
-    conn.execute(
+def _log(conn, operation_type: str, source: str, operator: dict[str, Any] | None, target_member_id: int | None, area: str | None, before: Any, after: Any, message_id: str | None = None, remark: str | None = None) -> int:
+    cursor = conn.execute(
         """
         INSERT INTO operation_logs(group_area, operation_type, source, operator_qq, operator_nickname,
             target_member_id, before_json, after_json, message_id, created_at, remark)
@@ -115,6 +97,91 @@ def _log(conn, operation_type: str, source: str, operator: dict[str, Any] | None
             remark,
         ),
     )
+    return int(cursor.lastrowid)
+
+
+def _enqueue_status_bridge_job(
+    conn,
+    *,
+    operation_log_id: int,
+    member_id: int,
+    group_area: str,
+    status: str,
+    effective_at: str,
+    caused_by_record_id: int | None = None,
+) -> None:
+    if not CONFIG.deduction_policy_v102_enabled:
+        return
+    created_at = now_str()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO v102_status_bridge_jobs(
+            operation_log_id, member_id, group_area, target_status,
+            caused_by_record_id, effective_at, idempotency_key,
+            created_at, updated_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            operation_log_id,
+            member_id,
+            group_area,
+            status,
+            caused_by_record_id,
+            effective_at,
+            f"status-log:{operation_log_id}",
+            created_at,
+            created_at,
+        ),
+    )
+
+
+def _explicit_causal_record_id(
+    conn,
+    intent: dict[str, Any],
+    *,
+    member_id: int,
+    group_area: str,
+) -> int | None:
+    reply_message_id = str(intent.get("_reply_message_id") or "").strip()
+    if not reply_message_id:
+        return None
+    operation = conn.execute(
+        """
+        SELECT remark FROM operation_logs
+        WHERE message_id=? AND operation_type='新增记录'
+          AND target_member_id=? AND group_area=?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (reply_message_id, member_id, group_area),
+    ).fetchone()
+    if operation is None:
+        return None
+    matched = _RECORD_LOG_REMARK_RE.fullmatch(str(operation["remark"] or ""))
+    if matched is None:
+        return None
+    record_id = int(matched.group(1))
+    record = conn.execute(
+        """
+        SELECT id FROM violation_records
+        WHERE id=? AND member_id=? AND group_area=? AND is_withdrawn=0
+        """,
+        (record_id, member_id, group_area),
+    ).fetchone()
+    return record_id if record is not None else None
+
+
+def _causal_record_is_active(conn, payload: dict[str, Any]) -> bool:
+    record_id = payload.get("caused_by_record_id")
+    if record_id is None:
+        return True
+    record = conn.execute(
+        """
+        SELECT 1 FROM violation_records
+        WHERE id=? AND member_id=? AND group_area=? AND is_withdrawn=0
+        """,
+        (record_id, payload["member_id"], payload["group_area"]),
+    ).fetchone()
+    return record is not None
 
 
 def _set_pending(group_id: str, operator_qq: str, operation_type: str, payload: dict[str, Any]) -> None:
@@ -142,6 +209,7 @@ def _pop_pending(group_id: str, operator_qq: str) -> tuple[str, dict[str, Any]] 
         conn.execute("DELETE FROM pending_operations WHERE id=?", (row["id"],))
         payload = json.loads(row["payload_json"])
         if datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S") < datetime.now():
+            payload["_expired_operation_type"] = row["operation_type"]
             return "expired", payload
         return row["operation_type"], payload
 
@@ -632,6 +700,13 @@ def preview_create(intent: dict[str, Any], group_id: str, operator_qq: str, oper
 
 def _insert_violation(conn, record: dict[str, Any], operator: dict[str, Any], message_id: str | None) -> InsertedViolation:
     before = _state(conn, record["member_id"], record["group_area"])
+    if CONFIG.deduction_policy_v102_enabled:
+        ensure_policy_scope_snapshot(
+            conn,
+            record["member_id"],
+            record["group_area"],
+            now_str(),
+        )
     previous_last_time = _effective_record_summary(conn, record["member_id"], record["group_area"])[1]
     ts = now_str()
     cursor = conn.execute(
@@ -671,7 +746,18 @@ def _insert_violation(conn, record: dict[str, Any], operator: dict[str, Any], me
             (record["violation_time"], record["violation_time"], ts, record["member_id"], record["group_area"]),
         )
     after = _sync_state_counts(conn, record["member_id"], record["group_area"])
-    _log(conn, "新增记录", "手动", operator, record["member_id"], record["group_area"], before, after, message_id)
+    _log(
+        conn,
+        "新增记录",
+        "手动",
+        operator,
+        record["member_id"],
+        record["group_area"],
+        before,
+        after,
+        message_id,
+        remark=f"record_id={violation_id}",
+    )
     member = get_member_by_id(record["member_id"])
     return InsertedViolation(
         detail=violation_detail(
@@ -702,6 +788,14 @@ def confirm_pending(group_id: str, operator_qq: str, operator_nickname: str | No
     if not pending:
         return "没有待确认操作。"
     if pending[0] == "expired":
+        from .policy_commands import log_cancelled_policy_command
+
+        log_cancelled_policy_command(
+            pending[1].get("_expired_operation_type", ""),
+            pending[1],
+            operator_qq=operator_qq,
+            expired=True,
+        )
         _mark_evidence_batch(pending[1], "expired")
         return "待确认操作已过期，请重新发起。"
     operation_type, payload = pending
@@ -747,16 +841,56 @@ def confirm_pending(group_id: str, operator_qq: str, operator_nickname: str | No
                 logger.warning(
                     f"证据存储不可用 stage=store batch={batch_id} record={inserted.violation_id} error={type(exc).__name__}"
                 )
+        if CONFIG.deduction_policy_v102_enabled:
+            try:
+                from . import policy_bridge
+
+                policy_bridge.bridge_violation_record(inserted.violation_id)
+            except Exception as exc:
+                logger.exception(
+                    "v102策略联动失败 stage=record "
+                    f"record={inserted.violation_id} error={type(exc).__name__}"
+                )
         return inserted.detail.replace("\n\n时间", "\n\n已记录。\n\n时间", 1)
+    if operation_type.startswith("v102_"):
+        from .policy_commands import apply_pending_policy_command
+
+        return apply_pending_policy_command(
+            operation_type, payload, operator, message_id
+        )
+    result = None
     with connect() as conn:
+        if (
+            operation_type in {"consultation", "status_update"}
+            and payload.get("caused_by_record_id") is not None
+        ):
+            conn.execute("BEGIN IMMEDIATE")
         if operation_type == "consultation":
-            return _apply_consultation(conn, payload, operator, message_id)
-        if operation_type == "withdraw_latest":
-            return _apply_withdraw(conn, payload, operator, message_id)
-        if operation_type == "status_update":
-            return _apply_status(conn, payload, operator, message_id)
-        if operation_type == "unlock_member":
-            return _apply_unlock(conn, payload, operator, message_id)
+            result = _apply_consultation(conn, payload, operator, message_id)
+        elif operation_type == "withdraw_latest":
+            result = _apply_withdraw(conn, payload, operator, message_id)
+        elif operation_type == "status_update":
+            result = _apply_status(conn, payload, operator, message_id)
+        elif operation_type == "unlock_member":
+            result = _apply_unlock(conn, payload, operator, message_id)
+    if result is not None and CONFIG.deduction_policy_v102_enabled:
+        try:
+            from . import policy_bridge
+
+            if operation_type == "withdraw_latest":
+                policy_bridge.bridge_withdrawal(
+                    payload["record_id"], reason="管理员撤回"
+                )
+            elif operation_type in {"consultation", "status_update", "unlock_member"}:
+                policy_bridge.process_status_bridge_jobs(as_of=now_str())
+        except Exception as exc:
+            logger.exception(
+                "v102策略联动失败 "
+                f"stage={operation_type} member={payload.get('member_id')} "
+                f"error={type(exc).__name__}"
+            )
+    if result is not None:
+        return result
     return "未知待确认操作，已取消。"
 
 
@@ -765,8 +899,22 @@ def cancel_pending(group_id: str, operator_qq: str) -> str:
     if not pending:
         return "没有待取消操作。"
     if pending[0] == "expired":
+        from .policy_commands import log_cancelled_policy_command
+
+        log_cancelled_policy_command(
+            pending[1].get("_expired_operation_type", ""),
+            pending[1],
+            operator_qq=operator_qq,
+            expired=True,
+        )
         _mark_evidence_batch(pending[1], "expired")
         return "待确认操作已过期，请重新发起。"
+    if pending[0].startswith("v102_"):
+        from .policy_commands import log_cancelled_policy_command
+
+        log_cancelled_policy_command(
+            pending[0], pending[1], operator_qq=operator_qq, expired=False
+        )
     _mark_evidence_batch(pending[1], "cancelled")
     return "已取消。"
 
@@ -792,16 +940,43 @@ def preview_consultation(intent: dict[str, Any], group_id: str, operator_qq: str
         state = _state(conn, member["id"], area)
         if state["status"] in LOCKED_STATUSES or state["locked"]:
             return f"{format_member(member)}\n\n状态：{state['status']}，数据已锁定，只允许查询。"
+        caused_by_record_id = _explicit_causal_record_id(
+            conn,
+            intent,
+            member_id=member["id"],
+            group_area=area,
+        )
     ctype = "最后警告" if intent["intent"] == "final_warning" else "质询"
     result = intent["status_update"].get("result") or "通过"
     status_after = normalize_status(result) if result in {"已移出", "已拉黑"} else ("最后警告" if ctype == "最后警告" else "已质询")
     payload = {"member_id": member["id"], "group_area": area, "consultation_type": ctype, "consultation_time": status_time, "result": result, "status_after": status_after}
+    if caused_by_record_id is not None:
+        payload["caused_by_record_id"] = caused_by_record_id
     _set_pending(group_id, operator_qq, "consultation", payload)
-    return f"{format_member(member)}\n\n群聊：{area}\n{ctype}时间：{display_time(status_time)}\n{ctype}人：{operator['nickname']}\n{ctype}结果：{result}\n状态：{status_after}\n\n请回复“确认”保存，或回复“取消”放弃。"
+    cause_line = (
+        f"\n关联违规记录：#{caused_by_record_id}"
+        if caused_by_record_id is not None
+        else ""
+    )
+    return f"{format_member(member)}\n\n群聊：{area}\n{ctype}时间：{display_time(status_time)}\n{ctype}人：{operator['nickname']}\n{ctype}结果：{result}\n状态：{status_after}{cause_line}\n\n请回复“确认”保存，或回复“取消”放弃。"
 
 
 def _apply_consultation(conn, payload: dict[str, Any], operator: dict[str, Any], message_id: str | None) -> str:
     before = _state(conn, payload["member_id"], payload["group_area"])
+    if not _causal_record_is_active(conn, payload):
+        _log(
+            conn,
+            f"{payload['consultation_type']}失败",
+            "手动",
+            operator,
+            payload["member_id"],
+            payload["group_area"],
+            before,
+            before,
+            message_id,
+            remark="关联违规记录已撤回",
+        )
+        return "关联的违规记录已撤回，请重新发起状态操作。"
     ts = now_str()
     conn.execute(
         """
@@ -818,7 +993,16 @@ def _apply_consultation(conn, payload: dict[str, Any], operator: dict[str, Any],
         (payload["status_after"], locked, final_time, ts, payload["member_id"], payload["group_area"]),
     )
     after = _sync_state_counts(conn, payload["member_id"], payload["group_area"])
-    _log(conn, payload["consultation_type"], "手动", operator, payload["member_id"], payload["group_area"], before, after, message_id)
+    operation_log_id = _log(conn, payload["consultation_type"], "手动", operator, payload["member_id"], payload["group_area"], before, after, message_id)
+    _enqueue_status_bridge_job(
+        conn,
+        operation_log_id=operation_log_id,
+        member_id=payload["member_id"],
+        group_area=payload["group_area"],
+        status=payload["status_after"],
+        effective_at=payload["consultation_time"],
+        caused_by_record_id=payload.get("caused_by_record_id"),
+    )
     member = get_member_by_id(payload["member_id"])
     return f"{format_member(member)}\n\n已保存。\n群聊：{payload['group_area']}\n状态：{payload['status_after']}"
 
@@ -847,7 +1031,15 @@ def preview_withdraw(intent: dict[str, Any], group_id: str, operator_qq: str, op
 
 def _apply_withdraw(conn, payload: dict[str, Any], operator: dict[str, Any], message_id: str | None) -> str:
     before = _state(conn, payload["member_id"], payload["group_area"])
-    conn.execute("UPDATE violation_records SET is_withdrawn=1, withdrawn_reason='管理员撤回', updated_at=? WHERE id=?", (now_str(), payload["record_id"]))
+    changed_at = now_str()
+    if CONFIG.deduction_policy_v102_enabled:
+        ensure_policy_scope_snapshot(
+            conn,
+            payload["member_id"],
+            payload["group_area"],
+            changed_at,
+        )
+    conn.execute("UPDATE violation_records SET is_withdrawn=1, withdrawn_reason='管理员撤回', updated_at=? WHERE id=?", (changed_at, payload["record_id"]))
     after = _sync_state_counts(conn, payload["member_id"], payload["group_area"])
     _log(conn, "撤回记录", "手动", operator, payload["member_id"], payload["group_area"], before, after, message_id)
     member = get_member_by_id(payload["member_id"])
@@ -866,20 +1058,58 @@ def preview_status_update(intent: dict[str, Any], group_id: str, operator_qq: st
         return "状态指令只支持：退群 / 移出 / 拉黑。"
     with connect() as conn:
         records = conn.execute("SELECT COUNT(*) AS c FROM violation_records WHERE member_id=? AND group_area=? AND is_withdrawn=0", (member["id"], area)).fetchone()["c"]
+        caused_by_record_id = _explicit_causal_record_id(
+            conn,
+            intent,
+            member_id=member["id"],
+            group_area=area,
+        )
     if not records:
         return "查不到违规记录。"
-    _set_pending(group_id, operator_qq, "status_update", {"member_id": member["id"], "group_area": area, "status": status})
-    return f"{format_member(member)}\n\n群聊：{area}\n状态将更新为：{status}\n\n请回复“确认”保存，或回复“取消”放弃。"
+    payload = {"member_id": member["id"], "group_area": area, "status": status}
+    if caused_by_record_id is not None:
+        payload["caused_by_record_id"] = caused_by_record_id
+    _set_pending(group_id, operator_qq, "status_update", payload)
+    cause_line = (
+        f"\n关联违规记录：#{caused_by_record_id}"
+        if caused_by_record_id is not None
+        else ""
+    )
+    return f"{format_member(member)}\n\n群聊：{area}\n状态将更新为：{status}{cause_line}\n\n请回复“确认”保存，或回复“取消”放弃。"
 
 
 def _apply_status(conn, payload: dict[str, Any], operator: dict[str, Any], message_id: str | None) -> str:
     before = _state(conn, payload["member_id"], payload["group_area"])
+    if not _causal_record_is_active(conn, payload):
+        _log(
+            conn,
+            f"{payload['status'].removeprefix('已')}失败",
+            "手动",
+            operator,
+            payload["member_id"],
+            payload["group_area"],
+            before,
+            before,
+            message_id,
+            remark="关联违规记录已撤回",
+        )
+        return "关联的违规记录已撤回，请重新发起状态操作。"
+    changed_at = now_str()
     conn.execute(
         "UPDATE member_group_states SET status=?, locked=1, updated_at=? WHERE member_id=? AND group_area=?",
-        (payload["status"], now_str(), payload["member_id"], payload["group_area"]),
+        (payload["status"], changed_at, payload["member_id"], payload["group_area"]),
     )
     after = _sync_state_counts(conn, payload["member_id"], payload["group_area"])
-    _log(conn, payload["status"].removeprefix("已"), "手动", operator, payload["member_id"], payload["group_area"], before, after, message_id)
+    operation_log_id = _log(conn, payload["status"].removeprefix("已"), "手动", operator, payload["member_id"], payload["group_area"], before, after, message_id)
+    _enqueue_status_bridge_job(
+        conn,
+        operation_log_id=operation_log_id,
+        member_id=payload["member_id"],
+        group_area=payload["group_area"],
+        status=payload["status"],
+        effective_at=changed_at,
+        caused_by_record_id=payload.get("caused_by_record_id"),
+    )
     member = get_member_by_id(payload["member_id"])
     return f"{format_member(member)}\n\n已更新状态：{payload['status']}。"
 
@@ -897,17 +1127,29 @@ def preview_unlock(intent: dict[str, Any], group_id: str, operator_qq: str, oper
 
 def _apply_unlock(conn, payload: dict[str, Any], operator: dict[str, Any], message_id: str | None) -> str:
     before = _state(conn, payload["member_id"], payload["group_area"])
+    changed_at = now_str()
     conn.execute(
         "UPDATE member_group_states SET status='正常', locked=0, updated_at=? WHERE member_id=? AND group_area=?",
-        (now_str(), payload["member_id"], payload["group_area"]),
+        (changed_at, payload["member_id"], payload["group_area"]),
     )
     after = _sync_state_counts(conn, payload["member_id"], payload["group_area"])
-    _log(conn, "解锁", "手动", operator, payload["member_id"], payload["group_area"], before, after, message_id)
+    operation_log_id = _log(conn, "解锁", "手动", operator, payload["member_id"], payload["group_area"], before, after, message_id)
+    _enqueue_status_bridge_job(
+        conn,
+        operation_log_id=operation_log_id,
+        member_id=payload["member_id"],
+        group_area=payload["group_area"],
+        status="正常",
+        effective_at=changed_at,
+        caused_by_record_id=payload.get("caused_by_record_id"),
+    )
     member = get_member_by_id(payload["member_id"])
     return f"{format_member(member)}\n\n已解锁。"
 
 
 def automatic_maintenance() -> list[str]:
+    if CONFIG.deduction_policy_v102_enabled:
+        return []
     messages: list[str] = []
     with connect() as conn:
         states = conn.execute("SELECT * FROM member_group_states WHERE current_count_cache > 0").fetchall()

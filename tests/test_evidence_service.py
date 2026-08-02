@@ -37,7 +37,7 @@ class EvidenceServiceTests(unittest.TestCase):
         with (
             patch.object(service, "CONFIG", replace(service.CONFIG, evidence_required=required)),
             patch.object(service, "_operator_or_message", return_value=OPERATOR),
-            patch.object(service, "_resolve_target_for_write", return_value=("ok", MEMBER)),
+            patch.object(service, "_resolve_target_for_read", return_value=("ok", MEMBER)),
             patch.object(service, "_resolve_handler_admin", return_value=("ok", HANDLER)),
             patch.object(service, "connect", return_value=nullcontext(MagicMock())),
             patch.object(service, "_state", return_value={"status": "正常", "locked": 0}),
@@ -71,6 +71,11 @@ class EvidenceServiceTests(unittest.TestCase):
             target_qq="123456",
         )
         with (
+            patch.object(
+                service,
+                "CONFIG",
+                replace(service.CONFIG, deduction_policy_v102_enabled=False),
+            ),
             patch.object(
                 service,
                 "_pop_pending",
