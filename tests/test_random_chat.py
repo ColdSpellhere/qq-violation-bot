@@ -1,5 +1,11 @@
+import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+os.environ.setdefault("TARGET_GROUP_ID", "123456789")
+
+from plugins.random_chat.ai import RandomChatAIError, generate_reply
 from plugins.random_chat.policy import eligible_text, should_reply
 
 
@@ -17,6 +23,85 @@ class RandomChatPolicyTests(unittest.TestCase):
         self.assertTrue(should_reply(0.05, sample=0.049))
         self.assertFalse(should_reply(0.05, sample=0.05))
         self.assertTrue(should_reply(1.0, sample=0.999))
+
+
+class _FakeResponse:
+    def __init__(self, content):
+        self.content = content
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"choices": [{"message": {"content": self.content}}]}
+
+
+class _FakeClient:
+    response_content = "  可以吃点热乎的。  "
+    posted = None
+    error = None
+
+    def __init__(self, *, timeout):
+        self.timeout = timeout
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, *, headers, json):
+        type(self).posted = (url, headers, json, self.timeout)
+        if type(self).error:
+            raise type(self).error
+        return _FakeResponse(type(self).response_content)
+
+
+class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        _FakeClient.response_content = "  可以吃点热乎的。  "
+        _FakeClient.posted = None
+        _FakeClient.error = None
+        self.config = SimpleNamespace(
+            ai_api_key="secret",
+            ai_base_url="https://ai.example.com",
+            ai_model="chat-model",
+            ai_timeout=12,
+        )
+
+    async def test_generates_short_free_text_reply(self):
+        with patch("plugins.random_chat.ai.CONFIG", self.config), patch(
+            "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
+        ):
+            reply = await generate_reply("今晚吃什么")
+
+        self.assertEqual(reply, "可以吃点热乎的。")
+        url, headers, payload, timeout = _FakeClient.posted
+        self.assertEqual(url, "https://ai.example.com/v1/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer secret")
+        self.assertEqual(payload["model"], "chat-model")
+        self.assertIn("简短", payload["messages"][0]["content"])
+        self.assertEqual(timeout, 12)
+
+    async def test_returns_none_for_missing_key_or_empty_content(self):
+        self.config.ai_api_key = ""
+        with patch("plugins.random_chat.ai.CONFIG", self.config):
+            self.assertIsNone(await generate_reply("你好"))
+
+        self.config.ai_api_key = "secret"
+        _FakeClient.response_content = "   "
+        with patch("plugins.random_chat.ai.CONFIG", self.config), patch(
+            "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
+        ):
+            self.assertIsNone(await generate_reply("你好"))
+
+    async def test_wraps_transport_errors(self):
+        _FakeClient.error = RuntimeError("network down")
+        with patch("plugins.random_chat.ai.CONFIG", self.config), patch(
+            "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
+        ):
+            with self.assertRaisesRegex(RandomChatAIError, "network down"):
+                await generate_reply("你好")
 
 
 if __name__ == "__main__":
