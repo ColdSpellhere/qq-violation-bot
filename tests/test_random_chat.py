@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -7,7 +9,6 @@ os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
 from plugins.random_chat.ai import RandomChatAIError, generate_reply
 from plugins.random_chat.policy import eligible_text, is_candidate, should_reply
-from plugins.violation_record.config import CONFIG
 
 
 class RandomChatPolicyTests(unittest.TestCase):
@@ -18,8 +19,26 @@ class RandomChatPolicyTests(unittest.TestCase):
         self.assertFalse(is_candidate(True, 100, 100, 10, 10))
 
     def test_configuration_defaults_are_safe(self):
-        self.assertFalse(CONFIG.random_chat_enabled)
-        self.assertEqual(CONFIG.random_chat_probability, 0.05)
+        env = os.environ.copy()
+        env["TARGET_GROUP_ID"] = "999000111"
+        env.pop("RANDOM_CHAT_ENABLED", None)
+        env.pop("RANDOM_CHAT_PROBABILITY", None)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from plugins.violation_record.config import CONFIG; "
+                    "assert CONFIG.random_chat_enabled is False; "
+                    "assert CONFIG.random_chat_probability == 0.05"
+                ),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
 
     def test_rejects_empty_command_and_at_bot(self):
         self.assertIsNone(eligible_text("   ", at_bot=False))
