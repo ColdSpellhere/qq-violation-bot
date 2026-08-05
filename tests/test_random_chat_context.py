@@ -4,10 +4,14 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
+
 from plugins.chat_archive.db import SCHEMA, ContextMessage, recent_text_context
+from plugins.random_chat.matcher import send_random_reply
 
 
 class RecentTextContextTests(unittest.TestCase):
@@ -121,6 +125,60 @@ class RecentTextContextTests(unittest.TestCase):
                         bot_user_id="999",
                     ),
                 )
+
+
+def _event() -> GroupMessageEvent:
+    message = Message("当前消息")
+    return GroupMessageEvent(
+        time=2000,
+        self_id=999,
+        post_type="message",
+        sub_type="normal",
+        user_id=123,
+        message_type="group",
+        message_id=456,
+        group_id=789,
+        message=message,
+        original_message=message,
+        raw_message="当前消息",
+        font=0,
+        sender={"user_id": 123, "nickname": "成员", "role": "member"},
+    )
+
+
+class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reads_expected_window_and_sends_contextual_reply(self):
+        bot = AsyncMock()
+        context = [ContextMessage("小明", "前文")]
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=context
+        ) as read_context, patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ) as generate:
+            await send_random_reply(bot, _event(), "当前消息")
+
+        read_context.assert_called_once()
+        kwargs = read_context.call_args.kwargs
+        self.assertEqual(200, kwargs["since_epoch"])
+        self.assertEqual(20, kwargs["limit"])
+        self.assertEqual("456", kwargs["exclude_message_id"])
+        self.assertEqual("999", kwargs["bot_user_id"])
+        generate.assert_awaited_once_with("当前消息", context=context)
+        bot.send_group_msg.assert_awaited_once_with(group_id=789, message="自然回复")
+
+    async def test_archive_ai_and_send_failures_do_not_escape(self):
+        bot = AsyncMock()
+        bot.send_group_msg.side_effect = RuntimeError("send failed")
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context",
+            side_effect=RuntimeError("archive failed"),
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="回复"),
+        ) as generate:
+            await send_random_reply(bot, _event(), "当前消息")
+        generate.assert_awaited_once_with("当前消息", context=[])
 
 
 if __name__ == "__main__":

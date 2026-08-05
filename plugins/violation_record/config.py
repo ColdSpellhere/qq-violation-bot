@@ -85,7 +85,7 @@ class AppConfig:
     ai_timeout: int = _int_env("AI_TIMEOUT", 30)
     random_chat_enabled: bool = _bool_env("RANDOM_CHAT_ENABLED", False)
     random_chat_probability: float = min(
-        1.0, max(0.0, _float_env("RANDOM_CHAT_PROBABILITY", 0.05))
+        1.0, max(0.0, _float_env("RANDOM_CHAT_PROBABILITY", 0.10))
     )
     admin_seed: str = os.getenv("ADMIN_SEED", "")
 

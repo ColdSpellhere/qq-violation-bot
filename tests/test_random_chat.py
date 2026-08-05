@@ -31,7 +31,7 @@ class RandomChatPolicyTests(unittest.TestCase):
                 (
                     "from plugins.violation_record.config import CONFIG; "
                     "assert CONFIG.random_chat_enabled is False; "
-                    "assert CONFIG.random_chat_probability == 0.05"
+                    "assert CONFIG.random_chat_probability == 0.10"
                 ),
             ],
             env=env,
