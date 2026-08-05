@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,55 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE INDEX IF NOT EXISTS idx_chat_messages_time
 ON chat_messages(event_time, message_id);
 """
+
+
+@dataclass(frozen=True)
+class ContextMessage:
+    nickname: str
+    text: str
+
+
+def recent_text_context(
+    path: Path,
+    *,
+    group_id: int,
+    since_epoch: int,
+    limit: int,
+    exclude_message_id: str,
+    bot_user_id: str,
+) -> list[ContextMessage]:
+    if not path.is_file() or limit <= 0:
+        return []
+    try:
+        with sqlite3.connect(path) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id,sender_json,plaintext
+                FROM chat_messages
+                WHERE group_id=? AND event_time>=?
+                  AND message_id<>? AND user_id<>?
+                  AND trim(plaintext)<>''
+                  AND substr(ltrim(plaintext),1,1)<>'/'
+                ORDER BY event_time DESC,message_id DESC
+                LIMIT ?
+                """,
+                (group_id, since_epoch, exclude_message_id, bot_user_id, limit),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return []
+    context: list[ContextMessage] = []
+    for user_id, sender_json, plaintext in reversed(rows):
+        try:
+            sender = json.loads(sender_json)
+            if not isinstance(sender, dict):
+                sender = {}
+        except (TypeError, json.JSONDecodeError):
+            sender = {}
+        nickname = str(sender.get("card") or sender.get("nickname") or user_id).strip()
+        text = str(plaintext).strip()
+        if text:
+            context.append(ContextMessage(nickname or str(user_id), text))
+    return context
 
 
 def archive_payload(path: Path, target_group_id: int, payload: dict[str, Any]) -> bool:
