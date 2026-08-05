@@ -71,13 +71,13 @@ AI_BASE_URL=https://api.deepseek.com
 AI_API_KEY=你的 DeepSeek Key
 AI_MODEL=deepseek-chat
 RANDOM_CHAT_ENABLED=false
-RANDOM_CHAT_PROBABILITY=0.05
+RANDOM_CHAT_PROBABILITY=0.10
 ADMIN_SEED=123456:ColdSpell:冷|spell;654321:企鹅
 ```
 
 `AI_API_KEY` 缺失时，机器人会回复：`AI 未启用或缺少 AI_API_KEY，无法进行自然语言解析。`
 
-`RANDOM_CHAT_ENABLED=false` 默认关闭随机 AI 群聊回复。设为 `true` 后，只在当前 `TARGET_GROUP_ID` 对普通成员文字按 `RANDOM_CHAT_PROBABILITY` 概率回复，默认值 `0.05` 表示 5%。机器人自身消息、@ 机器人消息、空消息和 `/` 开头命令不会触发；AI 超时或返回异常时静默跳过，不影响违规记录等现有模块。紧急停用时将开关恢复为 `false`，再执行 `systemctl restart qq-violation-bot.service`。
+`RANDOM_CHAT_ENABLED=false` 默认关闭随机 AI 群聊回复。设为 `true` 后，只在当前 `TARGET_GROUP_ID` 对普通成员文字按 `RANDOM_CHAT_PROBABILITY` 概率回复，默认值 `0.10` 表示 10%。命中后会读取当前群最近 30 分钟内最多 20 条纯文本，按群名片、QQ 昵称、QQ号的顺序标注成员并交给 AI 理解上下文；不读取图片或业务数据库。机器人自身消息、@ 机器人消息、空消息和 `/` 开头命令不会触发；归档、AI 或发送异常时静默降级，不影响违规记录等现有模块。紧急停用时将开关恢复为 `false`，再执行 `systemctl restart qq-violation-bot.service`。
 
 `TARGET_GROUP_ID` 只允许配置一个群号。其他群的消息在框架接收入口后立即丢弃，不进入 NLP、业务查询、数据库写入、消息归档、图片下载、管理员同步或自定义日志。目标群的全部消息都会归档，不要求必须 @ 机器人；归档保存消息及相关元数据，但不会因此下载消息中的普通图片。
 
