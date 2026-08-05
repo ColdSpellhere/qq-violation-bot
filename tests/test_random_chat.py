@@ -9,6 +9,7 @@ os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
 from plugins.random_chat.ai import RandomChatAIError, generate_reply
 from plugins.random_chat.policy import eligible_text, is_candidate, should_reply
+from plugins.chat_archive.db import ContextMessage
 
 
 class RandomChatPolicyTests(unittest.TestCase):
@@ -103,7 +104,13 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         with patch("plugins.random_chat.ai.CONFIG", self.config), patch(
             "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
         ):
-            reply = await generate_reply("今晚吃什么")
+            reply = await generate_reply(
+                "今晚吃什么",
+                context=[
+                    ContextMessage("小明", "想吃火锅"),
+                    ContextMessage("小红", "我也想"),
+                ],
+            )
 
         self.assertEqual(reply, "可以吃点热乎的。")
         url, headers, payload, timeout = _FakeClient.posted
@@ -111,19 +118,22 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["Authorization"], "Bearer secret")
         self.assertEqual(payload["model"], "chat-model")
         self.assertIn("简短", payload["messages"][0]["content"])
+        user_content = payload["messages"][1]["content"]
+        self.assertLess(user_content.index("小明：想吃火锅"), user_content.index("小红：我也想"))
+        self.assertIn("当前消息：今晚吃什么", user_content)
         self.assertEqual(timeout, 12)
 
     async def test_returns_none_for_missing_key_or_empty_content(self):
         self.config.ai_api_key = ""
         with patch("plugins.random_chat.ai.CONFIG", self.config):
-            self.assertIsNone(await generate_reply("你好"))
+            self.assertIsNone(await generate_reply("你好", context=[]))
 
         self.config.ai_api_key = "secret"
         _FakeClient.response_content = "   "
         with patch("plugins.random_chat.ai.CONFIG", self.config), patch(
             "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
         ):
-            self.assertIsNone(await generate_reply("你好"))
+            self.assertIsNone(await generate_reply("你好", context=[]))
 
     async def test_wraps_transport_errors(self):
         _FakeClient.error = RuntimeError("network down")
@@ -131,7 +141,7 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
             "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
         ):
             with self.assertRaisesRegex(RandomChatAIError, "network down"):
-                await generate_reply("你好")
+                await generate_reply("你好", context=[])
 
 
 if __name__ == "__main__":
