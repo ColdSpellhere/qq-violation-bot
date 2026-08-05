@@ -13,6 +13,7 @@ driver = nonebot.get_driver()
 driver.register_adapter(OneBotV11Adapter)
 nonebot.load_plugin("plugins.violation_record")
 nonebot.load_plugin("plugins.chat_archive")
+nonebot.load_plugin("plugins.random_chat")
 
 if __name__ == "__main__":
     nonebot.run()

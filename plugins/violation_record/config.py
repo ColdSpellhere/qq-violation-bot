@@ -21,6 +21,16 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _bool_env(name: str, default: bool = False) -> bool:
     raw = str(os.getenv(name) or "").strip().lower()
     if not raw:
@@ -73,6 +83,10 @@ class AppConfig:
     ai_api_key: str = os.getenv("AI_API_KEY", "")
     ai_model: str = os.getenv("AI_MODEL", "deepseek-chat")
     ai_timeout: int = _int_env("AI_TIMEOUT", 30)
+    random_chat_enabled: bool = _bool_env("RANDOM_CHAT_ENABLED", False)
+    random_chat_probability: float = min(
+        1.0, max(0.0, _float_env("RANDOM_CHAT_PROBABILITY", 0.05))
+    )
     admin_seed: str = os.getenv("ADMIN_SEED", "")
 
 

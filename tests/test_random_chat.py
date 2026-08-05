@@ -3,13 +3,24 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-os.environ.setdefault("TARGET_GROUP_ID", "123456789")
+os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
 from plugins.random_chat.ai import RandomChatAIError, generate_reply
-from plugins.random_chat.policy import eligible_text, should_reply
+from plugins.random_chat.policy import eligible_text, is_candidate, should_reply
+from plugins.violation_record.config import CONFIG
 
 
 class RandomChatPolicyTests(unittest.TestCase):
+    def test_candidate_requires_enabled_target_group_and_human_sender(self):
+        self.assertTrue(is_candidate(True, 100, 100, 20, 10))
+        self.assertFalse(is_candidate(False, 100, 100, 20, 10))
+        self.assertFalse(is_candidate(True, 100, 200, 20, 10))
+        self.assertFalse(is_candidate(True, 100, 100, 10, 10))
+
+    def test_configuration_defaults_are_safe(self):
+        self.assertFalse(CONFIG.random_chat_enabled)
+        self.assertEqual(CONFIG.random_chat_probability, 0.05)
+
     def test_rejects_empty_command_and_at_bot(self):
         self.assertIsNone(eligible_text("   ", at_bot=False))
         self.assertIsNone(eligible_text("/help", at_bot=False))

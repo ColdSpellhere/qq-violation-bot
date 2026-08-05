@@ -24,7 +24,7 @@ import nonebot
 import bot
 
 loaded = {plugin.name for plugin in nonebot.get_loaded_plugins()}
-required = {"violation_record", "chat_archive"}
+required = {"violation_record", "chat_archive", "random_chat"}
 missing = sorted(required - loaded)
 if missing:
     raise SystemExit(f"missing loaded plugins: {missing}; loaded={sorted(loaded)}")
