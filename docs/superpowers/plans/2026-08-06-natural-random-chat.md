@@ -34,7 +34,7 @@
 **Files:**
 - Verify: repository-wide tests and service logs
 
-- [ ] Run `TARGET_GROUP_ID=246813579 .venv/bin/python -m unittest discover -s tests -t . -v` and require zero failures.
+- [ ] Run the full suite with a numeric synthetic `TARGET_GROUP_ID` that does not occur in tracked files, and require zero failures.
 - [ ] Inspect `git diff --check` and `git diff -- plugins/random_chat/ai.py tests/test_random_chat.py`.
 - [ ] Commit the focused change on `feat/context-aware-random-chat` without creating a tag.
 - [ ] Restart the existing bot service only, then confirm the service is active and the OneBot connection is established in fresh logs.

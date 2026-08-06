@@ -32,6 +32,8 @@ class RecentTextContextTests(unittest.TestCase):
         text: str,
         card: str = "",
         nickname: str = "",
+        segments: list[dict] | None = None,
+        reply_message_id: str | None = None,
     ) -> None:
         with sqlite3.connect(path) as conn:
             conn.execute(
@@ -47,9 +49,9 @@ class RecentTextContextTests(unittest.TestCase):
                     event_time,
                     user_id,
                     json.dumps({"card": card, "nickname": nickname}, ensure_ascii=False),
-                    "[]",
+                    json.dumps(segments or [], ensure_ascii=False),
                     text,
-                    None,
+                    reply_message_id,
                     "2026-08-06 00:00:00",
                 ),
             )
@@ -78,12 +80,43 @@ class RecentTextContextTests(unittest.TestCase):
 
         self.assertEqual(
             [
-                ContextMessage("群名片", "火锅"),
-                ContextMessage("小红", "同意"),
-                ContextMessage("7", "走起"),
+                ContextMessage("群名片", "火锅", message_id="a", user_id="5"),
+                ContextMessage("小红", "同意", message_id="b", user_id="6"),
+                ContextMessage("7", "走起", message_id="c", user_id="7"),
             ],
             result,
         )
+
+    def test_preserves_mentions_and_resolves_reply_author(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._database(directory)
+            self._insert(path, message_id="a", event_time=1001, user_id="5", text="原话", nickname="小明")
+            self._insert(
+                path,
+                message_id="b",
+                event_time=1002,
+                user_id="6",
+                text="你说得对",
+                nickname="小红",
+                segments=[
+                    {"type": "reply", "data": {"id": "a"}},
+                    {"type": "at", "data": {"qq": "5"}},
+                    {"type": "text", "data": {"text": "你说得对"}},
+                ],
+                reply_message_id="a",
+            )
+            result = recent_text_context(
+                path,
+                group_id=123,
+                since_epoch=1000,
+                limit=20,
+                exclude_message_id="none",
+                bot_user_id="999",
+            )
+
+        self.assertEqual(("5",), result[1].at_user_ids)
+        self.assertEqual("a", result[1].reply_message_id)
+        self.assertEqual("5", result[1].replied_to_user_id)
 
     def test_returns_newest_twenty_in_chronological_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -149,13 +182,22 @@ def _event() -> GroupMessageEvent:
 class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_reads_expected_window_and_sends_contextual_reply(self):
         bot = AsyncMock()
-        context = [ContextMessage("小明", "前文")]
+        context = [ContextMessage("小明", "前文", message_id="1", user_id="11")]
         with patch(
             "plugins.random_chat.matcher.recent_text_context", return_value=context
         ) as read_context, patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
             "plugins.random_chat.matcher.generate_reply",
             new=AsyncMock(return_value="自然回复"),
-        ) as generate:
+        ) as generate, patch(
+            "plugins.random_chat.matcher.extract_memory_candidates",
+            new=AsyncMock(return_value=[]),
+        ) as extract, patch(
+            "plugins.random_chat.matcher.apply_candidates"
+        ) as apply:
             await send_random_reply(bot, _event(), "当前消息")
 
         read_context.assert_called_once()
@@ -164,8 +206,13 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(20, kwargs["limit"])
         self.assertEqual("456", kwargs["exclude_message_id"])
         self.assertEqual("999", kwargs["bot_user_id"])
-        generate.assert_awaited_once_with("当前消息", context=context)
+        generated = generate.await_args.kwargs
+        self.assertEqual(context, generated["context"])
+        self.assertEqual("123", generated["current"].user_id)
+        self.assertEqual([], generated["profiles"])
         bot.send_group_msg.assert_awaited_once_with(group_id=789, message="自然回复")
+        extract.assert_awaited_once()
+        apply.assert_called_once()
 
     async def test_archive_ai_and_send_failures_do_not_escape(self):
         bot = AsyncMock()
@@ -174,11 +221,18 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "plugins.random_chat.matcher.recent_text_context",
             side_effect=RuntimeError("archive failed"),
         ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
             "plugins.random_chat.matcher.generate_reply",
             new=AsyncMock(return_value="回复"),
-        ) as generate:
+        ) as generate, patch(
+            "plugins.random_chat.matcher.extract_memory_candidates",
+            new=AsyncMock(side_effect=RuntimeError("memory failed")),
+        ):
             await send_random_reply(bot, _event(), "当前消息")
-        generate.assert_awaited_once_with("当前消息", context=[])
+        self.assertEqual([], generate.await_args.kwargs["context"])
 
 
 if __name__ == "__main__":

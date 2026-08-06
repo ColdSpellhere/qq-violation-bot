@@ -8,7 +8,11 @@ __pycache__/
 .pytest_cache/
 .coverage
 
-data/
+data/*
+!data/member_memory/
+data/member_memory/*
+!data/member_memory/.gitignore
+!data/member_memory/README.md
 backups/
 exports/
 logs/

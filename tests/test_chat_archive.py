@@ -60,6 +60,20 @@ class ChatArchiveTests(unittest.IsolatedAsyncioTestCase):
         capture_referenced_images.assert_not_called()
         archive_insert.assert_not_called()
 
+    async def test_successful_archive_updates_identity_without_coupling_failures(self) -> None:
+        event = _group_event(archive_matcher.CONFIG.target_group_id)
+        with patch.object(archive_matcher, "archive_payload", return_value=True), patch.object(
+            archive_matcher, "remember_identity"
+        ) as remember:
+            await archive_matcher.archive_target_message(event)
+        remember.assert_called_once()
+        self.assertEqual("456791", remember.call_args.kwargs["user_id"])
+
+        with patch.object(archive_matcher, "archive_payload", return_value=True), patch.object(
+            archive_matcher, "remember_identity", side_effect=RuntimeError("memory failed")
+        ):
+            await archive_matcher.archive_target_message(event)
+
     def test_only_target_group_is_archived_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "chat.db"

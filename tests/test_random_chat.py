@@ -8,6 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
 from plugins.random_chat.ai import RandomChatAIError, generate_reply
+from plugins.member_memory.store import MemberProfile, MemoryTrait
 from plugins.random_chat.policy import eligible_text, is_candidate, should_reply
 from plugins.chat_archive.db import ContextMessage
 
@@ -31,7 +32,7 @@ class RandomChatPolicyTests(unittest.TestCase):
                 (
                     "from plugins.violation_record.config import CONFIG; "
                     "assert CONFIG.random_chat_enabled is False; "
-                    "assert CONFIG.random_chat_probability == 0.10"
+                    "assert CONFIG.random_chat_probability == 0.05"
                 ),
             ],
             env=env,
@@ -107,8 +108,25 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
             reply = await generate_reply(
                 "今晚吃什么",
                 context=[
-                    ContextMessage("小明", "想吃火锅"),
-                    ContextMessage("小红", "我也想"),
+                    ContextMessage("小明", "想吃火锅", message_id="1", user_id="11"),
+                    ContextMessage(
+                        "小红",
+                        "我也想",
+                        message_id="2",
+                        user_id="22",
+                        at_user_ids=("11",),
+                    ),
+                ],
+                current=ContextMessage("小刚", "今晚吃什么", message_id="3", user_id="33"),
+                profiles=[
+                    MemberProfile(
+                        group_id=100,
+                        user_id="11",
+                        nickname="小明",
+                        aliases=(),
+                        traits=(MemoryTrait("喜欢火锅", "1", "2026-08-06 00:00:00"),),
+                        updated_at="2026-08-06 00:00:00",
+                    )
                 ],
             )
 
@@ -123,8 +141,11 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不固定使用", system_prompt)
         self.assertIn("只输出最终群消息或 SKIP", system_prompt)
         user_content = payload["messages"][1]["content"]
-        self.assertLess(user_content.index("小明：想吃火锅"), user_content.index("小红：我也想"))
-        self.assertIn("当前消息：今晚吃什么", user_content)
+        self.assertLess(user_content.index("小明[QQ:11]"), user_content.index("小红[QQ:22]"))
+        self.assertIn("艾特:QQ:11", user_content)
+        self.assertIn("小刚[QQ:33]", user_content)
+        self.assertIn("喜欢火锅", user_content)
+        self.assertIn("群友之间说的话不等于对你说", system_prompt)
         self.assertEqual(timeout, 12)
 
     async def test_returns_none_for_missing_key_or_empty_content(self):

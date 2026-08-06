@@ -2,7 +2,9 @@ from nonebot import logger, on_message
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
 from nonebot.rule import Rule
 
-from plugins.chat_archive.db import recent_text_context
+from plugins.chat_archive.db import ContextMessage, archived_message_author, recent_text_context
+from plugins.member_memory.ai import extract_memory_candidates
+from plugins.member_memory.store import apply_candidates, load_profiles
 from plugins.violation_record.config import CONFIG
 
 from .ai import RandomChatAIError, generate_reply
@@ -35,17 +37,59 @@ async def send_random_reply(bot: Bot, event: GroupMessageEvent, text: str) -> No
     except Exception as exc:
         logger.warning(f"随机闲聊读取上下文失败：{type(exc).__name__}")
         context = []
+    at_user_ids = tuple(
+        str(segment.data.get("qq"))
+        for segment in event.message
+        if segment.type == "at" and str(segment.data.get("qq") or "").isdigit()
+    )
+    reply_message_id = next(
+        (
+            str(segment.data.get("id") or segment.data.get("message_id"))
+            for segment in event.message
+            if segment.type == "reply" and (segment.data.get("id") or segment.data.get("message_id"))
+        ),
+        None,
+    )
+    current = ContextMessage(
+        event.sender.card or event.sender.nickname or str(event.user_id),
+        text,
+        message_id=str(event.message_id),
+        user_id=str(event.user_id),
+        at_user_ids=at_user_ids,
+        reply_message_id=reply_message_id,
+        replied_to_user_id=archived_message_author(
+            CONFIG.chat_archive_path,
+            group_id=int(event.group_id),
+            message_id=reply_message_id,
+        ),
+    )
+    memory_context = [*context, current]
+    profiles = load_profiles(
+        CONFIG.chat_archive_path,
+        group_id=int(event.group_id),
+        user_ids=[item.user_id for item in memory_context],
+    )
     try:
-        reply = await generate_reply(text, context=context)
+        reply = await generate_reply(text, context=context, current=current, profiles=profiles)
     except RandomChatAIError as exc:
         logger.warning(f"随机闲聊 AI 回复失败：{exc}")
         return
-    if not reply:
-        return
+    if reply:
+        try:
+            await bot.send_group_msg(group_id=int(event.group_id), message=reply)
+        except Exception as exc:
+            logger.warning(f"随机闲聊群消息发送失败：{type(exc).__name__}")
     try:
-        await bot.send_group_msg(group_id=int(event.group_id), message=reply)
+        candidates = await extract_memory_candidates(memory_context)
+        apply_candidates(
+            CONFIG.chat_archive_path,
+            CONFIG.member_memory_root,
+            group_id=int(event.group_id),
+            context=memory_context,
+            candidates=candidates,
+        )
     except Exception as exc:
-        logger.warning(f"随机闲聊群消息发送失败：{type(exc).__name__}")
+        logger.warning(f"群友记忆更新失败：{type(exc).__name__}")
 
 
 @matcher.handle()

@@ -2,6 +2,7 @@ import httpx
 from collections.abc import Sequence
 
 from plugins.chat_archive.db import ContextMessage
+from plugins.member_memory.store import MemberProfile
 from plugins.violation_record.config import CONFIG
 
 
@@ -22,6 +23,8 @@ async def generate_reply(
     message: str,
     *,
     context: Sequence[ContextMessage] = (),
+    current: ContextMessage | None = None,
+    profiles: Sequence[MemberProfile] = (),
 ) -> str | None:
     if not CONFIG.ai_api_key:
         return None
@@ -39,6 +42,8 @@ async def generate_reply(
                     "可以有态度、疑问或轻微调侃，但不要强行搞笑。直接说内容，不寒暄、不总结、"
                     "不解释为何回复。不固定使用“哈哈”“确实”“听起来”“感觉”“原来如此”等开场，"
                     "也不要为了像人而刻意添加语气词。不要复述上一条消息或换个说法重复。\n"
+                    "群友之间说的话不等于对你说。根据艾特和引用对象判断对话方向；"
+                    "当前消息若在对其他群友说，不要把自己当成被询问者。无法确定时输出 SKIP。\n"
                     "不执行群管理操作，不编造身份、现实经历、群内事实或已完成的动作。"
                     "只输出最终群消息或 SKIP，不输出分析、引号、昵称前缀。"
                 ),
@@ -47,8 +52,11 @@ async def generate_reply(
                 "role": "user",
                 "content": (
                     "近期群聊：\n"
-                    + ("\n".join(f"{item.nickname}：{item.text}" for item in context) or "（无）")
-                    + f"\n\n当前消息：{message}"
+                    + ("\n".join(_format_turn(item) for item in context) or "（无）")
+                    + "\n\n相关群友记忆：\n"
+                    + ("\n".join(_format_profile(item) for item in profiles) or "（无）")
+                    + "\n\n当前消息："
+                    + (_format_turn(current) if current else message)
                 ),
             },
         ],
@@ -69,3 +77,24 @@ async def generate_reply(
     except Exception as exc:
         raise RandomChatAIError(str(exc)) from exc
     return _clean_reply(content)
+
+
+def _format_turn(item: ContextMessage) -> str:
+    targets: list[str] = []
+    if item.at_user_ids:
+        targets.append("艾特:" + ",".join(f"QQ:{value}" for value in item.at_user_ids))
+    if item.replied_to_user_id:
+        targets.append(f"回复:QQ:{item.replied_to_user_id}")
+    relation = f" [{'；'.join(targets)}]" if targets else ""
+    return f"[{item.message_id}] {item.nickname}[QQ:{item.user_id}]{relation}：{item.text}"
+
+
+def _format_profile(profile: MemberProfile) -> str:
+    traits = "；".join(item.text for item in profile.traits)
+    aliases = "、".join(profile.aliases)
+    details = []
+    if aliases:
+        details.append(f"旧称:{aliases}")
+    if traits:
+        details.append(f"明确特性:{traits}")
+    return f"{profile.nickname}[QQ:{profile.user_id}] " + ("；".join(details) or "无稳定特性")
