@@ -117,7 +117,11 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(url, "https://ai.example.com/v1/chat/completions")
         self.assertEqual(headers["Authorization"], "Bearer secret")
         self.assertEqual(payload["model"], "chat-model")
-        self.assertIn("简短", payload["messages"][0]["content"])
+        system_prompt = payload["messages"][0]["content"]
+        self.assertIn("真实的 QQ 群聊", system_prompt)
+        self.assertIn("SKIP", system_prompt)
+        self.assertIn("不固定使用", system_prompt)
+        self.assertIn("只输出最终群消息或 SKIP", system_prompt)
         user_content = payload["messages"][1]["content"]
         self.assertLess(user_content.index("小明：想吃火锅"), user_content.index("小红：我也想"))
         self.assertIn("当前消息：今晚吃什么", user_content)
@@ -134,6 +138,14 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
             "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
         ):
             self.assertIsNone(await generate_reply("你好", context=[]))
+
+    async def test_suppresses_skip_and_repetitive_haha_openers(self):
+        for content in ("SKIP", " skip ", "哈哈，确实是这样", "哈哈, 可以试试"):
+            _FakeClient.response_content = content
+            with self.subTest(content=content), patch(
+                "plugins.random_chat.ai.CONFIG", self.config
+            ), patch("plugins.random_chat.ai.httpx.AsyncClient", _FakeClient):
+                self.assertIsNone(await generate_reply("你好", context=[]))
 
     async def test_wraps_transport_errors(self):
         _FakeClient.error = RuntimeError("network down")
