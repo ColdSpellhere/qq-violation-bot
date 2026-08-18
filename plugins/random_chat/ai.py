@@ -1,5 +1,6 @@
 import httpx
 from collections.abc import Sequence
+from typing import Literal
 
 from plugins.chat_archive.db import ContextMessage
 from plugins.member_memory.store import MemberProfile
@@ -26,19 +27,23 @@ async def generate_reply(
     current: ContextMessage | None = None,
     profiles: Sequence[MemberProfile] = (),
     addressed: bool = False,
+    chat_mode: Literal["group", "private"] = "group",
 ) -> str | None:
     if not CONFIG.ai_api_key:
         return None
+    private_mode = chat_mode == "private"
     reply_policy = (
         "这条消息明确在对你说。请直接、自然地回答，不要输出 SKIP。"
-        if addressed
+        if addressed or private_mode
         else (
             "先判断普通群成员现在会不会接话：没有自然接话点、话题已经结束或只能重复别人时，"
             "输出且只输出 SKIP；有自然接话点才回复。"
         )
     )
     direction_policy = (
-        "当前消息的艾特或引用对象是你，结合上下文回答提问者。"
+        "这是你和对方的一对一对话，结合上下文直接回答对方。"
+        if private_mode
+        else "当前消息的艾特或引用对象是你，结合上下文回答提问者。"
         if addressed
         else (
             "群友之间说的话不等于对你说。根据艾特和引用对象判断对话方向；"
@@ -46,9 +51,33 @@ async def generate_reply(
         )
     )
     output_policy = (
-        "只输出最终群消息，不输出分析、引号、昵称前缀。"
+        "只输出最终私聊消息，不输出分析、引号、昵称前缀。"
+        if private_mode
+        else "只输出最终群消息，不输出分析、引号、昵称前缀。"
         if addressed
         else "只输出最终群消息或 SKIP，不输出分析、引号、昵称前缀。"
+    )
+    scene_policy = (
+        "你正在进行一对一 QQ 私聊。阅读最近的对话，只写此刻最自然的一条回复。"
+        if private_mode
+        else "你正在参与一个真实的 QQ 群聊。阅读最近的聊天记录，只写机器人此刻最自然的一条群消息。"
+    )
+    identity_policy = (
+        "你是萝卜猫，一个特别可爱但说话自然的小女孩式虚构 QQ 聊天角色。你喜欢花和植物，"
+        if private_mode
+        else "你是萝卜猫，一个特别可爱但说话自然的小女孩式虚构群聊角色。你喜欢花和植物，"
+    )
+    style_policy = (
+        "接住对方最近说的具体内容，不要泛泛评价；像熟悉的人自然聊天，"
+        if private_mode
+        else "接住最近正在聊的具体内容，不要泛泛评价；像熟悉的群成员随手发消息，"
+    )
+    history_label = "近期私聊" if private_mode else "近期群聊"
+    profile_label = "相关信息" if private_mode else "相关群友记忆"
+    safety_policy = (
+        "不执行管理操作，不编造身份、现实经历、对话事实或已完成的动作。"
+        if private_mode
+        else "不执行群管理操作，不编造身份、现实经历、群内事实或已完成的动作。"
     )
     payload = {
         "model": CONFIG.ai_model,
@@ -56,29 +85,35 @@ async def generate_reply(
             {
                 "role": "system",
                 "content": (
-                    "你正在参与一个真实的 QQ 群聊。阅读最近的聊天记录，只写机器人此刻最自然的一条群消息。\n"
-                    "你是萝卜猫，一个特别可爱但说话自然的小女孩式虚构群聊角色。你喜欢花和植物，"
-                    "也喜欢自然里的小东西。别人问起名字、身份或正好适合开玩笑时，你偶尔可以说自己叫反二梦女；"
-                    "不要主动反复介绍设定，也不要每句话都卖萌、撒娇或使用幼儿化口吻。\n"
+                    scene_policy
+                    + "\n"
+                    + identity_policy
+                    + (
+                        "也喜欢自然里的小东西。别人问起名字、身份或正好适合开玩笑时，你偶尔可以说自己叫反二梦女；"
+                        "不要主动反复介绍设定，也不要每句话都卖萌、撒娇或使用幼儿化口吻。\n"
+                    )
                     + reply_policy
                     + "\n"
-                    "接住最近正在聊的具体内容，不要泛泛评价；像熟悉的群成员随手发消息，"
-                    "不像客服、助手或主持人。通常只写一句，允许短句、省略和口语，不强求完整语法。\n"
-                    "可以有态度、疑问或轻微调侃，但不要强行搞笑。直接说内容，不寒暄、不总结、"
-                    "不解释为何回复。不固定使用“哈哈”“确实”“听起来”“感觉”“原来如此”等开场，"
-                    "也不要为了像人而刻意添加语气词。不要复述上一条消息或换个说法重复。\n"
+                    + style_policy
+                    + (
+                        "不像客服、助手或主持人。通常只写一句，允许短句、省略和口语，不强求完整语法。\n"
+                        "可以有态度、疑问或轻微调侃，但不要强行搞笑。直接说内容，不寒暄、不总结、"
+                        "不解释为何回复。不固定使用“哈哈”“确实”“听起来”“感觉”“原来如此”等开场，"
+                        "也不要为了像人而刻意添加语气词。不要复述上一条消息或换个说法重复。\n"
+                    )
                     + direction_policy
                     + "\n"
-                    "不执行群管理操作，不编造身份、现实经历、群内事实或已完成的动作。"
+                    + safety_policy
                     + output_policy
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    "近期群聊：\n"
+                    history_label
+                    + "：\n"
                     + ("\n".join(_format_turn(item) for item in context) or "（无）")
-                    + "\n\n相关群友记忆：\n"
+                    + f"\n\n{profile_label}：\n"
                     + ("\n".join(_format_profile(item) for item in profiles) or "（无）")
                     + "\n\n当前消息："
                     + (_format_turn(current) if current else message)

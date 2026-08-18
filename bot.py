@@ -15,6 +15,7 @@ nonebot.load_plugin("plugins.violation_record")
 nonebot.load_plugin("plugins.chat_archive")
 nonebot.load_plugin("plugins.member_memory.matcher")
 nonebot.load_plugin("plugins.random_chat")
+nonebot.load_plugin("plugins.private_chat")
 
 if __name__ == "__main__":
     nonebot.run()

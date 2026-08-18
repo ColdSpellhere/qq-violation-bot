@@ -101,6 +101,10 @@ class AppConfig:
         "RANDOM_CHAT_SPECIAL_STICKER",
         "5df2a91f55ea6257a768b6bcfe6a10b1.gif",
     )
+    private_chat_enabled: bool = _bool_env("PRIVATE_CHAT_ENABLED", False)
+    private_chat_allowed_user_id: str = str(
+        os.getenv("PRIVATE_CHAT_ALLOWED_USER_ID") or ""
+    ).strip()
     admin_seed: str = os.getenv("ADMIN_SEED", "")
 
 

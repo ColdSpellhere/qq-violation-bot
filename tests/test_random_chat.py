@@ -166,6 +166,28 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("无法确定时输出 SKIP", system_prompt)
         self.assertNotIn("最终群消息或 SKIP", system_prompt)
 
+    async def test_private_mode_uses_one_to_one_prompt_without_group_language(self):
+        with patch("plugins.random_chat.ai.CONFIG", self.config), patch(
+            "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
+        ):
+            await generate_reply(
+                "在吗",
+                context=[],
+                current=ContextMessage("测试者", "在吗", message_id="p1", user_id="123"),
+                addressed=True,
+                chat_mode="private",
+            )
+
+        payload = _FakeClient.posted[2]
+        system_prompt = payload["messages"][0]["content"]
+        user_prompt = payload["messages"][1]["content"]
+        self.assertIn("一对一 QQ 私聊", system_prompt)
+        self.assertNotIn("QQ 群聊", system_prompt)
+        self.assertNotIn("群友", system_prompt)
+        self.assertIn("不要输出 SKIP", system_prompt)
+        self.assertIn("近期私聊", user_prompt)
+        self.assertNotIn("近期群聊", user_prompt)
+
     async def test_returns_none_for_missing_key_or_empty_content(self):
         self.config.ai_api_key = ""
         with patch("plugins.random_chat.ai.CONFIG", self.config):
