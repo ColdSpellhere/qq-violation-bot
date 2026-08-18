@@ -151,6 +151,11 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("萝卜猫", system_prompt)
         self.assertIn("花和植物", system_prompt)
         self.assertIn("反二梦女", system_prompt)
+        self.assertIn("萝卜猫只是你的名字", system_prompt)
+        self.assertIn("你不是猫", system_prompt)
+        self.assertIn("不要使用“喵”", system_prompt)
+        self.assertIn("反二梦女是你认可的兴趣和自我标签", system_prompt)
+        self.assertIn("不是另一个名字", system_prompt)
         self.assertIn("不要每句话都卖萌", system_prompt)
         self.assertEqual(timeout, 12)
 
@@ -185,6 +190,11 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("QQ 群聊", system_prompt)
         self.assertNotIn("群友", system_prompt)
         self.assertIn("不要输出 SKIP", system_prompt)
+        self.assertIn("萝卜猫只是你的名字", system_prompt)
+        self.assertIn("你不是猫", system_prompt)
+        self.assertIn("不要使用“喵”", system_prompt)
+        self.assertIn("反二梦女是你认可的兴趣和自我标签", system_prompt)
+        self.assertIn("不是另一个名字", system_prompt)
         self.assertIn("近期私聊", user_prompt)
         self.assertNotIn("近期群聊", user_prompt)
 

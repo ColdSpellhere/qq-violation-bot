@@ -4,12 +4,16 @@ def is_private_candidate(
     user_id: str,
     self_id: str,
 ) -> bool:
-    allowed = str(allowed_user_id).strip()
+    allowed = {
+        item.strip()
+        for item in str(allowed_user_id).split(",")
+        if item.strip().isdigit()
+    }
+    sender = str(user_id)
     return (
         enabled
-        and allowed.isdigit()
-        and str(user_id) == allowed
-        and str(user_id) != str(self_id)
+        and sender in allowed
+        and sender != str(self_id)
     )
 
 

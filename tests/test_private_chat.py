@@ -59,8 +59,14 @@ class PrivateChatPolicyTests(unittest.TestCase):
 
     def test_candidate_requires_enabled_exact_human_sender(self):
         self.assertTrue(is_private_candidate(True, "123456", "123456", "999999"))
+        self.assertTrue(
+            is_private_candidate(True, "123456, 654321", "654321", "999999")
+        )
         self.assertFalse(is_private_candidate(False, "123456", "123456", "999999"))
         self.assertFalse(is_private_candidate(True, "123456", "654321", "999999"))
+        self.assertFalse(
+            is_private_candidate(True, "123456, 654321", "111111", "999999")
+        )
         self.assertFalse(is_private_candidate(True, "", "123456", "999999"))
         self.assertFalse(is_private_candidate(True, "abc", "abc", "999999"))
         self.assertFalse(is_private_candidate(True, "999999", "999999", "999999"))
