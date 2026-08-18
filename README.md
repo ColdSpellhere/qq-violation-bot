@@ -72,6 +72,8 @@ AI_API_KEY=你的 DeepSeek Key
 AI_MODEL=deepseek-chat
 RANDOM_CHAT_ENABLED=false
 RANDOM_CHAT_PROBABILITY=0.10
+PRIVATE_CHAT_ENABLED=false
+PRIVATE_CHAT_ALLOWED_USER_ID=
 ADMIN_SEED=123456:ColdSpell:冷|spell;654321:企鹅
 ```
 
@@ -84,6 +86,8 @@ ADMIN_SEED=123456:ColdSpell:冷|spell;654321:企鹅
 `RANDOM_CHAT_ENABLED=true` 时，萝卜猫以 `RANDOM_CHAT_PROBABILITY` 概率尝试参与目标群普通聊天；当前生产运行配置为 `0.03`（3%）。她喜欢花和植物，只在合适的身份玩笑中偶尔自称“反二梦女”，不会反复介绍设定或固定卖萌。上下文会保留发送者 QQ、昵称、艾特对象和引用对象，避免把群友之间的话误当成对机器人说。
 
 `RANDOM_CHAT_DIRECT_FALLBACK_ENABLED=true` 允许点名或回复机器人、但业务路由判定为 `unknown` 的消息转为正常闲聊；查询、记录、减数、禁言等已识别业务仍优先处理。若该功能异常，将它改为 `false` 并重启 `qq-violation-bot.service` 即可关闭，无需回滚版本。成功的闲聊回复以 `RANDOM_CHAT_STICKER_PROBABILITY=0.20` 的概率附带最多一张表情包；指定首图在已决定附图时占 10%，其余图片均分 90%。表情包只保存在 `data/random_chat/stickers/incoming/`，不会提交到 GitHub，业务回复永不附图。
+
+`PRIVATE_CHAT_ENABLED=true` 时，机器人只回复 `PRIVATE_CHAT_ALLOWED_USER_ID` 指定的单个 QQ 私聊，其他账号完全静默。允许账号的每条非空普通文字都会由萝卜猫回复，不使用群聊 3% 概率；以 `/` 开头的命令和纯图片消息忽略。最近 20 条双方文字只保存在进程内存中，服务重启即清空，不写入群归档、成员记忆或业务数据库。私聊回复沿用 20% 表情包概率。紧急关闭时将 `PRIVATE_CHAT_ENABLED=false` 并重启机器人服务，无需回滚代码。
 
 成员记忆独立于随机回复概率持续收集：同一成员累计 5 条合格消息，或首条待处理消息等待 60 秒，任一条件满足即以微批方式提炼一次。记忆按群号和 QQ号存储，只接受成员本人明确表达、能回溯原消息且非敏感的稳定特性；SQLite 为权威数据，便于人工查看的私有 JSON 镜像写入 `data/member_memory/`。运行时档案不会提交到 GitHub。
 
