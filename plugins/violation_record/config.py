@@ -88,6 +88,19 @@ class AppConfig:
     random_chat_probability: float = min(
         1.0, max(0.0, _float_env("RANDOM_CHAT_PROBABILITY", 0.05))
     )
+    random_chat_direct_fallback_enabled: bool = _bool_env(
+        "RANDOM_CHAT_DIRECT_FALLBACK_ENABLED", False
+    )
+    random_chat_sticker_probability: float = min(
+        1.0, max(0.0, _float_env("RANDOM_CHAT_STICKER_PROBABILITY", 0.20))
+    )
+    random_chat_sticker_root: Path = (
+        DATA_DIR / "random_chat" / "stickers" / "incoming"
+    )
+    random_chat_special_sticker: str = os.getenv(
+        "RANDOM_CHAT_SPECIAL_STICKER",
+        "5df2a91f55ea6257a768b6bcfe6a10b1.gif",
+    )
     admin_seed: str = os.getenv("ADMIN_SEED", "")
 
 

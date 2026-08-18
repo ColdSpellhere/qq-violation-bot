@@ -11,7 +11,9 @@ os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
 
 from plugins.chat_archive.db import SCHEMA, ContextMessage, recent_text_context
+from plugins.random_chat import matcher as random_chat_matcher
 from plugins.random_chat.matcher import send_random_reply
+from plugins.violation_record.config import CONFIG
 
 
 class RecentTextContextTests(unittest.TestCase):
@@ -193,10 +195,13 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "plugins.random_chat.matcher.generate_reply",
             new=AsyncMock(return_value="自然回复"),
         ) as generate, patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ), patch(
             "plugins.random_chat.matcher.extract_memory_candidates",
+            create=True,
             new=AsyncMock(return_value=[]),
         ) as extract, patch(
-            "plugins.random_chat.matcher.apply_candidates"
+            "plugins.random_chat.matcher.apply_candidates", create=True
         ) as apply:
             await send_random_reply(bot, _event(), "当前消息")
 
@@ -211,8 +216,63 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("123", generated["current"].user_id)
         self.assertEqual([], generated["profiles"])
         bot.send_group_msg.assert_awaited_once_with(group_id=789, message="自然回复")
-        extract.assert_awaited_once()
-        apply.assert_called_once()
+        extract.assert_not_awaited()
+        apply.assert_not_called()
+
+    async def test_appends_one_selected_sticker_to_the_same_message(self):
+        bot = AsyncMock()
+        sticker = Path("/tmp/radish-cat.gif")
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="给你一朵小花"),
+        ), patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=sticker
+        ):
+            sent = await send_random_reply(bot, _event(), "当前消息", addressed=True)
+
+        self.assertTrue(sent)
+        message = bot.send_group_msg.await_args.kwargs["message"]
+        self.assertEqual("text", message[0].type)
+        self.assertEqual("给你一朵小花", message[0].data["text"])
+        self.assertEqual("image", message[1].type)
+        self.assertEqual("file:///tmp/radish-cat.gif", message[1].data["file"])
+
+    async def test_text_still_sends_when_no_sticker_is_selected(self):
+        bot = AsyncMock()
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ), patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(bot, _event(), "当前消息")
+
+        self.assertTrue(sent)
+        self.assertEqual("自然回复", bot.send_group_msg.await_args.kwargs["message"])
+
+    async def test_probability_gate_uses_config_and_skips_send_when_false(self):
+        bot = AsyncMock()
+        with patch(
+            "plugins.random_chat.matcher.should_reply", return_value=False
+        ) as should_reply, patch(
+            "plugins.random_chat.matcher.send_random_reply", new=AsyncMock()
+        ) as send:
+            await random_chat_matcher._(bot, _event())
+
+        should_reply.assert_called_once_with(CONFIG.random_chat_probability)
+        send.assert_not_awaited()
 
     async def test_archive_ai_and_send_failures_do_not_escape(self):
         bot = AsyncMock()
@@ -227,10 +287,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "plugins.random_chat.matcher.generate_reply",
             new=AsyncMock(return_value="回复"),
-        ) as generate, patch(
-            "plugins.random_chat.matcher.extract_memory_candidates",
-            new=AsyncMock(side_effect=RuntimeError("memory failed")),
-        ):
+        ) as generate:
             await send_random_reply(bot, _event(), "当前消息")
         self.assertEqual([], generate.await_args.kwargs["context"])
 

@@ -1,14 +1,14 @@
 from nonebot import logger, on_message
-from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
+from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, MessageSegment
 from nonebot.rule import Rule
 
 from plugins.chat_archive.db import ContextMessage, archived_message_author, recent_text_context
-from plugins.member_memory.ai import extract_memory_candidates
-from plugins.member_memory.store import apply_candidates, load_profiles
+from plugins.member_memory.store import load_profiles
 from plugins.violation_record.config import CONFIG
 
 from .ai import RandomChatAIError, generate_reply
 from .policy import eligible_text, is_candidate, should_reply
+from .stickers import choose_sticker
 
 
 async def random_chat_candidate(event: Event) -> bool:
@@ -24,7 +24,9 @@ async def random_chat_candidate(event: Event) -> bool:
 matcher = on_message(rule=Rule(random_chat_candidate), priority=9, block=False)
 
 
-async def send_random_reply(bot: Bot, event: GroupMessageEvent, text: str) -> None:
+async def send_random_reply(
+    bot: Bot, event: GroupMessageEvent, text: str, *, addressed: bool = False
+) -> bool:
     try:
         context = recent_text_context(
             CONFIG.chat_archive_path,
@@ -70,28 +72,32 @@ async def send_random_reply(bot: Bot, event: GroupMessageEvent, text: str) -> No
         user_ids=[item.user_id for item in memory_context],
     )
     try:
-        reply = await generate_reply(text, context=context, current=current, profiles=profiles)
+        reply = await generate_reply(
+            text,
+            context=context,
+            current=current,
+            profiles=profiles,
+            addressed=addressed,
+        )
     except RandomChatAIError as exc:
         logger.warning(f"随机闲聊 AI 回复失败：{exc}")
-        return
+        return False
     if reply:
         try:
-            await bot.send_group_msg(group_id=int(event.group_id), message=reply)
+            sticker = choose_sticker(
+                CONFIG.random_chat_sticker_root,
+                special_filename=CONFIG.random_chat_special_sticker,
+                attachment_probability=CONFIG.random_chat_sticker_probability,
+            )
+            message: str | Message = reply
+            if sticker is not None:
+                message = Message(reply)
+                message += MessageSegment.image(file=f"file://{sticker}")
+            await bot.send_group_msg(group_id=int(event.group_id), message=message)
+            return True
         except Exception as exc:
             logger.warning(f"随机闲聊群消息发送失败：{type(exc).__name__}")
-    try:
-        candidates = await extract_memory_candidates(memory_context)
-        apply_candidates(
-            CONFIG.chat_archive_path,
-            CONFIG.member_memory_root,
-            group_id=int(event.group_id),
-            context=memory_context,
-            candidates=candidates,
-        )
-    except Exception as exc:
-        logger.warning(f"群友记忆更新失败：{type(exc).__name__}")
-
-
+    return False
 @matcher.handle()
 async def _(bot: Bot, event: GroupMessageEvent) -> None:
     text_parts: list[str] = []

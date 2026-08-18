@@ -25,6 +25,7 @@ class RandomChatPolicyTests(unittest.TestCase):
         env["TARGET_GROUP_ID"] = "999000111"
         env.pop("RANDOM_CHAT_ENABLED", None)
         env.pop("RANDOM_CHAT_PROBABILITY", None)
+        env.pop("RANDOM_CHAT_DIRECT_FALLBACK_ENABLED", None)
         completed = subprocess.run(
             [
                 sys.executable,
@@ -32,7 +33,8 @@ class RandomChatPolicyTests(unittest.TestCase):
                 (
                     "from plugins.violation_record.config import CONFIG; "
                     "assert CONFIG.random_chat_enabled is False; "
-                    "assert CONFIG.random_chat_probability == 0.05"
+                    "assert CONFIG.random_chat_probability == 0.05; "
+                    "assert CONFIG.random_chat_direct_fallback_enabled is False"
                 ),
             ],
             env=env,
@@ -146,7 +148,23 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("小刚[QQ:33]", user_content)
         self.assertIn("喜欢火锅", user_content)
         self.assertIn("群友之间说的话不等于对你说", system_prompt)
+        self.assertIn("萝卜猫", system_prompt)
+        self.assertIn("花和植物", system_prompt)
+        self.assertIn("反二梦女", system_prompt)
+        self.assertIn("不要每句话都卖萌", system_prompt)
         self.assertEqual(timeout, 12)
+
+    async def test_addressed_mode_requires_a_natural_answer(self):
+        with patch("plugins.random_chat.ai.CONFIG", self.config), patch(
+            "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
+        ):
+            await generate_reply("你叫什么", context=[], addressed=True)
+
+        system_prompt = _FakeClient.posted[2]["messages"][0]["content"]
+        self.assertIn("这条消息明确在对你说", system_prompt)
+        self.assertIn("不要输出 SKIP", system_prompt)
+        self.assertNotIn("无法确定时输出 SKIP", system_prompt)
+        self.assertNotIn("最终群消息或 SKIP", system_prompt)
 
     async def test_returns_none_for_missing_key_or_empty_content(self):
         self.config.ai_api_key = ""

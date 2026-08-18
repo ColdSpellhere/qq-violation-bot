@@ -24,10 +24,16 @@ import nonebot
 import bot
 
 loaded = {plugin.name for plugin in nonebot.get_loaded_plugins()}
+loaded_modules = {plugin.module_name for plugin in nonebot.get_loaded_plugins()}
 required = {"violation_record", "chat_archive", "random_chat"}
 missing = sorted(required - loaded)
 if missing:
     raise SystemExit(f"missing loaded plugins: {missing}; loaded={sorted(loaded)}")
+if "plugins.member_memory.matcher" not in loaded_modules:
+    raise SystemExit(
+        "missing loaded plugin module: plugins.member_memory.matcher; "
+        f"loaded_modules={sorted(loaded_modules)}"
+    )
 """
 
         completed = subprocess.run(

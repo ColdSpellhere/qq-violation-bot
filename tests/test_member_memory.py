@@ -7,7 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import nonebot
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
 
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
@@ -20,6 +23,108 @@ from plugins.member_memory.store import (
     load_profiles,
     remember_identity,
 )
+
+try:
+    nonebot.get_driver()
+except ValueError:
+    nonebot.init()
+
+from plugins.member_memory import matcher as memory_matcher
+
+
+def _group_event(
+    *,
+    group_id: int | None = None,
+    user_id: int = 456791,
+    self_id: int = 10000,
+    text: str = "我喜欢火锅",
+) -> GroupMessageEvent:
+    message = Message(text)
+    return GroupMessageEvent(
+        time=1785168002,
+        self_id=self_id,
+        post_type="message",
+        sub_type="normal",
+        user_id=user_id,
+        message_type="group",
+        message_id=104,
+        group_id=group_id or memory_matcher.CONFIG.target_group_id,
+        message=message,
+        original_message=message,
+        raw_message=text,
+        font=0,
+        sender={"user_id": user_id, "nickname": "群友", "role": "member"},
+    )
+
+
+class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_target_group_text_is_submitted_to_independent_batcher(self):
+        event = _group_event()
+
+        with patch.object(memory_matcher.BATCHER, "add") as add:
+            await memory_matcher.collect_member_memory(event)
+
+        add.assert_called_once_with(
+            group_id=memory_matcher.CONFIG.target_group_id,
+            user_id="456791",
+            event_time=1785168002,
+            callback=memory_matcher.analyze_member_memory,
+        )
+
+    async def test_commands_blank_self_and_outside_group_are_ignored(self):
+        events = (
+            _group_event(text="   "),
+            _group_event(text="  /帮助"),
+            _group_event(user_id=10000, self_id=10000),
+            _group_event(group_id=memory_matcher.CONFIG.target_group_id + 1),
+        )
+
+        with patch.object(memory_matcher.BATCHER, "add") as add:
+            for event in events:
+                if memory_matcher._target_member_message(event):
+                    await memory_matcher.collect_member_memory(event)
+
+        add.assert_not_called()
+
+    async def test_analysis_reads_recent_context_and_applies_only_target_member(self):
+        context = [ContextMessage("小明", "我喜欢火锅", message_id="m1", user_id="7")]
+        candidates = [
+            {"user_id": "7", "trait": "喜欢火锅"},
+            {"user_id": "8", "trait": "喜欢跑步"},
+        ]
+        with patch.object(
+            memory_matcher, "recent_text_context", return_value=context
+        ) as recent, patch.object(
+            memory_matcher,
+            "extract_memory_candidates",
+            AsyncMock(return_value=candidates),
+        ) as extract, patch.object(memory_matcher, "apply_candidates") as apply:
+            await memory_matcher.analyze_member_memory(123, "7", 2000)
+
+        recent.assert_called_once_with(
+            memory_matcher.CONFIG.chat_archive_path,
+            group_id=123,
+            since_epoch=2000 - 1800,
+            limit=20,
+            exclude_message_id="",
+            bot_user_id=str(memory_matcher.CONFIG.bot_self_id),
+        )
+        extract.assert_awaited_once_with(context)
+        apply.assert_called_once_with(
+            memory_matcher.CONFIG.chat_archive_path,
+            memory_matcher.CONFIG.member_memory_root,
+            group_id=123,
+            context=context,
+            candidates=[candidates[0]],
+        )
+
+    async def test_analysis_failure_is_caught_at_callback_boundary(self):
+        with patch.object(
+            memory_matcher, "recent_text_context", side_effect=RuntimeError("db failed")
+        ), patch.object(memory_matcher.logger, "warning") as warning:
+            await memory_matcher.analyze_member_memory(123, "7", 2000)
+
+        warning.assert_called_once()
 
 
 class MemberMemoryStoreTests(unittest.TestCase):

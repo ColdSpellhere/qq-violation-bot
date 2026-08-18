@@ -30,6 +30,8 @@ def _is_at_me(event: GroupMessageEvent) -> bool:
     except Exception:
         pass
     self_id = CONFIG.bot_self_id or str(event.self_id)
+    if event.reply and str(event.reply.sender.user_id or "") == self_id:
+        return True
     for seg in event.message:
         if seg.type == "at" and str(seg.data.get("qq")) == self_id:
             return True
@@ -279,6 +281,14 @@ async def _(bot: Bot, event: GroupMessageEvent):
         referenced_time = await _referenced_message_time(bot, event)
         intent = await parse_intent(text, referenced_time=referenced_time)
         intent["_raw"] = text
+        if (
+            intent.get("intent") == "unknown"
+            and CONFIG.random_chat_direct_fallback_enabled
+        ):
+            from plugins.random_chat.matcher import send_random_reply
+
+            await send_random_reply(bot, event, text, addressed=True)
+            return
         if intent.get("intent") == "create_violation":
             try:
                 batch_id, evidence_count = await capture_referenced_images(
