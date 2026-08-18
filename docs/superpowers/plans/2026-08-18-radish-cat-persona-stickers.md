@@ -58,5 +58,5 @@
 - [ ] Set production `RANDOM_CHAT_PROBABILITY=0.03`, `RANDOM_CHAT_STICKER_PROBABILITY=0.20`, and the special filename; do not commit `.env` or sticker assets.
 - [ ] Document persona, routing precedence, probability semantics, storage path, and rollback.
 - [ ] Run the full unittest suite and Python compilation checks.
-- [ ] Restart `qq-violation-bot`, verify it is active, inspect fresh logs, and confirm OneBot account `2727968581` is connected.
+- [ ] Restart `qq-violation-bot`, verify it is active, inspect fresh logs, and confirm the privately configured OneBot account is connected.
 - [ ] Review `git diff`, remove the unrelated stray memory README sentence, commit the intended code/docs as `v1.0.2.6beta`, tag, and push the feature branch and tag.

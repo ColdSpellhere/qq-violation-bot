@@ -189,7 +189,7 @@ Back up every changed server file before replacement, copy the tested files into
 
 - [ ] **Step 5: Verify production health**
 
-Run service checks, verify the reverse OneBot socket on `127.0.0.1:6199` is `ESTAB`, confirm `BOT_SELF_ID=2727968581` and `RANDOM_CHAT_PROBABILITY='0.01'`, and inspect startup logs for import errors or memory matcher exceptions.
+Run service checks, verify the reverse OneBot socket on `127.0.0.1:6199` is `ESTAB`, confirm the private `BOT_SELF_ID` setting and `RANDOM_CHAT_PROBABILITY='0.01'`, and inspect startup logs for import errors or memory matcher exceptions.
 
 - [ ] **Step 6: Git handoff**
 
