@@ -14,7 +14,7 @@ from .evidence_capture import capture_referenced_images
 from .evidence_store import EvidenceStore
 from .moderation import handle_mute_intent
 from .policy_commands import PolicyCommandError, handle_policy_text
-from .reply_models import StructuredReply
+from .reply_models import RecordMessage, StructuredReply
 from .service import handle_intent
 
 
@@ -121,12 +121,47 @@ async def _referenced_message_time(bot: Bot, event: GroupMessageEvent) -> str | 
     return None
 
 
-async def _send_structured_reply(bot: Bot, group_id: int, reply: StructuredReply) -> None:
-    for record in reply.records:
-        message = Message(record.text)
-        existing_images = [path for path in record.images if path.is_file()]
-        for path in existing_images:
+def _record_message(record: RecordMessage) -> Message:
+    message = Message(record.text)
+    for path in record.images:
+        if path.is_file():
             message += MessageSegment.image(file=f"file://{path}")
+    return message
+
+
+async def _send_structured_reply(bot: Bot, group_id: int, reply: StructuredReply) -> None:
+    if len(reply.records) > 1:
+        nodes = [
+            MessageSegment.node_custom(
+                int(bot.self_id), "违规记录机器人", _record_message(record)
+            )
+            for record in reply.records
+        ]
+        try:
+            await bot.call_api(
+                "send_group_forward_msg", group_id=group_id, messages=nodes
+            )
+        except Exception as exc:
+            logger.warning(
+                f"合并转发发送失败 stage=query group={group_id} error={type(exc).__name__}"
+            )
+            fallback = "\n\n".join(record.text for record in reply.records)
+            has_images = any(
+                path.is_file()
+                for record in reply.records
+                for path in record.images
+            )
+            notice = "合并转发发送失败，已改为单条文字。"
+            if has_images:
+                notice = "合并转发发送失败，已改为单条文字；证据图片未展开，请稍后重试。"
+            await bot.send_group_msg(
+                group_id=group_id, message=f"{fallback}\n\n{notice}"
+            )
+        return
+
+    for record in reply.records:
+        message = _record_message(record)
+        existing_images = [path for path in record.images if path.is_file()]
         try:
             await bot.send_group_msg(group_id=group_id, message=message)
         except Exception as exc:
