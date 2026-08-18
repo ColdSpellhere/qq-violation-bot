@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import sqlite3
 import unittest
@@ -7,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from plugins.violation_record import db, service
+from plugins.violation_record import ai_router, db, service
 from plugins.violation_record.config import CONFIG
 from plugins.violation_record.reply_models import StructuredReply
 
@@ -120,6 +121,47 @@ class QueryContractTests(unittest.TestCase):
             flatten_reply(result),
         )
         self.assertTrue(all(record.images == () for record in result.records))
+
+    def test_member_query_shortcut_keeps_fuzzy_name(self) -> None:
+        intent = ai_router._keyword_shortcut("查询 蜂巢 小眀")
+
+        self.assertIsNotNone(intent)
+        self.assertEqual("query_member", intent["intent"])
+        self.assertEqual(
+            {"qq_number": None, "qq_nickname": "小眀"}, intent["target"]
+        )
+
+    def test_member_query_shortcut_does_not_drop_name_before_record_suffix(self) -> None:
+        intent = ai_router._keyword_shortcut("查询蜂巢小眀违规记录")
+
+        self.assertIsNotNone(intent)
+        self.assertEqual("query_member", intent["intent"])
+        self.assertEqual(
+            {"qq_number": None, "qq_nickname": "小眀"}, intent["target"]
+        )
+
+    def test_unmatched_fuzzy_member_query_returns_one_member_error(self) -> None:
+        intent = ai_router._keyword_shortcut("查询蜂巢小眀违规记录")
+        self.assertIsNotNone(intent)
+        intent["_raw"] = "查询蜂巢小眀违规记录"
+
+        with patch.object(
+            service, "_resolve_target_for_read", return_value=("not_found", None)
+        ):
+            result = asyncio.run(
+                service.handle_intent(intent, "123456789", "90001", "记录员", "m3")
+            )
+
+        self.assertEqual("未找到该成员，请补充 QQ号 和 QQ昵称。", result)
+
+    def test_area_query_shortcut_stays_area_wide_without_member_name(self) -> None:
+        intent = ai_router._keyword_shortcut("查询 蜂巢 最近违规记录")
+
+        self.assertIsNotNone(intent)
+        self.assertEqual("query_area_records", intent["intent"])
+        self.assertEqual(
+            {"qq_number": None, "qq_nickname": None}, intent["target"]
+        )
 
 
 if __name__ == "__main__":

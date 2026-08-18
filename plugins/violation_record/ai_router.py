@@ -48,6 +48,14 @@ class AIRouterError(Exception):
     pass
 
 
+_MEMBER_QUERY_RE = re.compile(
+    r"^(?:查询|查看|查|看)\s*(蜂巢|蜂窝|蜂箱)\s*(.+?)\s*$"
+)
+_MEMBER_QUERY_SUFFIX_RE = re.compile(
+    r"(?:的)?(?:(?:最近|本月|这个月|本周|这周|今天|今日|昨天|昨日)\s*)?(?:违规)?记录\s*$"
+)
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     text = text.strip()
     if text.startswith("```"):
@@ -65,6 +73,33 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             return None
     return None
+
+
+def _member_query_shortcut(message: str) -> dict[str, Any] | None:
+    matched = _MEMBER_QUERY_RE.fullmatch(message.strip())
+    if not matched:
+        return None
+    area, raw_target = matched.groups()
+    recent = "最近" in raw_target
+    target_text = _MEMBER_QUERY_SUFFIX_RE.sub("", raw_target).strip()
+    target_text = target_text.strip(" \t,，。！!?？:：;；/\\_—-")
+    if not target_text:
+        return None
+    target = {
+        "qq_number": target_text if re.fullmatch(r"\d{5,12}", target_text) else None,
+        "qq_nickname": None if re.fullmatch(r"\d{5,12}", target_text) else target_text,
+    }
+    data = DEFAULT_INTENT | {
+        "intent": "query_recent" if recent else "query_member",
+        "group_area": area,
+        "target": target,
+    }
+    data["operation"] = {
+        **DEFAULT_INTENT["operation"],
+        "need_confirm": False,
+        "confidence": 1.0,
+    }
+    return merge_default(data)
 
 
 def _keyword_shortcut(message: str) -> dict[str, Any] | None:
@@ -87,6 +122,9 @@ def _keyword_shortcut(message: str) -> dict[str, Any] | None:
         data["query"] = {**DEFAULT_INTENT["query"], "time_range": _time_range_from_text(stripped)}
         data["operation"] = {**DEFAULT_INTENT["operation"], "need_confirm": False, "confidence": 1.0}
         return merge_default(data)
+    member_query = _member_query_shortcut(stripped)
+    if member_query:
+        return member_query
     destructive_words = {"撤回", "解锁", "退群", "移出", "拉黑", "质询", "最后警告", "确认", "取消"}
     if area and not any(word in stripped for word in destructive_words) and (
         "违规记录" in stripped or "全部记录" in stripped or _looks_like_area_only_query(stripped, area)
