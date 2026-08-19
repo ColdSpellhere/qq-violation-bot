@@ -172,18 +172,34 @@ class MemberMemoryStoreTests(unittest.TestCase):
                 for index in range(10)
             ]
             self.assertEqual(10, apply_candidates(db, root, group_id=123, context=context, candidates=candidates))
+            all_traits = load_profiles(db, group_id=123, user_ids=["7"])[0].traits
             for index in range(10):
                 remember_identity(db, root, group_id=123, user_id="7", nickname=f"名字{index}")
             self.assertTrue(commit_summary(
                 db, root, group_id=123, user_id="7", previous_through_id=0,
-                through_fact_id=2, summary="长期喜欢植物",
+                through_fact_id=all_traits[1].fact_id, summary="长期喜欢植物",
             ))
 
-            profile = load_profiles(db, group_id=123, user_ids=["7"], compact=True)[0]
+            with patch("plugins.member_memory.store._profile_row", side_effect=AssertionError):
+                profile = load_profiles(db, group_id=123, user_ids=["7"], compact=True)[0]
+            fallback = load_profiles(
+                db, group_id=123, user_ids=["7"], compact=True, include_summary=False
+            )[0]
 
             self.assertEqual("长期喜欢植物", profile.summary)
             self.assertEqual(8, len(profile.traits))
             self.assertEqual(5, len(profile.aliases))
+            self.assertEqual("", fallback.summary)
+            self.assertEqual(0, fallback.summary_through_fact_id)
+            self.assertEqual(8, len(fallback.traits))
+            self.assertEqual(5, len(fallback.aliases))
+            self.assertTrue(commit_summary(
+                db, root, group_id=123, user_id="7", previous_through_id=all_traits[1].fact_id,
+                through_fact_id=all_traits[-1].fact_id, summary="长期喜欢植物",
+            ))
+            self.assertEqual(
+                (), load_profiles(db, group_id=123, user_ids=["7"], compact=True)[0].traits
+            )
     def test_store_imports_cleanly_in_fresh_process(self):
         env = os.environ.copy()
         env["TARGET_GROUP_ID"] = "975310864"

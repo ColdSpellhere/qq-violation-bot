@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import sqlite3
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
@@ -266,8 +266,69 @@ def remember_identity(path: Path, root: Path, *, group_id: int, user_id: str, ni
     return profile
 
 
+def _compact_profile_row(
+    conn: sqlite3.Connection,
+    group_id: int,
+    user_id: str,
+    *,
+    include_summary: bool,
+) -> MemberProfile | None:
+    row = conn.execute(
+        "SELECT group_id,user_id,nickname,aliases_json,traits_json,updated_at "
+        "FROM member_memories WHERE group_id=? AND user_id=?",
+        (group_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    summary = ""
+    through = 0
+    if include_summary:
+        summary_row = conn.execute(
+            "SELECT summary_text,through_fact_id FROM member_memory_summaries "
+            "WHERE group_id=? AND user_id=?",
+            (group_id, user_id),
+        ).fetchone()
+        if summary_row is not None:
+            summary, through = str(summary_row[0]), int(summary_row[1])
+    aliases = tuple(
+        item[0]
+        for item in reversed(
+            conn.execute(
+                "SELECT alias FROM member_memory_aliases WHERE group_id=? AND user_id=? "
+                "ORDER BY id DESC LIMIT ?",
+                (group_id, user_id, PROMPT_ALIAS_LIMIT),
+            ).fetchall()
+        )
+    )
+    if not aliases:
+        aliases = _decode_json_aliases(row[3])[-PROMPT_ALIAS_LIMIT:]
+    fact_rows = conn.execute(
+        "SELECT id,trait,evidence_message_id,created_at FROM member_memory_facts "
+        "WHERE group_id=? AND user_id=? AND id>? ORDER BY id DESC LIMIT ?",
+        (group_id, user_id, through, PROMPT_UNSUMMARIZED_LIMIT),
+    ).fetchall()
+    traits = tuple(
+        MemoryTrait(text, evidence, created, int(fact_id))
+        for fact_id, text, evidence, created in reversed(fact_rows)
+    )
+    has_ledger_facts = conn.execute(
+        "SELECT 1 FROM member_memory_facts WHERE group_id=? AND user_id=? LIMIT 1",
+        (group_id, user_id),
+    ).fetchone()
+    if not traits and has_ledger_facts is None:
+        traits = _decode_json_traits(row[4])[-PROMPT_UNSUMMARIZED_LIMIT:]
+    return MemberProfile(
+        int(row[0]), str(row[1]), str(row[2]), aliases, traits, str(row[5]), summary, through
+    )
+
+
 def load_profiles(
-    path: Path, *, group_id: int, user_ids: Iterable[str], compact: bool = False
+    path: Path,
+    *,
+    group_id: int,
+    user_ids: Iterable[str],
+    compact: bool = False,
+    include_summary: bool = True,
 ) -> list[MemberProfile]:
     ordered = list(dict.fromkeys(str(item) for item in user_ids if str(item)))
     if not path.is_file() or not ordered:
@@ -275,24 +336,17 @@ def load_profiles(
     try:
         with sqlite3.connect(path) as conn:
             _ensure_schema(conn)
-            profiles = [_profile_row(conn, group_id, item) for item in ordered]
+            profiles = [
+                _compact_profile_row(
+                    conn, group_id, item, include_summary=include_summary
+                )
+                if compact
+                else _profile_row(conn, group_id, item)
+                for item in ordered
+            ]
     except (OSError, sqlite3.Error):
         return []
-    result = [item for item in profiles if item is not None]
-    if not compact:
-        return result
-    return [
-        replace(
-            profile,
-            aliases=profile.aliases[-PROMPT_ALIAS_LIMIT:],
-            traits=tuple(
-                trait
-                for trait in profile.traits
-                if trait.fact_id == 0 or trait.fact_id > profile.summary_through_fact_id
-            )[-PROMPT_UNSUMMARIZED_LIMIT:],
-        )
-        for profile in result
-    ]
+    return [item for item in profiles if item is not None]
 
 
 def pending_summary_batch(
