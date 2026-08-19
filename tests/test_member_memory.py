@@ -22,6 +22,7 @@ from plugins.member_memory.store import (
     apply_candidates,
     load_profiles,
     remember_identity,
+    _write_mirror,
 )
 
 try:
@@ -220,6 +221,16 @@ class MemberMemoryStoreTests(unittest.TestCase):
             with patch("plugins.member_memory.store.os.replace", side_effect=OSError("disk full")):
                 profile = remember_identity(db, root, group_id=123, user_id="7", nickname="小明")
             self.assertEqual("小明", profile.nickname)
+            self.assertEqual("小明", load_profiles(db, group_id=123, user_ids=["7"])[0].nickname)
+
+
+    def test_mirror_directory_failure_does_not_escape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "member_memory"
+            db = Path(directory) / "chat.db"
+            profile = remember_identity(db, root, group_id=123, user_id="7", nickname="小明")
+            with patch("plugins.member_memory.store.Path.mkdir", side_effect=OSError("read-only")):
+                _write_mirror(db, root, profile.group_id, profile.user_id)
             self.assertEqual("小明", load_profiles(db, group_id=123, user_ids=["7"])[0].nickname)
 
 

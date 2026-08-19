@@ -56,3 +56,15 @@
 另行通过：
 - /opt/qq-violation-bot/.venv/bin/python -m py_compile plugins/member_memory/store.py
 - git diff --check
+
+
+## Fix round 2
+
+### 修复内容
+- 将 mirror 目标目录创建纳入 OSError 防护；目录创建失败只记录日志并返回，不向业务调用方传播。
+- 新增 test_mirror_directory_failure_does_not_escape，验证 SQLite profile 仍可读取。
+
+### RED / GREEN 证据
+RED：新增目录创建失败测试在修复前以 OSError 失败。
+GREEN：/opt/qq-violation-bot/.venv/bin/python -m unittest tests.test_member_memory.MemberMemoryStoreTests -v 结果为 6 tests，全部通过（OK）。
+另行通过 py_compile plugins/member_memory/store.py 与 git diff --check。

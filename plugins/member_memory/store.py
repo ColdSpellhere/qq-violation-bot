@@ -194,7 +194,11 @@ def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> None:
     if profile is None:
         return
     directory = root / str(profile.group_id)
-    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.exception("member memory mirror directory creation failed for group=%s user=%s", group_id, user_id)
+        return
     target = directory / f"{profile.user_id}.json"
     temporary = directory / f".{profile.user_id}.json.tmp"
     payload = {
