@@ -148,9 +148,7 @@ def _profile_row(conn: sqlite3.Connection, group_id: int, user_id: str) -> Membe
             (group_id, user_id),
         ).fetchall()
     )
-    if not aliases:
-        aliases = _decode_json_aliases(row[3])
-    facts = tuple(
+    traits = tuple(
         MemoryTrait(text, evidence, created, int(fact_id))
         for fact_id, text, evidence, created in conn.execute(
             "SELECT id,trait,evidence_message_id,created_at FROM member_memory_facts "
@@ -158,7 +156,6 @@ def _profile_row(conn: sqlite3.Connection, group_id: int, user_id: str) -> Membe
             (group_id, user_id),
         ).fetchall()
     )
-    traits = facts or _decode_json_traits(row[4])
     summary_row = conn.execute(
         "SELECT summary_text,through_fact_id FROM member_memory_summaries WHERE group_id=? AND user_id=?",
         (group_id, user_id),
@@ -170,35 +167,123 @@ def _profile_row(conn: sqlite3.Connection, group_id: int, user_id: str) -> Membe
     )
 
 
-def _import_legacy_profile(conn: sqlite3.Connection, profile: MemberProfile) -> None:
-    for alias in profile.aliases:
-        _append_alias(conn, profile.group_id, profile.user_id, alias, profile.updated_at)
-    for trait in profile.traits:
-        _append_fact(
-            conn,
-            profile.group_id,
-            profile.user_id,
-            trait.text,
-            trait.evidence_message_id,
-            trait.updated_at,
-        )
-
-
-def _append_alias(conn: sqlite3.Connection, group_id: int, user_id: str, alias: str, seen_at: str) -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO member_memory_aliases(group_id,user_id,alias,first_seen_at) VALUES(?,?,?,?)",
-        (group_id, user_id, alias, seen_at),
+def _legacy_profile_row(
+    conn: sqlite3.Connection,
+    group_id: int,
+    user_id: str,
+    *,
+    include_aliases: bool,
+    include_traits: bool,
+) -> MemberProfile | None:
+    row = conn.execute(
+        "SELECT group_id,user_id,nickname,aliases_json,traits_json,updated_at "
+        "FROM member_memories WHERE group_id=? AND user_id=?",
+        (group_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return MemberProfile(
+        int(row[0]),
+        str(row[1]),
+        str(row[2]),
+        _decode_json_aliases(row[3]) if include_aliases else (),
+        _decode_json_traits(row[4]) if include_traits else (),
+        str(row[5]),
     )
+
+
+def _profile_with_legacy_fallback(
+    conn: sqlite3.Connection, group_id: int, user_id: str
+) -> MemberProfile | None:
+    profile = _profile_row(conn, group_id, user_id)
+    if profile is None or (profile.aliases and profile.traits):
+        return profile
+    legacy = _legacy_profile_row(
+        conn,
+        group_id,
+        user_id,
+        include_aliases=not profile.aliases,
+        include_traits=not profile.traits,
+    )
+    if legacy is None:
+        return profile
+    return MemberProfile(
+        profile.group_id,
+        profile.user_id,
+        profile.nickname,
+        profile.aliases or legacy.aliases,
+        profile.traits or legacy.traits,
+        profile.updated_at,
+        profile.summary,
+        profile.summary_through_fact_id,
+    )
+
+
+def _import_legacy_profile(conn: sqlite3.Connection, group_id: int, user_id: str) -> None:
+    aliases_empty = conn.execute(
+        "SELECT 1 FROM member_memory_aliases WHERE group_id=? AND user_id=? LIMIT 1",
+        (group_id, user_id),
+    ).fetchone() is None
+    facts_empty = conn.execute(
+        "SELECT 1 FROM member_memory_facts WHERE group_id=? AND user_id=? LIMIT 1",
+        (group_id, user_id),
+    ).fetchone() is None
+    if not aliases_empty and not facts_empty:
+        return
+    legacy = _legacy_profile_row(
+        conn,
+        group_id,
+        user_id,
+        include_aliases=aliases_empty,
+        include_traits=facts_empty,
+    )
+    if legacy is None:
+        return
+    if aliases_empty:
+        for alias in legacy.aliases[-LEGACY_VIEW_LIMIT:]:
+            _append_alias(conn, group_id, user_id, alias, legacy.updated_at)
+    if facts_empty:
+        for trait in legacy.traits[-LEGACY_VIEW_LIMIT:]:
+            _append_fact(
+                conn,
+                group_id,
+                user_id,
+                trait.text,
+                trait.evidence_message_id,
+                trait.updated_at,
+            )
+
+
+def _append_alias(
+    conn: sqlite3.Connection, group_id: int, user_id: str, alias: str, seen_at: str
+) -> bool:
+    try:
+        cursor = conn.execute(
+            "INSERT INTO member_memory_aliases(group_id,user_id,alias,first_seen_at) "
+            "SELECT ?,?,?,? WHERE NOT EXISTS ("
+            "SELECT 1 FROM member_memory_aliases WHERE group_id=? AND user_id=? AND alias=?"
+            ")",
+            (group_id, user_id, alias, seen_at, group_id, user_id, alias),
+        )
+    except sqlite3.IntegrityError:
+        return False
+    return cursor.rowcount == 1
 
 
 def _append_fact(
     conn: sqlite3.Connection, group_id: int, user_id: str, trait: str, evidence_id: str, created_at: str
 ) -> bool:
-    cursor = conn.execute(
-        "INSERT OR IGNORE INTO member_memory_facts(group_id,user_id,trait,evidence_message_id,created_at) "
-        "VALUES(?,?,?,?,?)",
-        (group_id, user_id, trait, evidence_id, created_at),
-    )
+    try:
+        cursor = conn.execute(
+            "INSERT INTO member_memory_facts(group_id,user_id,trait,evidence_message_id,created_at) "
+            "SELECT ?,?,?,?,? WHERE NOT EXISTS ("
+            "SELECT 1 FROM member_memory_facts "
+            "WHERE group_id=? AND user_id=? AND trait=? AND evidence_message_id=?"
+            ")",
+            (group_id, user_id, trait, evidence_id, created_at, group_id, user_id, trait, evidence_id),
+        )
+    except sqlite3.IntegrityError:
+        return False
     return cursor.rowcount == 1
 
 
@@ -242,9 +327,9 @@ def migrate_legacy_memory(path: Path, root: Path, *, apply: bool) -> MemoryMigra
                     trait.evidence_message_id, trait.updated_at or profile.updated_at,
                 ))
             for alias in profile.aliases:
-                before = conn.total_changes
-                _append_alias(conn, profile.group_id, profile.user_id, alias, profile.updated_at)
-                inserted_aliases += int(conn.total_changes > before)
+                inserted_aliases += int(_append_alias(
+                    conn, profile.group_id, profile.user_id, alias, profile.updated_at,
+                ))
         conn.commit()
     for profile in profiles:
         _write_mirror(path, root, profile.group_id, profile.user_id)
@@ -256,7 +341,7 @@ def migrate_legacy_memory(path: Path, root: Path, *, apply: bool) -> MemoryMigra
 def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> None:
     with sqlite3.connect(path) as conn:
         _ensure_schema(conn)
-        profile = _profile_row(conn, group_id, str(user_id))
+        profile = _profile_with_legacy_fallback(conn, group_id, str(user_id))
     if profile is None:
         return
     directory = root / str(profile.group_id)
@@ -294,7 +379,7 @@ def remember_identity(path: Path, root: Path, *, group_id: int, user_id: str, ni
         _ensure_schema(conn)
         existing = _profile_row(conn, group_id, user_id)
         if existing is not None:
-            _import_legacy_profile(conn, existing)
+            _import_legacy_profile(conn, group_id, user_id)
             existing = _profile_row(conn, group_id, user_id)
         seen_at = _now()
         if existing and existing.nickname != cleaned_name:
@@ -319,7 +404,7 @@ def remember_identity(path: Path, root: Path, *, group_id: int, user_id: str, ni
                 updated_at,
             ),
         )
-        profile = _profile_row(conn, group_id, user_id)
+        profile = _profile_with_legacy_fallback(conn, group_id, user_id)
     assert profile is not None
     _write_mirror(path, root, group_id, user_id)
     return profile
@@ -400,7 +485,7 @@ def load_profiles(
                     conn, group_id, item, include_summary=include_summary
                 )
                 if compact
-                else _profile_row(conn, group_id, item)
+                else _profile_with_legacy_fallback(conn, group_id, item)
                 for item in ordered
             ]
     except (OSError, sqlite3.Error):

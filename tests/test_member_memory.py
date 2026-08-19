@@ -253,6 +253,27 @@ class MemberMemoryStoreTests(unittest.TestCase):
             self.assertNotIn("电话12345678901", [item.text for item in profile.traits])
 
 
+    def test_repeated_candidate_does_not_replay_ledger_or_advance_fact_sequence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "member_memory"
+            db = Path(directory) / "chat.db"
+            context = [ContextMessage("小明", "我喜欢火锅", message_id="m1", user_id="7")]
+            candidate = {
+                "user_id": "7",
+                "trait": "喜欢火锅",
+                "evidence_message_id": "m1",
+                "quote": "我喜欢火锅",
+            }
+
+            self.assertEqual(1, apply_candidates(db, root, group_id=123, context=context, candidates=[candidate]))
+            self.assertEqual(0, apply_candidates(db, root, group_id=123, context=context, candidates=[candidate]))
+            with sqlite3.connect(db) as conn:
+                self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM member_memory_facts").fetchone()[0])
+                self.assertEqual(
+                    1,
+                    conn.execute("SELECT seq FROM sqlite_sequence WHERE name=\"member_memory_facts\"").fetchone()[0],
+                )
+
     def test_legacy_profile_is_imported_into_append_only_ledger_before_update(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "member_memory"

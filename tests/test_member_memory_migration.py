@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +68,27 @@ class MemberMemoryMigrationTests(unittest.TestCase):
         self.assertEqual(8, report.source_facts)
         self.assertEqual(2, report.source_aliases)
         self.assertEqual(0, report.inserted_facts)
+        self.assertFalse(table_exists(self.db, "member_memory_facts"))
+
+    def test_cli_without_mode_defaults_to_zero_write_dry_run(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "scripts/migrate_member_memory_v2.py",
+                "--database",
+                str(self.db),
+                "--mirror-root",
+                str(self.root),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIn("inserted_facts=0", completed.stdout)
         self.assertFalse(table_exists(self.db, "member_memory_facts"))
 
     def test_apply_is_idempotent_and_preserves_counts(self):

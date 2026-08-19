@@ -18,13 +18,15 @@ from plugins.member_memory.store import migrate_legacy_memory, pending_summary_b
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Migrate legacy member memories to the permanent ledger.")
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
     parser.add_argument("--summarize", action="store_true")
     parser.add_argument("--database", type=Path, default=PROJECT_DIR / "data" / "chat_archive.db")
     parser.add_argument("--mirror-root", type=Path, default=PROJECT_DIR / "data" / "member_memory")
     args = parser.parse_args()
+    if not args.apply:
+        args.dry_run = True
     if args.summarize and not args.apply:
         parser.error("--summarize requires --apply")
     return args
