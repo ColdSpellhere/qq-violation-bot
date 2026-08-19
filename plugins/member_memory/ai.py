@@ -87,7 +87,10 @@ async def generate_memory_summary(existing: str, facts: Sequence[MemoryTrait]) -
                 json=payload,
             )
             response.raise_for_status()
-            text = str(response.json()["choices"][0]["message"]["content"]).strip()
+            content = response.json()["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                return None
+            text = content.strip()
     except (OSError, ValueError, KeyError, TypeError, httpx.HTTPError):
         return None
     return text if text and len(text) <= 300 else None

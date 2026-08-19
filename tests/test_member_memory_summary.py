@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
@@ -44,6 +45,44 @@ class MemberMemorySummaryTests(unittest.IsolatedAsyncioTestCase):
         seed_facts(self.db, self.root, count=5)
         with patch("plugins.member_memory.summary.generate_memory_summary", AsyncMock(return_value=None)):
             self.assertFalse(await refresh_member_summary(self.db, self.root, group_id=123, user_id="7"))
+        profile = load_profiles(self.db, group_id=123, user_ids=["7"])[0]
+        self.assertEqual("", profile.summary)
+        self.assertEqual(0, profile.summary_through_fact_id)
+        self.assertEqual(5, len(profile.traits))
+
+    async def test_null_ai_content_keeps_cursor_and_raw_facts(self):
+        class NullResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": None}}]}
+
+        class NullClient:
+            def __init__(self, *, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, *, headers, json):
+                return NullResponse()
+
+        seed_facts(self.db, self.root, count=5)
+        config = SimpleNamespace(
+            ai_api_key="test-key",
+            ai_base_url="https://ai.example.com",
+            ai_model="test-model",
+            ai_timeout=12,
+        )
+        with patch("plugins.member_memory.ai.CONFIG", config), patch(
+            "plugins.member_memory.ai.httpx.AsyncClient", NullClient
+        ):
+            self.assertFalse(await refresh_member_summary(self.db, self.root, group_id=123, user_id="7"))
+
         profile = load_profiles(self.db, group_id=123, user_ids=["7"])[0]
         self.assertEqual("", profile.summary)
         self.assertEqual(0, profile.summary_through_fact_id)
