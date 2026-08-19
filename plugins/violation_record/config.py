@@ -85,6 +85,9 @@ class AppConfig:
     ai_model: str = os.getenv("AI_MODEL", "deepseek-chat")
     ai_timeout: int = _int_env("AI_TIMEOUT", 30)
     random_chat_enabled: bool = _bool_env("RANDOM_CHAT_ENABLED", False)
+    member_memory_summary_enabled: bool = _bool_env(
+        "MEMBER_MEMORY_SUMMARY_ENABLED", False
+    )
     random_chat_probability: float = min(
         1.0, max(0.0, _float_env("RANDOM_CHAT_PROBABILITY", 0.05))
     )

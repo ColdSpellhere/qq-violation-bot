@@ -20,6 +20,7 @@ from plugins.member_memory.store import (
     MemberProfile,
     MemoryTrait,
     apply_candidates,
+    commit_summary,
     load_profiles,
     remember_identity,
     _write_mirror,
@@ -99,7 +100,7 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
             memory_matcher,
             "extract_memory_candidates",
             AsyncMock(return_value=candidates),
-        ) as extract, patch.object(memory_matcher, "apply_candidates") as apply:
+        ) as extract, patch.object(memory_matcher, "apply_candidates", return_value=1) as apply:
             await memory_matcher.analyze_member_memory(123, "7", 2000)
 
         recent.assert_called_once_with(
@@ -119,6 +120,30 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
             candidates=[candidates[0]],
         )
 
+    async def test_analysis_refreshes_summary_after_new_facts(self):
+        context = [ContextMessage("小明", "我喜欢火锅", message_id="m1", user_id="7")]
+        candidates = [{"user_id": "7", "trait": "喜欢火锅"}]
+        config = SimpleNamespace(
+            chat_archive_path=Path("/tmp/chat.db"),
+            member_memory_root=Path("/tmp/member-memory"),
+            bot_self_id="999",
+            member_memory_summary_enabled=True,
+        )
+        with patch.object(memory_matcher, "CONFIG", config), patch.object(
+            memory_matcher, "recent_text_context", return_value=context
+        ), patch.object(
+            memory_matcher, "extract_memory_candidates", AsyncMock(return_value=candidates)
+        ), patch.object(
+            memory_matcher, "apply_candidates", return_value=1
+        ), patch.object(
+            memory_matcher, "refresh_member_summary", AsyncMock(return_value=True)
+        ) as refresh:
+            await memory_matcher.analyze_member_memory(123, "7", 2000)
+
+        refresh.assert_awaited_once_with(
+            config.chat_archive_path, config.member_memory_root, group_id=123, user_id="7"
+        )
+
     async def test_analysis_failure_is_caught_at_callback_boundary(self):
         with patch.object(
             memory_matcher, "recent_text_context", side_effect=RuntimeError("db failed")
@@ -129,6 +154,36 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MemberMemoryStoreTests(unittest.TestCase):
+    def test_compact_profile_contains_summary_and_only_bounded_pending_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "member_memory"
+            db = Path(directory) / "chat.db"
+            context = [
+                ContextMessage("小明", f"我喜欢爱好{index}", message_id=f"m{index}", user_id="7")
+                for index in range(10)
+            ]
+            candidates = [
+                {
+                    "user_id": "7",
+                    "trait": f"爱好{index}",
+                    "evidence_message_id": f"m{index}",
+                    "quote": f"我喜欢爱好{index}",
+                }
+                for index in range(10)
+            ]
+            self.assertEqual(10, apply_candidates(db, root, group_id=123, context=context, candidates=candidates))
+            for index in range(10):
+                remember_identity(db, root, group_id=123, user_id="7", nickname=f"名字{index}")
+            self.assertTrue(commit_summary(
+                db, root, group_id=123, user_id="7", previous_through_id=0,
+                through_fact_id=2, summary="长期喜欢植物",
+            ))
+
+            profile = load_profiles(db, group_id=123, user_ids=["7"], compact=True)[0]
+
+            self.assertEqual("长期喜欢植物", profile.summary)
+            self.assertEqual(8, len(profile.traits))
+            self.assertEqual(5, len(profile.aliases))
     def test_store_imports_cleanly_in_fresh_process(self):
         env = os.environ.copy()
         env["TARGET_GROUP_ID"] = "975310864"

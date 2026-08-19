@@ -150,11 +150,11 @@ def _format_turn(item: ContextMessage) -> str:
 
 
 def _format_profile(profile: MemberProfile) -> str:
-    traits = "；".join(item.text for item in profile.traits)
-    aliases = "、".join(profile.aliases)
     details = []
-    if aliases:
-        details.append(f"旧称:{aliases}")
-    if traits:
-        details.append(f"明确特性:{traits}")
+    if profile.aliases:
+        details.append("旧称:" + "、".join(profile.aliases))
+    if profile.summary:
+        details.append("记忆摘要:" + profile.summary)
+    if profile.traits:
+        details.append("新增特性:" + "；".join(item.text for item in profile.traits))
     return f"{profile.nickname}[QQ:{profile.user_id}] " + ("；".join(details) or "无稳定特性")

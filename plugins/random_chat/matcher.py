@@ -1,9 +1,15 @@
+from dataclasses import replace
+
 from nonebot import logger, on_message
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, MessageSegment
 from nonebot.rule import Rule
 
 from plugins.chat_archive.db import ContextMessage, archived_message_author, recent_text_context
-from plugins.member_memory.store import load_profiles
+from plugins.member_memory.store import (
+    PROMPT_ALIAS_LIMIT,
+    PROMPT_UNSUMMARIZED_LIMIT,
+    load_profiles,
+)
 from plugins.violation_record.config import CONFIG
 
 from .ai import RandomChatAIError, generate_reply
@@ -70,7 +76,22 @@ async def send_random_reply(
         CONFIG.chat_archive_path,
         group_id=int(event.group_id),
         user_ids=[item.user_id for item in memory_context],
+        compact=True,
     )
+    if not CONFIG.member_memory_summary_enabled:
+        profiles = [
+            replace(
+                profile,
+                aliases=profile.aliases[-PROMPT_ALIAS_LIMIT:],
+                summary="",
+                traits=profile.traits[-PROMPT_UNSUMMARIZED_LIMIT:],
+            )
+            for profile in load_profiles(
+                CONFIG.chat_archive_path,
+                group_id=int(event.group_id),
+                user_ids=[item.user_id for item in memory_context],
+            )
+        ]
     try:
         reply = await generate_reply(
             text,

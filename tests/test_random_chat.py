@@ -33,6 +33,7 @@ class RandomChatPolicyTests(unittest.TestCase):
                 (
                     "from plugins.violation_record.config import CONFIG; "
                     "assert CONFIG.random_chat_enabled is False; "
+                    "assert CONFIG.member_memory_summary_enabled is False; "
                     "assert CONFIG.random_chat_probability == 0.05; "
                     "assert CONFIG.random_chat_direct_fallback_enabled is False"
                 ),
@@ -128,6 +129,7 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
                         aliases=(),
                         traits=(MemoryTrait("喜欢火锅", "1", "2026-08-06 00:00:00"),),
                         updated_at="2026-08-06 00:00:00",
+                        summary="长期喜欢植物",
                     )
                 ],
             )
@@ -147,6 +149,8 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("艾特:QQ:11", user_content)
         self.assertIn("小刚[QQ:33]", user_content)
         self.assertIn("喜欢火锅", user_content)
+        self.assertIn("记忆摘要:长期喜欢植物", user_content)
+        self.assertIn("新增特性:喜欢火锅", user_content)
         self.assertIn("群友之间说的话不等于对你说", system_prompt)
         self.assertIn("萝卜猫", system_prompt)
         self.assertIn("花和植物", system_prompt)

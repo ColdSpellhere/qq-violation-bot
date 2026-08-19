@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
@@ -266,7 +266,9 @@ def remember_identity(path: Path, root: Path, *, group_id: int, user_id: str, ni
     return profile
 
 
-def load_profiles(path: Path, *, group_id: int, user_ids: Iterable[str]) -> list[MemberProfile]:
+def load_profiles(
+    path: Path, *, group_id: int, user_ids: Iterable[str], compact: bool = False
+) -> list[MemberProfile]:
     ordered = list(dict.fromkeys(str(item) for item in user_ids if str(item)))
     if not path.is_file() or not ordered:
         return []
@@ -276,7 +278,21 @@ def load_profiles(path: Path, *, group_id: int, user_ids: Iterable[str]) -> list
             profiles = [_profile_row(conn, group_id, item) for item in ordered]
     except (OSError, sqlite3.Error):
         return []
-    return [item for item in profiles if item is not None]
+    result = [item for item in profiles if item is not None]
+    if not compact:
+        return result
+    return [
+        replace(
+            profile,
+            aliases=profile.aliases[-PROMPT_ALIAS_LIMIT:],
+            traits=tuple(
+                trait
+                for trait in profile.traits
+                if trait.fact_id == 0 or trait.fact_id > profile.summary_through_fact_id
+            )[-PROMPT_UNSUMMARIZED_LIMIT:],
+        )
+        for profile in result
+    ]
 
 
 def pending_summary_batch(

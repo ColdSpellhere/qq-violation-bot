@@ -10,6 +10,7 @@ from plugins.chat_archive.db import recent_text_context
 from plugins.member_memory.ai import extract_memory_candidates
 from plugins.member_memory.batcher import MemberMemoryBatcher
 from plugins.member_memory.store import apply_candidates
+from plugins.member_memory.summary import refresh_member_summary
 from plugins.violation_record.config import CONFIG
 
 
@@ -60,13 +61,20 @@ async def analyze_member_memory(group_id: int, user_id: str, event_time: int) ->
             for item in candidates
             if str(item.get("user_id") or "") == user_id
         ]
-        apply_candidates(
+        applied = apply_candidates(
             CONFIG.chat_archive_path,
             CONFIG.member_memory_root,
             group_id=group_id,
             context=context,
             candidates=member_candidates,
         )
+        if applied > 0 and CONFIG.member_memory_summary_enabled:
+            await refresh_member_summary(
+                CONFIG.chat_archive_path,
+                CONFIG.member_memory_root,
+                group_id=group_id,
+                user_id=user_id,
+            )
     except Exception as exc:
         logger.warning(
             f"群友记忆分析失败 group_id={group_id} user_id={user_id} "
