@@ -93,6 +93,14 @@ class SummaryWork:
     facts: tuple[MemoryTrait, ...]
 
 
+@dataclass(frozen=True)
+class MemoryMigrationReport:
+    profiles: int
+    source_facts: int
+    source_aliases: int
+    inserted_facts: int
+    inserted_aliases: int
+
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -192,6 +200,57 @@ def _append_fact(
         (group_id, user_id, trait, evidence_id, created_at),
     )
     return cursor.rowcount == 1
+
+
+def _legacy_profile(row: tuple[object, ...]) -> MemberProfile:
+    return MemberProfile(
+        group_id=int(row[0]),
+        user_id=str(row[1]),
+        nickname=str(row[2]),
+        aliases=_decode_json_aliases(row[3]),
+        traits=_decode_json_traits(row[4]),
+        updated_at=str(row[5]),
+    )
+
+
+def migrate_legacy_memory(path: Path, root: Path, *, apply: bool) -> MemoryMigrationReport:
+    empty = MemoryMigrationReport(0, 0, 0, 0, 0)
+    if not path.is_file():
+        return empty
+    with sqlite3.connect(path) as conn:
+        has_legacy_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type=? AND name=?",
+            ("table", "member_memories"),
+        ).fetchone()
+        if has_legacy_table is None:
+            return empty
+        rows = conn.execute(
+            "SELECT group_id,user_id,nickname,aliases_json,traits_json,updated_at FROM member_memories"
+        ).fetchall()
+        profiles = tuple(_legacy_profile(row) for row in rows)
+        source_facts = sum(len(profile.traits) for profile in profiles)
+        source_aliases = sum(len(profile.aliases) for profile in profiles)
+        if not apply:
+            return MemoryMigrationReport(len(profiles), source_facts, source_aliases, 0, 0)
+        _ensure_schema(conn)
+        inserted_facts = 0
+        inserted_aliases = 0
+        for profile in profiles:
+            for trait in profile.traits:
+                inserted_facts += int(_append_fact(
+                    conn, profile.group_id, profile.user_id, trait.text,
+                    trait.evidence_message_id, trait.updated_at or profile.updated_at,
+                ))
+            for alias in profile.aliases:
+                before = conn.total_changes
+                _append_alias(conn, profile.group_id, profile.user_id, alias, profile.updated_at)
+                inserted_aliases += int(conn.total_changes > before)
+        conn.commit()
+    for profile in profiles:
+        _write_mirror(path, root, profile.group_id, profile.user_id)
+    return MemoryMigrationReport(
+        len(profiles), source_facts, source_aliases, inserted_facts, inserted_aliases
+    )
 
 
 def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> None:
