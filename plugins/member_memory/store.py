@@ -86,6 +86,13 @@ class MemberProfile:
     summary_through_fact_id: int = 0
 
 
+@dataclass(frozen=True)
+class SummaryWork:
+    summary: str
+    previous_through_id: int
+    facts: tuple[MemoryTrait, ...]
+
+
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -270,6 +277,68 @@ def load_profiles(path: Path, *, group_id: int, user_ids: Iterable[str]) -> list
     except (OSError, sqlite3.Error):
         return []
     return [item for item in profiles if item is not None]
+
+
+def pending_summary_batch(
+    path: Path, *, group_id: int, user_id: str, threshold: int = 5, limit: int = 20
+) -> SummaryWork | None:
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+        state = conn.execute(
+            "SELECT summary_text,through_fact_id FROM member_memory_summaries WHERE group_id=? AND user_id=?",
+            (group_id, user_id),
+        ).fetchone()
+        summary = str(state["summary_text"]) if state else ""
+        through = int(state["through_fact_id"]) if state else 0
+        pending_count = conn.execute(
+            "SELECT count(*) FROM member_memory_facts WHERE group_id=? AND user_id=? AND id>?",
+            (group_id, user_id, through),
+        ).fetchone()[0]
+        if pending_count < threshold:
+            return None
+        rows = conn.execute(
+            "SELECT id,trait,evidence_message_id,created_at FROM member_memory_facts "
+            "WHERE group_id=? AND user_id=? AND id>? ORDER BY id LIMIT ?",
+            (group_id, user_id, through, limit),
+        ).fetchall()
+    facts = tuple(
+        MemoryTrait(row["trait"], row["evidence_message_id"], row["created_at"], row["id"])
+        for row in rows
+    )
+    return SummaryWork(summary, through, facts)
+
+
+def commit_summary(
+    path: Path,
+    root: Path,
+    *,
+    group_id: int,
+    user_id: str,
+    previous_through_id: int,
+    through_fact_id: int,
+    summary: str,
+) -> bool:
+    with sqlite3.connect(path) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT through_fact_id FROM member_memory_summaries WHERE group_id=? AND user_id=?",
+            (group_id, user_id),
+        ).fetchone()
+        current = int(row[0]) if row else 0
+        if current != previous_through_id:
+            conn.rollback()
+            return False
+        conn.execute(
+            "INSERT INTO member_memory_summaries(group_id,user_id,summary_text,through_fact_id,updated_at) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(group_id,user_id) DO UPDATE SET "
+            "summary_text=excluded.summary_text,through_fact_id=excluded.through_fact_id,updated_at=excluded.updated_at",
+            (group_id, user_id, summary, through_fact_id, _now()),
+        )
+        conn.commit()
+    _write_mirror(path, root, group_id, user_id)
+    return True
 
 
 def apply_candidates(
