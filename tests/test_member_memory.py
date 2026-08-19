@@ -181,6 +181,48 @@ class MemberMemoryStoreTests(unittest.TestCase):
             self.assertNotIn("电话12345678901", [item.text for item in profile.traits])
 
 
+    def test_legacy_profile_is_imported_into_append_only_ledger_before_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "member_memory"
+            db = Path(directory) / "chat.db"
+            legacy_traits = [
+                {"text": "旧特性0", "evidence_message_id": "old0", "updated_at": "2026-01-01 00:00:00"},
+                {"text": "旧特性1", "evidence_message_id": "old1", "updated_at": "2026-01-01 00:00:01"},
+            ]
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE member_memories (group_id INTEGER NOT NULL, user_id TEXT NOT NULL, "
+                    "nickname TEXT NOT NULL, aliases_json TEXT NOT NULL, traits_json TEXT NOT NULL, "
+                    "updated_at TEXT NOT NULL, PRIMARY KEY(group_id,user_id))"
+                )
+                conn.execute(
+                    "INSERT INTO member_memories VALUES (?,?,?,?,?,?)",
+                    (123, "7", "旧昵称", json.dumps(["更旧昵称"]), json.dumps(legacy_traits), "2026-01-01 00:00:00"),
+                )
+            context = [ContextMessage("新昵称", "我喜欢火锅", message_id="m1", user_id="7")]
+            candidate = {"user_id": "7", "trait": "新特性", "evidence_message_id": "m1", "quote": "我喜欢火锅"}
+
+            self.assertEqual(1, apply_candidates(db, root, group_id=123, context=context, candidates=[candidate]))
+            self.assertEqual(0, apply_candidates(db, root, group_id=123, context=context, candidates=[candidate]))
+            profile = load_profiles(db, group_id=123, user_ids=["7"])[0]
+
+            self.assertEqual(("更旧昵称", "旧昵称"), profile.aliases)
+            self.assertEqual(["旧特性0", "旧特性1", "新特性"], [item.text for item in profile.traits])
+            with sqlite3.connect(db) as conn:
+                self.assertEqual(3, conn.execute("SELECT COUNT(*) FROM member_memory_facts").fetchone()[0])
+                self.assertEqual(2, conn.execute("SELECT COUNT(*) FROM member_memory_aliases").fetchone()[0])
+
+
+    def test_mirror_failure_does_not_rollback_committed_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "member_memory"
+            db = Path(directory) / "chat.db"
+            with patch("plugins.member_memory.store.os.replace", side_effect=OSError("disk full")):
+                profile = remember_identity(db, root, group_id=123, user_id="7", nickname="小明")
+            self.assertEqual("小明", profile.nickname)
+            self.assertEqual("小明", load_profiles(db, group_id=123, user_ids=["7"])[0].nickname)
+
+
 class _Response:
     def raise_for_status(self):
         return None

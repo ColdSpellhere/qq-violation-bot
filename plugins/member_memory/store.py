@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -57,6 +58,8 @@ MAX_ALIASES = LEGACY_VIEW_LIMIT
 MAX_TRAITS = LEGACY_VIEW_LIMIT
 PROMPT_ALIAS_LIMIT = 5
 PROMPT_UNSUMMARIZED_LIMIT = 8
+logger = logging.getLogger(__name__)
+
 SENSITIVE_RE = re.compile(
     r"手机号|电话号码?|身份证|住址|家庭地址|密码|token|银行卡|微信号|邮箱|真实姓名|\d{6,}",
     re.IGNORECASE,
@@ -111,7 +114,7 @@ def _decode_json_traits(value: object) -> tuple[MemoryTrait, ...]:
             for item in json.loads(str(value))
             if isinstance(item, dict) and {"text", "evidence_message_id", "updated_at"} <= item.keys()
         )
-    except (TypeError, json.JSONDecodeError, KeyError, TypeError):
+    except (TypeError, json.JSONDecodeError, KeyError):
         return ()
 
 
@@ -152,6 +155,20 @@ def _profile_row(conn: sqlite3.Connection, group_id: int, user_id: str) -> Membe
     )
 
 
+def _import_legacy_profile(conn: sqlite3.Connection, profile: MemberProfile) -> None:
+    for alias in profile.aliases:
+        _append_alias(conn, profile.group_id, profile.user_id, alias, profile.updated_at)
+    for trait in profile.traits:
+        _append_fact(
+            conn,
+            profile.group_id,
+            profile.user_id,
+            trait.text,
+            trait.evidence_message_id,
+            trait.updated_at,
+        )
+
+
 def _append_alias(conn: sqlite3.Connection, group_id: int, user_id: str, alias: str, seen_at: str) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO member_memory_aliases(group_id,user_id,alias,first_seen_at) VALUES(?,?,?,?)",
@@ -190,10 +207,13 @@ def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> None:
         "summary_through_fact_id": profile.summary_through_fact_id,
         "updated_at": profile.updated_at,
     }
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
-    os.replace(temporary, target)
-    target.chmod(0o600)
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        os.replace(temporary, target)
+        target.chmod(0o600)
+    except OSError:
+        logger.exception("member memory mirror write failed for group=%s user=%s", group_id, user_id)
 
 
 def remember_identity(path: Path, root: Path, *, group_id: int, user_id: str, nickname: str) -> MemberProfile:
@@ -203,6 +223,9 @@ def remember_identity(path: Path, root: Path, *, group_id: int, user_id: str, ni
     with sqlite3.connect(path) as conn:
         _ensure_schema(conn)
         existing = _profile_row(conn, group_id, user_id)
+        if existing is not None:
+            _import_legacy_profile(conn, existing)
+            existing = _profile_row(conn, group_id, user_id)
         seen_at = _now()
         if existing and existing.nickname != cleaned_name:
             _append_alias(conn, group_id, user_id, existing.nickname, seen_at)
