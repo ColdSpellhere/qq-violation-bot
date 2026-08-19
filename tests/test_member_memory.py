@@ -140,22 +140,22 @@ class MemberMemoryStoreTests(unittest.TestCase):
         )
         self.assertEqual(0, completed.returncode, completed.stderr)
 
-    def test_identity_keeps_bounded_aliases_and_writes_private_mirror(self):
+    def test_identity_keeps_all_historical_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "member_memory"
             db = Path(directory) / "chat.db"
-            remember_identity(db, root, group_id=123, user_id="7", nickname="旧名")
-            remember_identity(db, root, group_id=123, user_id="7", nickname="新名")
+            for index in range(10):
+                remember_identity(db, root, group_id=123, user_id="7", nickname=f"名字{index}")
             profile = load_profiles(db, group_id=123, user_ids=["7"])[0]
             mirror = root / "123" / "7.json"
 
-            self.assertEqual("新名", profile.nickname)
-            self.assertIn("旧名", profile.aliases)
+            self.assertEqual("名字9", profile.nickname)
+            self.assertEqual(tuple(f"名字{i}" for i in range(9)), profile.aliases)
             self.assertTrue(mirror.is_file())
             self.assertEqual(0o600, mirror.stat().st_mode & 0o777)
             self.assertEqual("7", json.loads(mirror.read_text())["user_id"])
 
-    def test_candidates_require_matching_first_party_evidence_and_are_bounded(self):
+    def test_candidates_keep_every_valid_fact_beyond_legacy_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "member_memory"
             db = Path(directory) / "chat.db"
@@ -173,10 +173,11 @@ class MemberMemoryStoreTests(unittest.TestCase):
                 ]
             )
             applied = apply_candidates(db, root, group_id=123, context=context, candidates=candidates)
+            self.assertEqual(0, apply_candidates(db, root, group_id=123, context=context, candidates=candidates))
             profile = load_profiles(db, group_id=123, user_ids=["7"])[0]
 
-            self.assertEqual(8, applied)
-            self.assertEqual(8, len(profile.traits))
+            self.assertEqual(10, applied)
+            self.assertEqual(10, len(profile.traits))
             self.assertNotIn("电话12345678901", [item.text for item in profile.traits])
 
 
