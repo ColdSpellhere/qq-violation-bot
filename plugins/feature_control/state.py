@@ -155,10 +155,10 @@ class FeatureController:
                 chat_enabled=cls._strict_bool(raw["chat_enabled"]),
                 group_chat_enabled=cls._strict_bool(raw["group_chat_enabled"]),
                 private_chat_enabled=cls._strict_bool(raw["private_chat_enabled"]),
-                group_chat_allowed_group_ids=cls._sorted_allowlist(
+                group_chat_allowed_group_ids=cls._load_allowlist(
                     "group_chat", raw["group_chat_allowed_group_ids"]
                 ),
-                private_chat_allowed_user_ids=cls._sorted_allowlist(
+                private_chat_allowed_user_ids=cls._load_allowlist(
                     "private_chat", raw["private_chat_allowed_user_ids"]
                 ),
                 updated_at=str(raw.get("updated_at", "")),
@@ -192,6 +192,14 @@ class FeatureController:
             if kind == "group_chat"
             else "private_chat_allowed_user_ids"
         )
+
+    @classmethod
+    def _load_allowlist(
+        cls, kind: str, values: Any
+    ) -> tuple[int, ...] | tuple[str, ...]:
+        if not isinstance(values, (list, tuple)):
+            raise ValueError("persisted allowlists must be arrays")
+        return cls._sorted_allowlist(kind, values)
 
     @classmethod
     def _sorted_allowlist(cls, kind: str, values: Any) -> tuple[int, ...] | tuple[str, ...]:
