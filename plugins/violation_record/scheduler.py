@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -84,60 +85,66 @@ async def _send_group_file(path: Path) -> str | None:
     return None
 
 
+def _reclaim_policy_outbox_leases(conn, *, as_of: str, lease_cutoff: str) -> None:
+    stale_rows = conn.execute(
+        """
+        SELECT * FROM v102_notification_outbox
+        WHERE status='sending' AND last_error IS NULL AND updated_at<=?
+        ORDER BY updated_at, id
+        """,
+        (lease_cutoff,),
+    ).fetchall()
+    for stale in stale_rows:
+        attempt_number = int(stale["attempt_count"] or 0)
+        if attempt_number > 0:
+            conn.execute(
+                """
+                INSERT INTO v102_notification_attempts(
+                    outbox_id, attempt_number, status, started_at,
+                    finished_at, detail, created_at, updated_at
+                ) VALUES(?, ?, 'lease_expired', ?, ?, ?, ?, ?)
+                ON CONFLICT(outbox_id, attempt_number) DO UPDATE SET
+                    status='lease_expired', finished_at=excluded.finished_at,
+                    detail=excluded.detail, updated_at=excluded.updated_at
+                """,
+                (
+                    stale["id"],
+                    attempt_number,
+                    stale["updated_at"],
+                    as_of,
+                    "发送租约超时，已自动回收",
+                    stale["updated_at"],
+                    as_of,
+                ),
+            )
+        conn.execute(
+            """
+            UPDATE v102_notification_outbox
+            SET status='failed', last_error='sending lease expired',
+                scheduled_at=?, updated_at=?
+            WHERE id=? AND status='sending'
+            """,
+            (as_of, as_of, stale["id"]),
+        )
+    conn.execute(
+        """
+        UPDATE v102_notification_outbox
+        SET status='failed', updated_at=?
+        WHERE status='sending' AND last_error IS NOT NULL
+          AND updated_at<=?
+        """,
+        (as_of, lease_cutoff),
+    )
+
+
 def _claim_policy_outbox(as_of: str, limit: int) -> list[dict]:
     with connect() as conn:
         lease_cutoff = (
             datetime.fromisoformat(as_of)
             - timedelta(minutes=_OUTBOX_LEASE_MINUTES)
         ).strftime("%Y-%m-%d %H:%M:%S")
-        stale_rows = conn.execute(
-            """
-            SELECT * FROM v102_notification_outbox
-            WHERE status='sending' AND last_error IS NULL AND updated_at<=?
-            ORDER BY updated_at, id
-            """,
-            (lease_cutoff,),
-        ).fetchall()
-        for stale in stale_rows:
-            attempt_number = int(stale["attempt_count"] or 0)
-            if attempt_number > 0:
-                conn.execute(
-                    """
-                    INSERT INTO v102_notification_attempts(
-                        outbox_id, attempt_number, status, started_at,
-                        finished_at, detail, created_at, updated_at
-                    ) VALUES(?, ?, 'lease_expired', ?, ?, ?, ?, ?)
-                    ON CONFLICT(outbox_id, attempt_number) DO UPDATE SET
-                        status='lease_expired', finished_at=excluded.finished_at,
-                        detail=excluded.detail, updated_at=excluded.updated_at
-                    """,
-                    (
-                        stale["id"],
-                        attempt_number,
-                        stale["updated_at"],
-                        as_of,
-                        "发送租约超时，已自动回收",
-                        stale["updated_at"],
-                        as_of,
-                    ),
-                )
-            conn.execute(
-                """
-                UPDATE v102_notification_outbox
-                SET status='failed', last_error='sending lease expired',
-                    scheduled_at=?, updated_at=?
-                WHERE id=? AND status='sending'
-                """,
-                (as_of, as_of, stale["id"]),
-            )
-        conn.execute(
-            """
-            UPDATE v102_notification_outbox
-            SET status='failed', updated_at=?
-            WHERE status='sending' AND last_error IS NOT NULL
-              AND updated_at<=?
-            """,
-            (as_of, lease_cutoff),
+        _reclaim_policy_outbox_leases(
+            conn, as_of=as_of, lease_cutoff=lease_cutoff
         )
         rows = conn.execute(
             """
@@ -322,20 +329,155 @@ def _record_missed_business_notification(
         return cursor.rowcount
 
 
-def _claim_missed_business_outbox(as_of: str) -> list[dict]:
+def _claim_business_notification_task(
+    *,
+    idempotency_key: str,
+    message_type: str,
+    message_text: str,
+    as_of: str,
+) -> dict | None:
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO business_notification_outbox(
+                idempotency_key, message_type, message_text, reason,
+                status, created_at, updated_at
+            ) VALUES(?, ?, ?, 'pending', 'pending', ?, ?)
+            ON CONFLICT(idempotency_key) DO NOTHING
+            """,
+            (idempotency_key, message_type, message_text, as_of, as_of),
+        )
+        row = conn.execute(
+            """
+            UPDATE business_notification_outbox
+            SET status='sending', updated_at=?
+            WHERE idempotency_key=? AND status='pending'
+            RETURNING *
+            """,
+            (as_of, idempotency_key),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _finish_business_notification_task(
+    row: dict,
+    *,
+    status: str,
+    reason: str,
+    message_text: str,
+    as_of: str,
+) -> int:
+    if status not in {"failed", "sent"}:
+        raise ValueError(f"unsupported business notification status: {status}")
+    sent_at = as_of if status == "sent" else None
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE business_notification_outbox
+            SET status=?, reason=?, message_text=?, sent_at=?, updated_at=?
+            WHERE id=? AND status='sending' AND updated_at=?
+            """,
+            (
+                status,
+                reason,
+                message_text,
+                sent_at,
+                as_of,
+                row["id"],
+                row["updated_at"],
+            ),
+        )
+        return cursor.rowcount
+
+
+def _claim_generated_legacy_notifications(
+    messages: list[str], *, maintenance_date: str, as_of: str
+) -> list[dict]:
+    tasks = [
+        (
+            "legacy:"
+            f"{maintenance_date}:automatic_maintenance:"
+            f"{hashlib.sha256(message.encode('utf-8')).hexdigest()}",
+            message,
+        )
+        for message in messages
+    ]
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for idempotency_key, message in tasks:
+            conn.execute(
+                """
+                INSERT INTO business_notification_outbox(
+                    idempotency_key, message_type, message_text, reason,
+                    status, created_at, updated_at
+                ) VALUES(?, 'legacy', ?, 'pending', 'pending', ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (idempotency_key, message, as_of, as_of),
+            )
+        claimed: list[dict] = []
+        for idempotency_key, _ in tasks:
+            row = conn.execute(
+                """
+                UPDATE business_notification_outbox
+                SET status='sending', updated_at=?
+                WHERE idempotency_key=? AND status='pending'
+                RETURNING *
+                """,
+                (as_of, idempotency_key),
+            ).fetchone()
+            if row is not None:
+                claimed.append(dict(row))
+    return claimed
+
+
+def _claim_missed_outboxes(as_of: str) -> tuple[list[dict], list[dict]]:
     lease_cutoff = (
         datetime.fromisoformat(as_of) - timedelta(minutes=_OUTBOX_LEASE_MINUTES)
     ).strftime("%Y-%m-%d %H:%M:%S")
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        policy_available = (
+            conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='v102_notification_outbox'
+                """
+            ).fetchone()
+            is not None
+        )
+        policy_rows: list[dict] = []
+        if policy_available:
+            _reclaim_policy_outbox_leases(
+                conn, as_of=as_of, lease_cutoff=lease_cutoff
+            )
+            policy_rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    UPDATE v102_notification_outbox
+                    SET status='sending', updated_at=?
+                    WHERE status='failed' AND scheduled_at<=?
+                    RETURNING *
+                    """,
+                    (as_of, as_of),
+                )
+            ]
         conn.execute(
             """
             UPDATE business_notification_outbox
-            SET status='failed', updated_at=?
+            SET status='failed',
+                reason=CASE
+                    WHEN reason IN ('pending', 'sent') THEN 'send_failed'
+                    ELSE reason
+                END,
+                updated_at=?
             WHERE status='sending' AND updated_at<=?
             """,
             (as_of, lease_cutoff),
         )
-        claimed = [
+        generic_rows = [
             dict(row)
             for row in conn.execute(
                 """
@@ -347,7 +489,10 @@ def _claim_missed_business_outbox(as_of: str) -> list[dict]:
                 (as_of,),
             )
         ]
-    return sorted(claimed, key=lambda row: (row["created_at"], row["id"]))
+    return (
+        sorted(policy_rows, key=lambda row: (row["scheduled_at"], row["id"])),
+        sorted(generic_rows, key=lambda row: (row["created_at"], row["id"])),
+    )
 
 
 def _restore_missed_business_claims(rows: list[dict], *, as_of: str) -> int:
@@ -364,36 +509,6 @@ def _restore_missed_business_claims(rows: list[dict], *, as_of: str) -> int:
             )
             restored += cursor.rowcount
     return restored
-
-
-def _claim_missed_policy_outbox(as_of: str) -> list[dict]:
-    with connect() as conn:
-        claimed = [
-            dict(row)
-            for row in conn.execute(
-                """
-                UPDATE v102_notification_outbox
-                SET status='sending', updated_at=?
-                WHERE status='failed' AND scheduled_at<=?
-                RETURNING *
-                """,
-                (as_of, as_of),
-            )
-        ]
-    return sorted(claimed, key=lambda row: (row["scheduled_at"], row["id"]))
-
-
-def _policy_outbox_available() -> bool:
-    with connect() as conn:
-        return (
-            conn.execute(
-                """
-                SELECT 1 FROM sqlite_master
-                WHERE type='table' AND name='v102_notification_outbox'
-                """
-            ).fetchone()
-            is not None
-        )
 
 
 def _cancel_missed_policy_claim(
@@ -435,12 +550,7 @@ async def deliver_missed_policy_summary(
     bot, *, as_of: str | None = None
 ) -> int:
     moment = as_of or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    selected = (
-        _claim_missed_policy_outbox(moment)
-        if _policy_outbox_available()
-        else []
-    )
-    generic_rows = _claim_missed_business_outbox(moment)
+    selected, generic_rows = _claim_missed_outboxes(moment)
 
     valid_rows: list[dict] = []
     seen_ids: set[int] = set()
@@ -744,16 +854,20 @@ async def maintenance_tick(
                 next(iter(bots.values())), as_of=moment
             )
         if _business_allowed():
-            for index, message in enumerate(automatic_maintenance()):
-                failure = await _send_group(message)
-                if failure in {"bot_offline", "send_failed"}:
-                    _record_missed_business_notification(
-                        idempotency_key=f"legacy:{moment}:{index}",
-                        message_type="legacy",
-                        message_text=message,
-                        reason=failure,
-                        as_of=moment,
-                    )
+            legacy_tasks = _claim_generated_legacy_notifications(
+                list(automatic_maintenance()),
+                maintenance_date=current.date().isoformat(),
+                as_of=moment,
+            )
+            for task in legacy_tasks:
+                failure = await _send_group(task["message_text"])
+                _finish_business_notification_task(
+                    task,
+                    status="sent" if failure is None else "failed",
+                    reason="sent" if failure is None else failure,
+                    message_text=task["message_text"],
+                    as_of=moment,
+                )
 
     if run_periodic_files:
         if current.weekday() in {0, 3, 6} and _last_backup_day != current.date():
@@ -766,35 +880,67 @@ async def maintenance_tick(
             and current.hour == 0
             and current.minute >= 10
             and _last_weekly != current.date()
-            and FEATURES.business_allowed(
-                CONFIG.target_group_id, CONFIG.target_group_id
-            )
+            and _business_allowed()
         ):
-            path = weekly_report("xlsx")
-            _last_weekly = current.date()
-            message_failure = await _send_group(f"周报已生成：{path}")
-            file_failure = (
-                "business_disabled"
-                if message_failure == "business_disabled"
-                else await _send_group_file(path)
+            weekly_key = f"weekly:{current.date().isoformat()}"
+            weekly_task = _claim_business_notification_task(
+                idempotency_key=weekly_key,
+                message_type="weekly",
+                message_text=f"周报任务：{current.date().isoformat()}",
+                as_of=moment,
             )
-            missed_reasons = {
-                reason
-                for reason in (message_failure, file_failure)
-                if reason in {"bot_offline", "send_failed"}
-            }
-            if missed_reasons:
-                _record_missed_business_notification(
-                    idempotency_key=f"weekly:{current.date().isoformat()}",
-                    message_type="weekly",
-                    message_text=f"周报未完整送达：{path}",
-                    reason=(
-                        "bot_offline"
-                        if "bot_offline" in missed_reasons
-                        else "send_failed"
-                    ),
-                    as_of=moment,
-                )
+            _last_weekly = current.date()
+            if weekly_task is not None:
+                try:
+                    path = weekly_report("xlsx")
+                except Exception as exc:
+                    logger.warning(
+                        f"周报生成失败 error={type(exc).__name__}"
+                    )
+                    _finish_business_notification_task(
+                        weekly_task,
+                        status="failed",
+                        reason="send_failed",
+                        message_text=(
+                            f"周报生成失败：{current.date().isoformat()}"
+                        ),
+                        as_of=moment,
+                    )
+                else:
+                    message_failure = await _send_group(f"周报已生成：{path}")
+                    file_failure = (
+                        "business_disabled"
+                        if message_failure == "business_disabled"
+                        else await _send_group_file(path)
+                    )
+                    failures = {
+                        reason
+                        for reason in (message_failure, file_failure)
+                        if reason is not None
+                    }
+                    if "business_disabled" in failures:
+                        status = "failed"
+                        reason = "business_disabled"
+                    elif "bot_offline" in failures:
+                        status = "failed"
+                        reason = "bot_offline"
+                    elif "send_failed" in failures:
+                        status = "failed"
+                        reason = "send_failed"
+                    else:
+                        status = "sent"
+                        reason = "sent"
+                    _finish_business_notification_task(
+                        weekly_task,
+                        status=status,
+                        reason=reason,
+                        message_text=(
+                            f"周报已送达：{path}"
+                            if status == "sent"
+                            else f"周报未完整送达：{path}"
+                        ),
+                        as_of=moment,
+                    )
 
     evidence_store = EvidenceStore(
         CONFIG.evidence_database_path, CONFIG.evidence_root

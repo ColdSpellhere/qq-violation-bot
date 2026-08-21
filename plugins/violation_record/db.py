@@ -175,8 +175,8 @@ def init_db() -> None:
                 message_type TEXT NOT NULL,
                 message_text TEXT NOT NULL,
                 reason TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'failed' CHECK(
-                    status IN ('failed', 'sending', 'sent')
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(
+                    status IN ('pending', 'failed', 'sending', 'sent')
                 ),
                 sent_at TEXT,
                 created_at TEXT NOT NULL,
@@ -187,6 +187,7 @@ def init_db() -> None:
             ON business_notification_outbox(status, updated_at, id);
             """
         )
+        ensure_business_notification_outbox_schema(conn)
         ensure_schema_extensions(conn)
         seed_admins(conn)
 
@@ -198,6 +199,62 @@ def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     if column not in _column_names(conn, table):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def ensure_business_notification_outbox_schema(conn: sqlite3.Connection) -> None:
+    table_sql = conn.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type='table' AND name='business_notification_outbox'
+        """
+    ).fetchone()["sql"]
+    if "status IN ('pending', 'failed', 'sending', 'sent')" in table_sql:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("DROP INDEX IF EXISTS idx_business_notification_outbox_status")
+    conn.execute(
+        """
+        ALTER TABLE business_notification_outbox
+        RENAME TO business_notification_outbox_legacy_state
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE business_notification_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            message_type TEXT NOT NULL,
+            message_text TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(
+                status IN ('pending', 'failed', 'sending', 'sent')
+            ),
+            sent_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO business_notification_outbox(
+            id, idempotency_key, message_type, message_text, reason,
+            status, sent_at, created_at, updated_at
+        )
+        SELECT
+            id, idempotency_key, message_type, message_text, reason,
+            status, sent_at, created_at, updated_at
+        FROM business_notification_outbox_legacy_state
+        """
+    )
+    conn.execute("DROP TABLE business_notification_outbox_legacy_state")
+    conn.execute(
+        """
+        CREATE INDEX idx_business_notification_outbox_status
+        ON business_notification_outbox(status, updated_at, id)
+        """
+    )
 
 
 LEGACY_IMPORT_INDEXES = (
