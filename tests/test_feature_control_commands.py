@@ -197,6 +197,34 @@ class FeatureControlMatcherTests(unittest.IsolatedAsyncioTestCase):
             finish.assert_awaited_once_with("你没有模块管理权限。")
             self.assertTrue(controller.snapshot().business_enabled)
 
+    async def test_persistence_failure_replies_without_reporting_success(self) -> None:
+        with TemporaryDirectory() as directory:
+            controller = FeatureController(
+                Path(directory) / "runtime_features.json",
+                FeatureState(True, True, True, True, (), ()),
+            )
+            configured_driver = SimpleNamespace(
+                config=SimpleNamespace(superusers={"1"})
+            )
+            with patch(
+                "plugins.feature_control.matcher.FEATURES", controller
+            ), patch(
+                "plugins.feature_control.matcher.get_driver",
+                return_value=configured_driver,
+            ), patch.object(
+                controller, "_persist", side_effect=OSError("disk full")
+            ), patch(
+                "plugins.feature_control.matcher.control_matcher.finish",
+                new=AsyncMock(),
+            ) as finish:
+                try:
+                    await handle_control_command(_event("/业务 关", user_id=1))
+                except OSError as exc:
+                    self.fail(f"persistence error escaped matcher: {exc}")
+
+            finish.assert_awaited_once_with("写入失败，状态未改变。")
+            self.assertTrue(controller.snapshot().business_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

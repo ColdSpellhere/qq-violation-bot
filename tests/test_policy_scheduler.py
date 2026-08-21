@@ -599,7 +599,7 @@ class PolicySchedulerTests(unittest.TestCase):
         forward = bot.forwarded[0]
         self.assertEqual(forward["api"], "send_group_forward_msg")
         self.assertEqual(forward["group_id"], 123456789)
-        self.assertEqual(len(forward["messages"]), deferred + 1)
+        self.assertEqual(len(forward["messages"]), 2)
         overview = forward["messages"][0]["data"]["content"]
         self.assertIn("未发送业务提醒概览", overview)
         self.assertIn(
@@ -873,6 +873,519 @@ class PolicySchedulerTests(unittest.TestCase):
                 )
             )
         maintenance.assert_called_once_with("2026-08-02 12:01:00")
+
+    def test_business_off_skips_legacy_maintenance_and_sends(self) -> None:
+        bot = FakeBot()
+        features = MagicMock()
+        features.business_allowed.return_value = False
+        legacy_config = replace(
+            self.config,
+            deduction_policy_v102_enabled=False,
+        )
+
+        with (
+            patch.object(scheduler, "CONFIG", legacy_config),
+            patch.object(scheduler, "FEATURES", features),
+            patch.object(scheduler, "get_bots", return_value={"bot": bot}),
+            patch.object(
+                scheduler,
+                "automatic_maintenance",
+                return_value=["不应生成的旧版通知"],
+            ) as automatic,
+        ):
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 12:01:00",
+                    run_periodic_files=False,
+                )
+            )
+
+        automatic.assert_not_called()
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(bot.forwarded, [])
+
+    def test_business_off_skips_weekly_generation_upload_and_send(self) -> None:
+        bot = FakeBot()
+        features = MagicMock()
+        features.business_allowed.return_value = False
+        scheduler._last_backup_day = None
+        scheduler._last_weekly = None
+
+        with (
+            patch.object(scheduler, "FEATURES", features),
+            patch.object(scheduler, "get_bots", return_value={"bot": bot}),
+            patch.object(scheduler, "backup_database", return_value=None),
+            patch.object(
+                scheduler.policy_bridge,
+                "run_policy_maintenance",
+                return_value={
+                    "compensated": 0,
+                    "settled": 0,
+                    "queued_events": 0,
+                    "queued_reminders": 0,
+                },
+            ),
+            patch.object(
+                scheduler, "weekly_report", return_value=Path("/tmp/report.xlsx")
+            ) as report,
+        ):
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 00:10:00",
+                    run_periodic_files=True,
+                )
+            )
+
+        report.assert_not_called()
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(bot.forwarded, [])
+        self.assertIsNone(scheduler._last_weekly)
+
+    def test_switching_business_off_stops_remaining_policy_sends(self) -> None:
+        self._record("禁言一小时")
+        policy_bridge.run_policy_maintenance("2026-08-02 12:01:00")
+        features = MagicMock()
+        features.business_allowed.return_value = True
+
+        class GateClosingBot(FakeBot):
+            async def send_group_msg(inner_self, **kwargs):
+                await super().send_group_msg(**kwargs)
+                features.business_allowed.return_value = False
+
+        bot = GateClosingBot()
+        with patch.object(scheduler, "FEATURES", features):
+            sent = asyncio.run(
+                scheduler.deliver_policy_outbox(
+                    bot, as_of="2026-08-02 12:01:00"
+                )
+            )
+
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(bot.sent), 1)
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT status, last_error FROM v102_notification_outbox ORDER BY id"
+            ).fetchall()
+        self.assertEqual([row["status"] for row in rows].count("sent"), 1)
+        self.assertNotIn("sending", {row["status"] for row in rows})
+        self.assertEqual(
+            {
+                row["last_error"]
+                for row in rows
+                if row["status"] != "sent"
+            },
+            {"business_disabled"},
+        )
+
+    def test_switching_business_off_after_weekly_message_stops_upload(self) -> None:
+        features = MagicMock()
+        features.business_allowed.return_value = True
+        scheduler._last_backup_day = None
+        scheduler._last_weekly = None
+
+        class GateClosingBot(FakeBot):
+            async def send_group_msg(inner_self, **kwargs):
+                await super().send_group_msg(**kwargs)
+                features.business_allowed.return_value = False
+
+        bot = GateClosingBot()
+        with (
+            patch.object(scheduler, "FEATURES", features),
+            patch.object(scheduler, "get_bots", return_value={"bot": bot}),
+            patch.object(scheduler, "get_bot", return_value=bot),
+            patch.object(scheduler, "backup_database", return_value=None),
+            patch.object(
+                scheduler.policy_bridge,
+                "run_policy_maintenance",
+                return_value={
+                    "compensated": 0,
+                    "settled": 0,
+                    "queued_events": 0,
+                    "queued_reminders": 0,
+                },
+            ),
+            patch.object(
+                scheduler, "weekly_report", return_value=Path("/tmp/report.xlsx")
+            ),
+        ):
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 00:10:00",
+                    run_periodic_files=True,
+                )
+            )
+
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(bot.forwarded, [])
+
+    def test_switching_business_off_before_missed_summary_restores_claims(self) -> None:
+        self._record("禁言一小时")
+        policy_bridge.run_policy_maintenance("2026-08-02 12:01:00")
+        deferred = scheduler.defer_policy_outbox(
+            "bot_offline", "2026-08-02 12:01:00"
+        )
+        features = MagicMock()
+        features.business_allowed.return_value = False
+        bot = FakeBot()
+
+        with patch.object(scheduler, "FEATURES", features):
+            handled = asyncio.run(
+                scheduler.deliver_missed_policy_summary(
+                    bot, as_of="2026-08-02 12:02:00"
+                )
+            )
+
+        self.assertGreaterEqual(deferred, 1)
+        self.assertEqual(handled, 0)
+        self.assertEqual(bot.forwarded, [])
+        with db.connect() as conn:
+            statuses = {
+                row["status"]
+                for row in conn.execute("SELECT status FROM v102_notification_outbox")
+            }
+        self.assertEqual(statuses, {"failed"})
+
+    def test_legacy_notification_offline_is_persisted_once(self) -> None:
+        features = MagicMock()
+        features.business_allowed.return_value = True
+        legacy_config = replace(
+            self.config,
+            deduction_policy_v102_enabled=False,
+        )
+
+        with (
+            patch.object(scheduler, "CONFIG", legacy_config),
+            patch.object(scheduler, "FEATURES", features),
+            patch.object(scheduler, "get_bots", return_value={}),
+            patch.object(scheduler, "get_bot", side_effect=RuntimeError("offline")),
+            patch.object(
+                scheduler,
+                "automatic_maintenance",
+                return_value=["旧版维护通知"],
+            ) as automatic,
+        ):
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 12:01:00",
+                    run_periodic_files=False,
+                )
+            )
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 12:01:00",
+                    run_periodic_files=False,
+                )
+            )
+
+        self.assertEqual(automatic.call_count, 2)
+        with db.connect() as conn:
+            table = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='business_notification_outbox'
+                """
+            ).fetchone()
+            self.assertIsNotNone(table)
+            rows = conn.execute(
+                "SELECT * FROM business_notification_outbox"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["message_type"], "legacy")
+        self.assertEqual(row["message_text"], "旧版维护通知")
+        self.assertEqual(row["reason"], "bot_offline")
+        self.assertEqual(row["status"], "failed")
+        self.assertTrue(row["idempotency_key"])
+        self.assertEqual(row["created_at"], "2026-08-02 12:01:00")
+        self.assertEqual(row["updated_at"], "2026-08-02 12:01:00")
+
+    def test_legacy_api_failure_is_persisted_for_merged_recovery(self) -> None:
+        features = MagicMock()
+        features.business_allowed.return_value = True
+        legacy_config = replace(
+            self.config,
+            deduction_policy_v102_enabled=False,
+        )
+        bot = FakeBot(fail=True)
+
+        with (
+            patch.object(scheduler, "CONFIG", legacy_config),
+            patch.object(scheduler, "FEATURES", features),
+            patch.object(scheduler, "get_bots", return_value={"bot": bot}),
+            patch.object(scheduler, "get_bot", return_value=bot),
+            patch.object(
+                scheduler,
+                "automatic_maintenance",
+                return_value=["API 失败的旧版通知"],
+            ),
+        ):
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 12:01:00",
+                    run_periodic_files=False,
+                )
+            )
+
+        self.assertEqual(bot.sent, [])
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM business_notification_outbox"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["message_text"], "API 失败的旧版通知")
+        self.assertEqual(row["reason"], "send_failed")
+        self.assertEqual(row["status"], "failed")
+
+    def test_weekly_report_offline_is_persisted_as_one_missed_item(self) -> None:
+        features = MagicMock()
+        features.business_allowed.return_value = True
+        scheduler._last_backup_day = None
+        scheduler._last_weekly = None
+        report_path = Path("/tmp/report.xlsx")
+
+        with (
+            patch.object(scheduler, "FEATURES", features),
+            patch.object(scheduler, "get_bots", return_value={}),
+            patch.object(scheduler, "get_bot", side_effect=RuntimeError("offline")),
+            patch.object(scheduler, "backup_database", return_value=None),
+            patch.object(
+                scheduler.policy_bridge,
+                "run_policy_maintenance",
+                return_value={
+                    "compensated": 0,
+                    "settled": 0,
+                    "queued_events": 0,
+                    "queued_reminders": 0,
+                },
+            ),
+            patch.object(scheduler, "weekly_report", return_value=report_path),
+        ):
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 00:10:00",
+                    run_periodic_files=True,
+                )
+            )
+
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM business_notification_outbox"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["message_type"], "weekly")
+        self.assertIn(str(report_path), row["message_text"])
+        self.assertEqual(row["reason"], "bot_offline")
+        self.assertEqual(row["status"], "failed")
+
+    def test_generic_missed_item_recovers_in_one_forward_overview(self) -> None:
+        scheduler._record_missed_business_notification(
+            idempotency_key="legacy:recovery:1",
+            message_type="legacy",
+            message_text="旧版维护通知",
+            reason="bot_offline",
+            as_of="2026-08-02 12:01:00",
+        )
+        features = MagicMock()
+        features.business_allowed.return_value = True
+        bot = FakeBot()
+
+        with patch.object(scheduler, "FEATURES", features):
+            handled = asyncio.run(
+                scheduler.deliver_missed_policy_summary(
+                    bot, as_of="2026-08-02 12:02:00"
+                )
+            )
+            duplicate = asyncio.run(
+                scheduler.deliver_missed_policy_summary(
+                    bot, as_of="2026-08-02 12:03:00"
+                )
+            )
+
+        self.assertEqual((handled, duplicate), (1, 0))
+        self.assertEqual(len(bot.forwarded), 1)
+        contents = [
+            node["data"]["content"]
+            for node in bot.forwarded[0]["messages"]
+        ]
+        self.assertIn("涉及提醒：1 条", contents[0])
+        self.assertTrue(any("旧版维护通知" in content for content in contents[1:]))
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM business_notification_outbox"
+            ).fetchone()
+        self.assertEqual(row["status"], "sent")
+        self.assertEqual(row["sent_at"], "2026-08-02 12:02:00")
+
+    def test_missed_overview_counts_types_and_groups_policy_items_by_member(self) -> None:
+        now = "2026-08-02 12:01:00"
+        with db.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO members(
+                    qq_number, qq_nickname, aliases, created_at, updated_at
+                ) VALUES('654321', '小红', '[]', ?, ?)
+                """,
+                (now, now),
+            )
+            second_member_id = int(cursor.lastrowid)
+            rows = (
+                (self.member_id, "policy_event", "小明提醒甲"),
+                (self.member_id, "policy_event", "小明提醒乙"),
+                (second_member_id, "pending_notice", "小红提醒甲"),
+            )
+            for index, (member_id, message_type, message_text) in enumerate(rows):
+                event_id, _ = _insert_event(
+                    conn,
+                    member_id=member_id,
+                    group_area="蜂巢",
+                    event_type="test_notice",
+                    effective_time=now,
+                    event_priority=100,
+                    source_sequence=index + 1,
+                    ingest_time=now,
+                    idempotency_key=f"test:missed-overview:{index}",
+                )
+                conn.execute(
+                    """
+                    INSERT INTO v102_notification_outbox(
+                        event_id, member_id, group_area, message_type,
+                        reminder_slot, message_text, scheduled_at,
+                        status, last_error, created_at, updated_at
+                    ) VALUES(?, ?, '蜂巢', ?, '', ?, ?,
+                             'failed', 'bot_offline', ?, ?)
+                    """,
+                    (
+                        event_id,
+                        member_id,
+                        message_type,
+                        message_text,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+        scheduler._record_missed_business_notification(
+            idempotency_key="legacy:overview:1",
+            message_type="legacy",
+            message_text="旧版汇总项",
+            reason="send_failed",
+            as_of=now,
+        )
+        features = MagicMock()
+        features.business_allowed.return_value = True
+        bot = FakeBot()
+
+        with patch.object(scheduler, "FEATURES", features):
+            handled = asyncio.run(
+                scheduler.deliver_missed_policy_summary(
+                    bot, as_of="2026-08-02 12:02:00"
+                )
+            )
+
+        self.assertEqual(handled, 4)
+        messages = bot.forwarded[0]["messages"]
+        self.assertEqual(len(messages), 4)
+        overview = messages[0]["data"]["content"]
+        self.assertIn("涉及提醒：4 条", overview)
+        self.assertIn("涉及成员：2 人", overview)
+        self.assertIn("legacy 1", overview)
+        self.assertIn("pending_notice 1", overview)
+        self.assertIn("policy_event 2", overview)
+        grouped_contents = [node["data"]["content"] for node in messages[1:]]
+        first_member_nodes = [
+            content
+            for content in grouped_contents
+            if f"成员 #{self.member_id}" in content
+        ]
+        self.assertEqual(len(first_member_nodes), 1)
+        self.assertIn("小明提醒甲", first_member_nodes[0])
+        self.assertIn("小明提醒乙", first_member_nodes[0])
+        self.assertTrue(
+            any(
+                f"成员 #{second_member_id}" in content and "小红提醒甲" in content
+                for content in grouped_contents
+            )
+        )
+        self.assertTrue(any("旧版汇总项" in content for content in grouped_contents))
+
+    def test_concurrent_generic_recovery_claims_send_one_forward(self) -> None:
+        scheduler._record_missed_business_notification(
+            idempotency_key="weekly:concurrent:1",
+            message_type="weekly",
+            message_text="并发恢复周报",
+            reason="bot_offline",
+            as_of="2026-08-02 12:01:00",
+        )
+        features = MagicMock()
+        features.business_allowed.return_value = True
+
+        async def exercise() -> tuple[int, int, BlockingForwardBot, FakeBot]:
+            first_bot = BlockingForwardBot()
+            second_bot = FakeBot()
+            first_task = asyncio.create_task(
+                scheduler.deliver_missed_policy_summary(
+                    first_bot, as_of="2026-08-02 12:02:00"
+                )
+            )
+            await first_bot.forward_started.wait()
+            second = await scheduler.deliver_missed_policy_summary(
+                second_bot, as_of="2026-08-02 12:02:01"
+            )
+            first_bot.release_forward.set()
+            first = await first_task
+            return first, second, first_bot, second_bot
+
+        with patch.object(scheduler, "FEATURES", features):
+            first, second, first_bot, second_bot = asyncio.run(exercise())
+
+        self.assertEqual((first, second), (1, 0))
+        self.assertEqual(len(first_bot.forwarded) + len(second_bot.forwarded), 1)
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM business_notification_outbox"
+            ).fetchone()
+        self.assertEqual(row["status"], "sent")
+
+    def test_legacy_tick_recovers_persisted_items_when_bot_returns(self) -> None:
+        scheduler._record_missed_business_notification(
+            idempotency_key="legacy:return:1",
+            message_type="legacy",
+            message_text="离线期间旧版通知",
+            reason="bot_offline",
+            as_of="2026-08-02 12:00:00",
+        )
+        features = MagicMock()
+        features.business_allowed.return_value = True
+        legacy_config = replace(
+            self.config,
+            deduction_policy_v102_enabled=False,
+        )
+        bot = FakeBot()
+
+        with (
+            patch.object(scheduler, "CONFIG", legacy_config),
+            patch.object(scheduler, "FEATURES", features),
+            patch.object(scheduler, "get_bots", return_value={"bot": bot}),
+            patch.object(scheduler, "automatic_maintenance", return_value=[]),
+        ):
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 12:01:00",
+                    run_periodic_files=False,
+                )
+            )
+
+        self.assertEqual(len(bot.forwarded), 1)
+        self.assertIn(
+            "离线期间旧版通知",
+            bot.forwarded[0]["messages"][1]["data"]["content"],
+        )
+        with db.connect() as conn:
+            status = conn.execute(
+                "SELECT status FROM business_notification_outbox"
+            ).fetchone()["status"]
+        self.assertEqual(status, "sent")
 
     def test_scheduler_keeps_one_task_and_cancels_it_on_shutdown(self) -> None:
         driver = FakeDriver()

@@ -18,7 +18,7 @@ from .conversation import PrivateConversation
 from .policy import eligible_private_text
 
 
-CONVERSATION = PrivateConversation(limit=20)
+CONVERSATIONS: dict[str, PrivateConversation] = {}
 
 
 async def private_chat_candidate(event: Event) -> bool:
@@ -42,15 +42,18 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
     if text is None:
         return
 
-    async with CONVERSATION.lock:
-        context = CONVERSATION.snapshot()
+    conversation = CONVERSATIONS.setdefault(
+        str(event.user_id), PrivateConversation(limit=20)
+    )
+    async with conversation.lock:
+        context = conversation.snapshot()
         current = ContextMessage(
             event.sender.nickname or str(event.user_id),
             text,
             message_id=str(event.message_id),
             user_id=str(event.user_id),
         )
-        CONVERSATION.append(current)
+        conversation.append(current)
         try:
             reply = await generate_reply(
                 text,
@@ -85,7 +88,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             logger.warning(f"私聊消息发送失败：{type(exc).__name__}")
             return
 
-        CONVERSATION.append(
+        conversation.append(
             ContextMessage(
                 "萝卜猫",
                 reply,

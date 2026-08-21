@@ -168,6 +168,23 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(group_id, operator_qq)
             );
+
+            CREATE TABLE IF NOT EXISTS business_notification_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                message_type TEXT NOT NULL,
+                message_text TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'failed' CHECK(
+                    status IN ('failed', 'sending', 'sent')
+                ),
+                sent_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_business_notification_outbox_status
+            ON business_notification_outbox(status, updated_at, id);
             """
         )
         ensure_schema_extensions(conn)

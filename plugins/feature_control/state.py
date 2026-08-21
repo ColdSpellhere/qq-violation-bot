@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -114,10 +113,7 @@ class FeatureController:
 
     def _persist(self, state: FeatureState) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        if self._path.is_file():
-            shutil.copy2(self._path, self._backup_path)
-        else:
-            self._write_json(self._backup_path, self._state)
+        self._write_json(self._backup_path, self._state)
         self._write_json(self._path, state)
 
     @staticmethod

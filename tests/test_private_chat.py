@@ -143,7 +143,7 @@ class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
         bot = AsyncMock()
         conversation = PrivateConversation()
         sticker = Path("/tmp/private-flower.gif")
-        with patch.object(private_matcher, "CONVERSATION", conversation), patch.object(
+        with patch.object(private_matcher, "CONVERSATIONS", {"123456": conversation}), patch.object(
             private_matcher,
             "generate_reply",
             new=AsyncMock(return_value="给你一朵小花"),
@@ -166,10 +166,45 @@ class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("file:///tmp/private-flower.gif", sent["message"][1].data["file"])
         self.assertEqual(["你好", "给你一朵小花"], [item.text for item in conversation.snapshot()])
 
+    async def test_allowed_users_have_isolated_conversations(self):
+        bot = AsyncMock()
+        conversations: dict[str, PrivateConversation] = {}
+
+        async def reply_side_effect(message, **kwargs):
+            return f"回复{message}"
+
+        generate = AsyncMock(side_effect=reply_side_effect)
+        with patch.object(
+            private_matcher, "CONVERSATIONS", conversations, create=True
+        ), patch.object(
+            private_matcher, "generate_reply", new=generate
+        ), patch.object(private_matcher, "choose_sticker", return_value=None):
+            await private_matcher.handle_private_message(
+                bot, _private_event("甲的第一条", user_id=123456)
+            )
+            await private_matcher.handle_private_message(
+                bot, _private_event("乙的第一条", user_id=654321)
+            )
+            await private_matcher.handle_private_message(
+                bot, _private_event("甲的第二条", user_id=123456)
+            )
+
+        first_context = generate.await_args_list[0].kwargs["context"]
+        second_context = generate.await_args_list[1].kwargs["context"]
+        third_context = generate.await_args_list[2].kwargs["context"]
+        self.assertEqual((), first_context)
+        self.assertEqual((), second_context)
+        self.assertNotIn("甲的第一条", [item.text for item in second_context])
+        self.assertNotIn("回复甲的第一条", [item.text for item in second_context])
+        self.assertEqual(
+            ["甲的第一条", "回复甲的第一条"],
+            [item.text for item in third_context],
+        )
+
     async def test_blank_and_command_messages_do_not_call_ai(self):
         bot = AsyncMock()
         generate = AsyncMock(return_value="不应回复")
-        with patch.object(private_matcher, "CONVERSATION", PrivateConversation()), patch.object(
+        with patch.object(private_matcher, "CONVERSATIONS", {}), patch.object(
             private_matcher, "generate_reply", new=generate
         ):
             await private_matcher.handle_private_message(bot, _private_event("   "))
@@ -181,7 +216,7 @@ class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
     async def test_ai_and_send_failures_do_not_escape_or_add_fake_bot_turn(self):
         bot = AsyncMock()
         conversation = PrivateConversation()
-        with patch.object(private_matcher, "CONVERSATION", conversation), patch.object(
+        with patch.object(private_matcher, "CONVERSATIONS", {"123456": conversation}), patch.object(
             private_matcher,
             "generate_reply",
             new=AsyncMock(side_effect=private_matcher.RandomChatAIError("down")),
@@ -192,7 +227,7 @@ class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
         bot.send_private_msg.assert_not_awaited()
 
         bot.send_private_msg.side_effect = RuntimeError("send failed")
-        with patch.object(private_matcher, "CONVERSATION", conversation), patch.object(
+        with patch.object(private_matcher, "CONVERSATIONS", {"123456": conversation}), patch.object(
             private_matcher,
             "generate_reply",
             new=AsyncMock(return_value="未发出的回复"),
@@ -214,7 +249,7 @@ class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
             return f"回复{message}"
 
         generate = AsyncMock(side_effect=reply_side_effect)
-        with patch.object(private_matcher, "CONVERSATION", conversation), patch.object(
+        with patch.object(private_matcher, "CONVERSATIONS", {"123456": conversation}), patch.object(
             private_matcher, "generate_reply", new=generate
         ), patch.object(private_matcher, "choose_sticker", return_value=None):
             first = asyncio.create_task(

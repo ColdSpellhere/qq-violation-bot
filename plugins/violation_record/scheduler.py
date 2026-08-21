@@ -31,29 +31,57 @@ class _DeferredFeatures:
 FEATURES = _DeferredFeatures()
 
 
-async def _send_group(text: str) -> None:
+def _business_allowed() -> bool:
+    return FEATURES.business_allowed(
+        CONFIG.target_group_id, CONFIG.target_group_id
+    )
+
+
+async def _send_group(text: str) -> str | None:
+    if not _business_allowed():
+        return "business_disabled"
     try:
         bot = get_bot()
+    except Exception as exc:
+        logger.warning(f"群通知发送失败：{type(exc).__name__}")
+        return "bot_offline"
+    if not _business_allowed():
+        return "business_disabled"
+    try:
         await bot.send_group_msg(group_id=CONFIG.target_group_id, message=text)
     except Exception as exc:
-        logger.warning(f"群通知发送失败：{exc}")
+        logger.warning(f"群通知发送失败：{type(exc).__name__}")
+        return "send_failed"
+    return None
 
 
-async def _send_group_file(path: Path) -> None:
+async def _send_group_file(path: Path) -> str | None:
+    if not _business_allowed():
+        return "business_disabled"
     try:
         bot = get_bot()
+    except Exception as exc:
+        logger.warning(f"群文件上传失败：{path}: {type(exc).__name__}")
+        return "bot_offline"
+    if not _business_allowed():
+        return "business_disabled"
+    try:
         await bot.call_api(
             "upload_group_file",
             group_id=str(CONFIG.target_group_id),
             file=str(path),
             name=path.name,
         )
+        if not _business_allowed():
+            return "business_disabled"
         await bot.send_group_msg(
             group_id=CONFIG.target_group_id, message=f"文件已上传：{path.name}"
         )
     except Exception as exc:
-        logger.warning(f"群文件上传失败：{path}: {exc}")
+        logger.warning(f"群文件上传失败：{path}: {type(exc).__name__}")
         await _send_group(f"文件上传失败，可从服务器路径下载：{path}\n原因：{exc}")
+        return "send_failed"
+    return None
 
 
 def _claim_policy_outbox(as_of: str, limit: int) -> list[dict]:
@@ -265,6 +293,79 @@ def _missed_reason(last_error: str | None) -> str:
     return "发送失败"
 
 
+def _record_missed_business_notification(
+    *,
+    idempotency_key: str,
+    message_type: str,
+    message_text: str,
+    reason: str,
+    as_of: str,
+) -> int:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO business_notification_outbox(
+                idempotency_key, message_type, message_text, reason,
+                status, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, 'failed', ?, ?)
+            ON CONFLICT(idempotency_key) DO NOTHING
+            """,
+            (
+                idempotency_key,
+                message_type,
+                message_text,
+                reason,
+                as_of,
+                as_of,
+            ),
+        )
+        return cursor.rowcount
+
+
+def _claim_missed_business_outbox(as_of: str) -> list[dict]:
+    lease_cutoff = (
+        datetime.fromisoformat(as_of) - timedelta(minutes=_OUTBOX_LEASE_MINUTES)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE business_notification_outbox
+            SET status='failed', updated_at=?
+            WHERE status='sending' AND updated_at<=?
+            """,
+            (as_of, lease_cutoff),
+        )
+        claimed = [
+            dict(row)
+            for row in conn.execute(
+                """
+                UPDATE business_notification_outbox
+                SET status='sending', updated_at=?
+                WHERE status='failed'
+                RETURNING *
+                """,
+                (as_of,),
+            )
+        ]
+    return sorted(claimed, key=lambda row: (row["created_at"], row["id"]))
+
+
+def _restore_missed_business_claims(rows: list[dict], *, as_of: str) -> int:
+    restored = 0
+    with connect() as conn:
+        for row in rows:
+            cursor = conn.execute(
+                """
+                UPDATE business_notification_outbox
+                SET status='failed', updated_at=?
+                WHERE id=? AND status='sending' AND updated_at=?
+                """,
+                (as_of, row["id"], row["updated_at"]),
+            )
+            restored += cursor.rowcount
+    return restored
+
+
 def _claim_missed_policy_outbox(as_of: str) -> list[dict]:
     with connect() as conn:
         claimed = [
@@ -280,6 +381,19 @@ def _claim_missed_policy_outbox(as_of: str) -> list[dict]:
             )
         ]
     return sorted(claimed, key=lambda row: (row["scheduled_at"], row["id"]))
+
+
+def _policy_outbox_available() -> bool:
+    with connect() as conn:
+        return (
+            conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='v102_notification_outbox'
+                """
+            ).fetchone()
+            is not None
+        )
 
 
 def _cancel_missed_policy_claim(
@@ -321,7 +435,12 @@ async def deliver_missed_policy_summary(
     bot, *, as_of: str | None = None
 ) -> int:
     moment = as_of or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    selected = _claim_missed_policy_outbox(moment)
+    selected = (
+        _claim_missed_policy_outbox(moment)
+        if _policy_outbox_available()
+        else []
+    )
+    generic_rows = _claim_missed_business_outbox(moment)
 
     valid_rows: list[dict] = []
     seen_ids: set[int] = set()
@@ -343,35 +462,84 @@ async def deliver_missed_policy_summary(
                 conn, row, reason=invalid_reason, as_of=moment
             )
 
-    if not valid_rows:
+    if not valid_rows and not generic_rows:
         return 0
 
     reason_counts = {"业务关闭": 0, "QQ离线": 0, "发送失败": 0}
     for row in valid_rows:
         reason_counts[_missed_reason(row.get("last_error"))] += 1
-    first = valid_rows[0]["scheduled_at"]
-    last = valid_rows[-1]["scheduled_at"]
+    for row in generic_rows:
+        reason_counts[_missed_reason(row.get("reason"))] += 1
+    timestamps = [row["scheduled_at"] for row in valid_rows]
+    timestamps.extend(row["created_at"] for row in generic_rows)
+    first = min(timestamps)
+    last = max(timestamps)
+    total_items = len(valid_rows) + len(generic_rows)
+    member_ids = {
+        int(row["member_id"])
+        for row in valid_rows
+        if row.get("member_id") is not None
+    }
+    type_counts: dict[str, int] = {}
+    for row in (*valid_rows, *generic_rows):
+        message_type = str(row["message_type"])
+        type_counts[message_type] = type_counts.get(message_type, 0) + 1
+    type_summary = " / ".join(
+        f"{message_type} {count}"
+        for message_type, count in sorted(type_counts.items())
+    )
     overview = (
         "未发送业务提醒概览\n"
         f"时间范围：{first} 至 {last}\n"
-        f"涉及提醒：{len(valid_rows)} 条\n"
+        f"涉及提醒：{total_items} 条\n"
+        f"涉及成员：{len(member_ids)} 人\n"
+        f"类型：{type_summary}\n"
         f"原因：业务关闭 {reason_counts['业务关闭']} / "
         f"QQ离线 {reason_counts['QQ离线']} / "
         f"发送失败 {reason_counts['发送失败']}"
     )
     nodes = [_missed_policy_node(bot, overview)]
-    nodes.extend(
-        _missed_policy_node(
-            bot,
-            (
-                f"未发送提醒 #{row['id']}\n"
-                f"时间：{row['scheduled_at']}\n"
-                f"原因：{_missed_reason(row.get('last_error'))}\n"
-                f"{row['message_text']}"
-            ),
+    rows_by_member: dict[int | None, list[dict]] = {}
+    for row in valid_rows:
+        member_id = (
+            int(row["member_id"])
+            if row.get("member_id") is not None
+            else None
         )
-        for row in valid_rows
-    )
+        rows_by_member.setdefault(member_id, []).append(row)
+    for member_id, member_rows in rows_by_member.items():
+        heading = (
+            f"成员 #{member_id} 的未发送提醒（{len(member_rows)} 条）"
+            if member_id is not None
+            else f"其他策略提醒（{len(member_rows)} 条）"
+        )
+        items = [heading]
+        items.extend(
+            (
+                f"[{row['message_type']}] {row['scheduled_at']}"
+                f"｜{_missed_reason(row.get('last_error'))}\n"
+                f"{row['message_text']}"
+            )
+            for row in member_rows
+        )
+        nodes.append(_missed_policy_node(bot, "\n\n".join(items)))
+    generic_by_type: dict[str, list[dict]] = {}
+    for row in generic_rows:
+        generic_by_type.setdefault(str(row["message_type"]), []).append(row)
+    for message_type, grouped_rows in generic_by_type.items():
+        items = [f"{message_type} 未发送通知（{len(grouped_rows)} 条）"]
+        items.extend(
+            (
+                f"{row['created_at']}｜{_missed_reason(row.get('reason'))}\n"
+                f"{row['message_text']}"
+            )
+            for row in grouped_rows
+        )
+        nodes.append(_missed_policy_node(bot, "\n\n".join(items)))
+    if not _business_allowed():
+        _restore_missed_policy_claims(valid_rows, as_of=moment)
+        _restore_missed_business_claims(generic_rows, as_of=moment)
+        return 0
     try:
         await bot.call_api(
             "send_group_forward_msg",
@@ -383,6 +551,7 @@ async def deliver_missed_policy_summary(
             f"未发送业务提醒汇总失败 error={type(exc).__name__}"
         )
         _restore_missed_policy_claims(valid_rows, as_of=moment)
+        _restore_missed_business_claims(generic_rows, as_of=moment)
         return 0
 
     handled = 0
@@ -404,6 +573,16 @@ async def deliver_missed_policy_summary(
                 """
                 UPDATE v102_notification_outbox
                 SET status='sent', sent_at=?, last_error=NULL, updated_at=?
+                WHERE id=? AND status='sending' AND updated_at=?
+                """,
+                (moment, moment, row["id"], row["updated_at"]),
+            )
+            handled += cursor.rowcount
+        for row in generic_rows:
+            cursor = conn.execute(
+                """
+                UPDATE business_notification_outbox
+                SET status='sent', sent_at=?, updated_at=?
                 WHERE id=? AND status='sending' AND updated_at=?
                 """,
                 (moment, moment, row["id"], row["updated_at"]),
@@ -461,6 +640,24 @@ async def deliver_policy_outbox(
                     status="cancelled",
                     finished_at=moment,
                     detail=invalid_reason,
+                )
+            continue
+        if not _business_allowed():
+            with connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE v102_notification_outbox
+                    SET status='failed', last_error='business_disabled', updated_at=?
+                    WHERE id=? AND status='sending'
+                    """,
+                    (moment, row["id"]),
+                )
+                _finish_outbox_attempt(
+                    conn,
+                    row,
+                    status="failed",
+                    finished_at=moment,
+                    detail="business_disabled",
                 )
             continue
         try:
@@ -539,11 +736,24 @@ async def maintenance_tick(
             await deliver_policy_outbox(
                 bot, as_of=moment, limit=_OUTBOX_DELIVERY_BATCH
             )
-    elif bots:
-        for message in automatic_maintenance():
-            await _send_group(message)
+    elif not _business_allowed():
+        logger.debug("业务功能已关闭，跳过旧版自动维护。")
     else:
-        logger.debug("NapCat 尚未连接，旧版自动维护等待下一轮。")
+        if bots:
+            await deliver_missed_policy_summary(
+                next(iter(bots.values())), as_of=moment
+            )
+        if _business_allowed():
+            for index, message in enumerate(automatic_maintenance()):
+                failure = await _send_group(message)
+                if failure in {"bot_offline", "send_failed"}:
+                    _record_missed_business_notification(
+                        idempotency_key=f"legacy:{moment}:{index}",
+                        message_type="legacy",
+                        message_text=message,
+                        reason=failure,
+                        as_of=moment,
+                    )
 
     if run_periodic_files:
         if current.weekday() in {0, 3, 6} and _last_backup_day != current.date():
@@ -556,11 +766,35 @@ async def maintenance_tick(
             and current.hour == 0
             and current.minute >= 10
             and _last_weekly != current.date()
+            and FEATURES.business_allowed(
+                CONFIG.target_group_id, CONFIG.target_group_id
+            )
         ):
             path = weekly_report("xlsx")
             _last_weekly = current.date()
-            await _send_group(f"周报已生成：{path}")
-            await _send_group_file(path)
+            message_failure = await _send_group(f"周报已生成：{path}")
+            file_failure = (
+                "business_disabled"
+                if message_failure == "business_disabled"
+                else await _send_group_file(path)
+            )
+            missed_reasons = {
+                reason
+                for reason in (message_failure, file_failure)
+                if reason in {"bot_offline", "send_failed"}
+            }
+            if missed_reasons:
+                _record_missed_business_notification(
+                    idempotency_key=f"weekly:{current.date().isoformat()}",
+                    message_type="weekly",
+                    message_text=f"周报未完整送达：{path}",
+                    reason=(
+                        "bot_offline"
+                        if "bot_offline" in missed_reasons
+                        else "send_failed"
+                    ),
+                    as_of=moment,
+                )
 
     evidence_store = EvidenceStore(
         CONFIG.evidence_database_path, CONFIG.evidence_root

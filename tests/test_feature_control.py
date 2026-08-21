@@ -75,6 +75,47 @@ class FeatureControllerTests(unittest.TestCase):
 
         self.assertEqual((101,), controller.snapshot().group_chat_allowed_group_ids)
 
+    def test_mutation_after_backup_recovery_preserves_validated_backup(self):
+        recovered = replace(
+            self.defaults,
+            group_chat_allowed_group_ids=(101,),
+            updated_by="recovered",
+        )
+        backup_path = self.path.with_suffix(self.path.suffix + ".bak")
+        self.path.write_text("{corrupt", encoding="utf-8")
+        backup_path.write_text(json.dumps(asdict(recovered)), encoding="utf-8")
+        controller = FeatureController(self.path, self.defaults)
+
+        controller.set_switch("chat_enabled", False, actor="1")
+        self.path.write_text("{corrupt again", encoding="utf-8")
+
+        restarted = FeatureController(self.path, self.defaults)
+        self.assertEqual(recovered, restarted.snapshot())
+
+    def test_failed_primary_replace_keeps_memory_and_valid_backup(self):
+        controller = FeatureController(self.path, self.defaults)
+        self.path.write_text("{corrupt", encoding="utf-8")
+        backup_path = self.path.with_suffix(self.path.suffix + ".bak")
+        real_replace = os.replace
+
+        def fail_primary_replace(source, destination):
+            if Path(destination) == self.path:
+                raise OSError("replace failed")
+            return real_replace(source, destination)
+
+        with patch(
+            "plugins.feature_control.state.os.replace",
+            side_effect=fail_primary_replace,
+        ):
+            with self.assertRaises(OSError):
+                controller.set_switch("chat_enabled", False, actor="1")
+
+        self.assertEqual(self.defaults, controller.snapshot())
+        self.assertEqual(
+            self.defaults,
+            FeatureController._load_state(backup_path),
+        )
+
     def test_legacy_private_allowlist_migrates_to_new_tuple(self):
         environment = os.environ.copy()
         environment.update(
@@ -92,6 +133,76 @@ class FeatureControllerTests(unittest.TestCase):
                 (
                     "from plugins.violation_record.config import CONFIG; "
                     "assert CONFIG.private_chat_allowed_user_ids == ('101', '202')"
+                ),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_legacy_environment_keeps_historical_target_group_chat_enabled(self):
+        environment = os.environ.copy()
+        environment["TARGET_GROUP_ID"] = "999000111"
+        environment["RANDOM_CHAT_ENABLED"] = "false"
+        for key in (
+            "BUSINESS_ENABLED",
+            "CHAT_ENABLED",
+            "GROUP_CHAT_ENABLED",
+            "GROUP_CHAT_ALLOWED_GROUP_IDS",
+            "PRIVATE_CHAT_ENABLED",
+            "PRIVATE_CHAT_ALLOWED_USER_IDS",
+        ):
+            environment.pop(key, None)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from plugins.violation_record.config import CONFIG; "
+                    "assert CONFIG.chat_enabled is True; "
+                    "assert CONFIG.group_chat_enabled is True; "
+                    "assert CONFIG.group_chat_allowed_group_ids == (999000111,)"
+                ),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_explicit_module_keys_override_legacy_chat_defaults(self):
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "TARGET_GROUP_ID": "999000111",
+                "RANDOM_CHAT_ENABLED": "true",
+                "BUSINESS_ENABLED": "false",
+                "CHAT_ENABLED": "false",
+                "GROUP_CHAT_ENABLED": "false",
+                "GROUP_CHAT_ALLOWED_GROUP_IDS": "222333444",
+                "PRIVATE_CHAT_ENABLED": "false",
+                "PRIVATE_CHAT_ALLOWED_USER_IDS": "333444555",
+            }
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from plugins.violation_record.config import CONFIG; "
+                    "assert CONFIG.business_enabled is False; "
+                    "assert CONFIG.chat_enabled is False; "
+                    "assert CONFIG.group_chat_enabled is False; "
+                    "assert CONFIG.group_chat_allowed_group_ids == (222333444,); "
+                    "assert CONFIG.private_chat_enabled is False; "
+                    "assert CONFIG.private_chat_allowed_user_ids == ('333444555',)"
                 ),
             ],
             env=environment,

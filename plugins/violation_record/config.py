@@ -78,6 +78,9 @@ def _database_path(url: str) -> Path:
 
 _TARGET_GROUP_ID = _target_group_id_env()
 legacy_private_ids = _string_id_tuple_env("PRIVATE_CHAT_ALLOWED_USER_ID", ())
+legacy_group_chat_config = (
+    "CHAT_ENABLED" not in os.environ and "GROUP_CHAT_ENABLED" not in os.environ
+)
 
 
 @dataclass(frozen=True)
@@ -131,9 +134,13 @@ class AppConfig:
     ).strip()
     business_enabled: bool = _bool_env("BUSINESS_ENABLED", True)
     chat_enabled: bool = _bool_env(
-        "CHAT_ENABLED", random_chat_enabled or private_chat_enabled
+        "CHAT_ENABLED",
+        True if legacy_group_chat_config else random_chat_enabled or private_chat_enabled,
     )
-    group_chat_enabled: bool = _bool_env("GROUP_CHAT_ENABLED", random_chat_enabled)
+    group_chat_enabled: bool = _bool_env(
+        "GROUP_CHAT_ENABLED",
+        True if legacy_group_chat_config else random_chat_enabled,
+    )
     group_chat_allowed_group_ids: tuple[int, ...] = _id_tuple_env(
         "GROUP_CHAT_ALLOWED_GROUP_IDS", (_TARGET_GROUP_ID,)
     )
