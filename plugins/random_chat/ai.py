@@ -139,7 +139,8 @@ def _format_turn(item: ContextMessage) -> str:
     if item.replied_to_user_id:
         targets.append(f"回复:QQ:{item.replied_to_user_id}")
     relation = f" [{'；'.join(targets)}]" if targets else ""
-    return f"[{item.message_id}] {item.nickname}[QQ:{item.user_id}]{relation}：{item.text}"
+    image_context = "".join(f"\n[图片理解：{description}]" for description in item.image_descriptions)
+    return f"[{item.message_id}] {item.nickname}[QQ:{item.user_id}]{relation}：{item.text}{image_context}"
 
 
 def _format_profile(profile: MemberProfile) -> str:

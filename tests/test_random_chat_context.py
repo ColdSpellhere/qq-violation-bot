@@ -11,6 +11,7 @@ os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
 
 from plugins.chat_archive.db import SCHEMA, ContextMessage, recent_text_context
+from plugins.random_chat.ai import _format_turn
 from plugins.random_chat.matcher import send_random_reply
 
 
@@ -55,6 +56,131 @@ class RecentTextContextTests(unittest.TestCase):
                     "2026-08-06 00:00:00",
                 ),
             )
+
+    def _insert_image_asset(
+        self,
+        path: Path,
+        *,
+        group_id: int,
+        message_id: str,
+        ordinal: int,
+        status: str,
+        description: str | None,
+        deleted_at: str | None = None,
+    ) -> None:
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_image_assets(
+                    group_id,message_id,ordinal,source_url,event_time,status,attempts,
+                    description,deleted_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    group_id,
+                    message_id,
+                    ordinal,
+                    "https://example.invalid/image.jpg",
+                    1001,
+                    status,
+                    0,
+                    description,
+                    deleted_at,
+                ),
+            )
+
+    def test_includes_ready_image_descriptions_after_original_is_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._database(directory)
+            with sqlite3.connect(path) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE chat_image_assets (
+                        id INTEGER PRIMARY KEY,
+                        group_id INTEGER NOT NULL,
+                        message_id TEXT NOT NULL,
+                        ordinal INTEGER NOT NULL,
+                        source_url TEXT NOT NULL,
+                        event_time INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        attempts INTEGER NOT NULL,
+                        description TEXT,
+                        deleted_at TEXT
+                    );
+                    """
+                )
+            self._insert(
+                path,
+                message_id="m1",
+                event_time=1001,
+                user_id="7",
+                text="",
+                nickname="小花",
+            )
+            self._insert_image_asset(
+                path,
+                group_id=123,
+                message_id="m1",
+                ordinal=0,
+                status="ready",
+                description="一朵白花",
+                deleted_at="2026-08-21 12:00:00",
+            )
+            self._insert_image_asset(
+                path,
+                group_id=123,
+                message_id="m1",
+                ordinal=1,
+                status="ready",
+                description="一只绿色小虫",
+            )
+            self._insert(path, message_id="failed", event_time=1002, user_id="8", text="")
+            self._insert_image_asset(
+                path,
+                group_id=123,
+                message_id="failed",
+                ordinal=0,
+                status="failed",
+                description=None,
+            )
+
+            result = recent_text_context(
+                path,
+                group_id=123,
+                since_epoch=1000,
+                limit=20,
+                exclude_message_id="none",
+                bot_user_id="999",
+            )
+
+        self.assertEqual(
+            [
+                ContextMessage(
+                    "小花",
+                    "[图片]",
+                    message_id="m1",
+                    user_id="7",
+                    image_descriptions=("一朵白花", "一只绿色小虫"),
+                )
+            ],
+            result,
+        )
+
+    def test_formats_image_descriptions_as_system_understanding(self):
+        formatted = _format_turn(
+            ContextMessage(
+                "小花",
+                "[图片]",
+                message_id="m1",
+                user_id="7",
+                image_descriptions=("一朵白花", "一只绿色小虫"),
+            )
+        )
+
+        self.assertEqual(
+            "[m1] 小花[QQ:7]：[图片]\n[图片理解：一朵白花]\n[图片理解：一只绿色小虫]",
+            formatted,
+        )
 
     def test_filters_and_formats_recent_context(self):
         with tempfile.TemporaryDirectory() as directory:

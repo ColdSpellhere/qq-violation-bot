@@ -35,6 +35,7 @@ class ContextMessage:
     at_user_ids: tuple[str, ...] = ()
     reply_message_id: str | None = None
     replied_to_user_id: str | None = None
+    image_descriptions: tuple[str, ...] = ()
 
 
 def recent_text_context(
@@ -50,22 +51,65 @@ def recent_text_context(
         return []
     try:
         with sqlite3.connect(path) as conn:
-            rows = conn.execute(
-                """
-                SELECT m.message_id,m.user_id,m.sender_json,m.message_json,m.plaintext,
-                       m.reply_message_id,replied.user_id
-                FROM chat_messages AS m
-                LEFT JOIN chat_messages AS replied
-                  ON replied.message_id=m.reply_message_id AND replied.group_id=m.group_id
-                WHERE m.group_id=? AND m.event_time>=?
-                  AND m.message_id<>? AND m.user_id<>?
-                  AND trim(m.plaintext)<>''
-                  AND substr(ltrim(m.plaintext),1,1)<>'/'
-                ORDER BY m.event_time DESC,m.message_id DESC
-                LIMIT ?
-                """,
-                (group_id, since_epoch, exclude_message_id, bot_user_id, limit),
-            ).fetchall()
+            has_image_assets = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_image_assets'"
+            ).fetchone()
+            if has_image_assets:
+                rows = conn.execute(
+                    """
+                    SELECT m.message_id,m.user_id,m.sender_json,m.message_json,m.plaintext,
+                           m.reply_message_id,replied.user_id
+                    FROM chat_messages AS m
+                    LEFT JOIN chat_messages AS replied
+                      ON replied.message_id=m.reply_message_id AND replied.group_id=m.group_id
+                    WHERE m.group_id=? AND m.event_time>=?
+                      AND m.message_id<>? AND m.user_id<>?
+                      AND (
+                          (trim(m.plaintext)<>'' AND substr(ltrim(m.plaintext),1,1)<>'/')
+                          OR EXISTS (
+                              SELECT 1 FROM chat_image_assets AS asset
+                              WHERE asset.group_id=m.group_id AND asset.message_id=m.message_id
+                                AND asset.status='ready' AND trim(asset.description)<>''
+                          )
+                      )
+                    ORDER BY m.event_time DESC,m.message_id DESC
+                    LIMIT ?
+                    """,
+                    (group_id, since_epoch, exclude_message_id, bot_user_id, limit),
+                ).fetchall()
+                descriptions = {
+                    str(message_id): tuple(
+                        str(description).strip()
+                        for (description,) in conn.execute(
+                            """
+                            SELECT description FROM chat_image_assets
+                            WHERE group_id=? AND message_id=?
+                              AND status='ready' AND trim(description)<>''
+                            ORDER BY ordinal
+                            """,
+                            (group_id, message_id),
+                        )
+                    )
+                    for message_id, *_ in rows
+                }
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT m.message_id,m.user_id,m.sender_json,m.message_json,m.plaintext,
+                           m.reply_message_id,replied.user_id
+                    FROM chat_messages AS m
+                    LEFT JOIN chat_messages AS replied
+                      ON replied.message_id=m.reply_message_id AND replied.group_id=m.group_id
+                    WHERE m.group_id=? AND m.event_time>=?
+                      AND m.message_id<>? AND m.user_id<>?
+                      AND trim(m.plaintext)<>''
+                      AND substr(ltrim(m.plaintext),1,1)<>'/'
+                    ORDER BY m.event_time DESC,m.message_id DESC
+                    LIMIT ?
+                    """,
+                    (group_id, since_epoch, exclude_message_id, bot_user_id, limit),
+                ).fetchall()
+                descriptions = {}
     except (OSError, sqlite3.Error):
         return []
     context: list[ContextMessage] = []
@@ -91,16 +135,18 @@ def recent_text_context(
             and segment.get("type") == "at"
             and str(segment.get("data", {}).get("qq") or "").isdigit()
         )
-        if text:
+        image_descriptions = descriptions.get(str(message_id), ())
+        if text or image_descriptions:
             context.append(
                 ContextMessage(
                     nickname or str(user_id),
-                    text,
+                    text or "[图片]",
                     message_id=str(message_id),
                     user_id=str(user_id),
                     at_user_ids=at_user_ids,
                     reply_message_id=str(reply_id) if reply_id else None,
                     replied_to_user_id=str(replied_user_id) if replied_user_id else None,
+                    image_descriptions=image_descriptions,
                 )
             )
     return context
