@@ -32,6 +32,10 @@ group_matcher = on_message(
 )
 
 
+def has_image(event: GroupMessageEvent) -> bool:
+    return any(segment.type == "image" for segment in event.message)
+
+
 @group_matcher.handle()
 async def route_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     group_id = int(event.group_id)
@@ -53,5 +57,7 @@ async def route_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
 
     ordinary_text = eligible_text(text, at_bot=False)
-    if ordinary_text is not None and should_reply(CONFIG.random_chat_probability):
-        await send_random_reply(bot, event, ordinary_text)
+    if (ordinary_text is not None or has_image(event)) and should_reply(
+        CONFIG.random_chat_probability
+    ):
+        await send_random_reply(bot, event, ordinary_text or text)

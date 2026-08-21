@@ -1,10 +1,19 @@
 import base64
+from dataclasses import dataclass
 
 import httpx
 
 
 class ChatVisionAIError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class VisionImage:
+    content: bytes
+    mime_type: str
+    message_id: str
+    ordinal: int
 
 
 def image_data_url(content: bytes, mime_type: str) -> str:

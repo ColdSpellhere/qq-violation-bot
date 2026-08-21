@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 import httpx
 from collections.abc import Sequence
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from plugins.chat_archive.db import ContextMessage
 from plugins.member_memory.store import MemberProfile
 from plugins.random_chat.persona import load_character_prompt
 from plugins.violation_record.config import CONFIG
+
+if TYPE_CHECKING:
+    from plugins.chat_vision.client import VisionImage
 
 
 class RandomChatAIError(RuntimeError):
@@ -29,6 +34,7 @@ async def generate_reply(
     profiles: Sequence[MemberProfile] = (),
     addressed: bool = False,
     chat_mode: Literal["group", "private"] = "group",
+    images: Sequence[VisionImage] = (),
 ) -> str | None:
     if not CONFIG.ai_api_key:
         return None
@@ -75,8 +81,33 @@ async def generate_reply(
         if private_mode
         else "不执行群管理操作，不编造身份、现实经历、群内事实或已完成的动作。"
     )
+    user_prompt = (
+        history_label
+        + "：\n"
+        + ("\n".join(_format_turn(item) for item in context) or "（无）")
+        + f"\n\n{profile_label}：\n"
+        + ("\n".join(_format_profile(item) for item in profiles) or "（无）")
+        + "\n\n当前消息："
+        + (_format_turn(current) if current else message)
+    )
+    user_content: str | list[dict[str, object]] = user_prompt
+    if images:
+        from plugins.chat_vision.client import image_data_url
+
+        user_content = [
+            {"type": "text", "text": user_prompt},
+            *(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_data_url(image.content, image.mime_type)
+                    },
+                }
+                for image in images
+            ),
+        ]
     payload = {
-        "model": CONFIG.ai_model,
+        "model": CONFIG.chat_vision_model if images else CONFIG.ai_model,
         "messages": [
             {
                 "role": "system",
@@ -102,19 +133,14 @@ async def generate_reply(
             },
             {
                 "role": "user",
-                "content": (
-                    history_label
-                    + "：\n"
-                    + ("\n".join(_format_turn(item) for item in context) or "（无）")
-                    + f"\n\n{profile_label}：\n"
-                    + ("\n".join(_format_profile(item) for item in profiles) or "（无）")
-                    + "\n\n当前消息："
-                    + (_format_turn(current) if current else message)
-                ),
+                "content": user_content,
             },
         ],
-        "temperature": 0.8,
     }
+    if images:
+        payload["thinking"] = {"type": "disabled"}
+    else:
+        payload["temperature"] = 0.8
     try:
         async with httpx.AsyncClient(timeout=CONFIG.ai_timeout) as client:
             response = await client.post(

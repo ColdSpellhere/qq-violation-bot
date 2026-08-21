@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -71,16 +76,79 @@ def _asset(row: sqlite3.Row) -> ChatImageAsset:
     )
 
 
+def read_original_image(
+    asset: ChatImageAsset,
+    root: Path,
+    *,
+    now_text: str | None = None,
+) -> bytes | None:
+    current_time = now_text or datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    if (
+        asset.deleted_at is not None
+        or asset.expires_at is None
+        or asset.expires_at <= current_time
+        or asset.relative_path is None
+    ):
+        return None
+
+    root = Path(root)
+    try:
+        root_mode = root.lstat().st_mode
+        root_resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        return None
+
+    relative_path = Path(asset.relative_path)
+    if relative_path.is_absolute() or any(
+        component in {"", ".", ".."} for component in relative_path.parts
+    ):
+        return None
+    candidate = root
+    for component in relative_path.parts:
+        candidate /= component
+        try:
+            mode = candidate.lstat().st_mode
+        except (OSError, RuntimeError):
+            return None
+        if stat.S_ISLNK(mode):
+            return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not stat.S_ISREG(mode) or not resolved.is_relative_to(root_resolved):
+        return None
+    try:
+        content = candidate.read_bytes()
+    except OSError:
+        return None
+    if asset.byte_size is not None and len(content) != asset.byte_size:
+        return None
+    if asset.sha256 is not None and hashlib.sha256(content).hexdigest() != asset.sha256:
+        return None
+    return content
+
+
 class ChatVisionStore:
     def __init__(self, database_path: Path):
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.database_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:

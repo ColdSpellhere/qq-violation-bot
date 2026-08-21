@@ -7,10 +7,11 @@ from unittest.mock import patch
 
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
-from plugins.random_chat.ai import RandomChatAIError, generate_reply
-from plugins.member_memory.store import MemberProfile, MemoryTrait
-from plugins.random_chat.policy import eligible_text, is_candidate, should_reply
 from plugins.chat_archive.db import ContextMessage
+from plugins.chat_vision.client import VisionImage
+from plugins.member_memory.store import MemberProfile, MemoryTrait
+from plugins.random_chat.ai import RandomChatAIError, generate_reply
+from plugins.random_chat.policy import eligible_text, is_candidate, should_reply
 
 
 class RandomChatPolicyTests(unittest.TestCase):
@@ -101,6 +102,7 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
             ai_api_key="secret",
             ai_base_url="https://ai.example.com",
             ai_model="chat-model",
+            chat_vision_model="vision-model",
             ai_timeout=12,
         )
 
@@ -139,12 +141,15 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(url, "https://ai.example.com/v1/chat/completions")
         self.assertEqual(headers["Authorization"], "Bearer secret")
         self.assertEqual(payload["model"], "chat-model")
+        self.assertEqual(0.8, payload["temperature"])
+        self.assertNotIn("thinking", payload)
         system_prompt = payload["messages"][0]["content"]
         self.assertIn("真实的 QQ 群聊", system_prompt)
         self.assertIn("SKIP", system_prompt)
         self.assertIn("不固定使用", system_prompt)
         self.assertIn("只输出最终群消息或 SKIP", system_prompt)
         user_content = payload["messages"][1]["content"]
+        self.assertIsInstance(user_content, str)
         self.assertLess(user_content.index("小明[QQ:11]"), user_content.index("小红[QQ:22]"))
         self.assertIn("艾特:QQ:11", user_content)
         self.assertIn("小刚[QQ:33]", user_content)
@@ -162,6 +167,53 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不是另一个名字", system_prompt)
         self.assertIn("不要每句话都卖萌", system_prompt)
         self.assertEqual(timeout, 12)
+
+    async def test_images_use_vision_model_and_openai_multimodal_content(self) -> None:
+        images = (
+            VisionImage(b"first-image", "image/jpeg", "current", 1),
+            VisionImage(b"second-image", "image/png", "quoted", 2),
+        )
+        with patch("plugins.random_chat.ai.CONFIG", self.config), patch(
+            "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
+        ):
+            try:
+                await generate_reply("看看图片", context=[], images=images)
+            except TypeError as exc:
+                self.fail(f"generate_reply must accept raw images: {exc}")
+
+        payload = _FakeClient.posted[2]
+        self.assertEqual("vision-model", payload["model"])
+        self.assertEqual({"type": "disabled"}, payload["thinking"])
+        self.assertNotIn("temperature", payload)
+        user_content = payload["messages"][1]["content"]
+        self.assertEqual("text", user_content[0]["type"])
+        self.assertIn("当前消息：看看图片", user_content[0]["text"])
+        self.assertEqual(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/jpeg;base64,Zmlyc3QtaW1hZ2U="
+                    },
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,c2Vjb25kLWltYWdl"
+                    },
+                },
+            ],
+            user_content[1:],
+        )
+
+    def test_vision_image_is_an_immutable_raw_image_value(self) -> None:
+        image = VisionImage(b"bytes", "image/jpeg", "m1", 3)
+        self.assertEqual(b"bytes", image.content)
+        self.assertEqual("image/jpeg", image.mime_type)
+        self.assertEqual("m1", image.message_id)
+        self.assertEqual(3, image.ordinal)
+        with self.assertRaises((AttributeError, TypeError)):
+            image.ordinal = 4
 
     async def test_addressed_mode_requires_a_natural_answer(self):
         with patch("plugins.random_chat.ai.CONFIG", self.config), patch(

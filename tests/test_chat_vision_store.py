@@ -1,8 +1,11 @@
+import hashlib
+import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from plugins.chat_vision.store import ChatVisionStore
+from plugins.chat_vision.store import ChatVisionStore, read_original_image
 
 
 class ChatVisionStoreTests(unittest.TestCase):
@@ -69,6 +72,25 @@ class ChatVisionStoreTests(unittest.TestCase):
         self.assertEqual("processing", second_store.for_message(100, "m1")[0].status)
         self.assertIsNone(second_store.claim(asset.id, max_retries=3))
 
+    def test_database_operations_close_their_connections(self) -> None:
+        connections = []
+        real_connect = sqlite3.connect
+
+        def tracking_connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            connections.append(connection)
+            return connection
+
+        with patch("plugins.chat_vision.store.sqlite3.connect", side_effect=tracking_connect):
+            store = ChatVisionStore(self.db_path)
+            store.ensure_pending(100, "m1", 1, "https://cdn.example/1.jpg", 1000)
+            store.for_message(100, "m1")
+
+        self.assertEqual(3, len(connections))
+        for connection in connections:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+
     def test_explicit_recovery_makes_interrupted_claim_claimable(self) -> None:
         store = ChatVisionStore(self.db_path)
         asset = store.ensure_pending(100, "m1", 1, "https://cdn.example/1.jpg", 1000)
@@ -77,6 +99,64 @@ class ChatVisionStoreTests(unittest.TestCase):
         store.recover_interrupted_claims()
 
         self.assertEqual([asset.id], [item.id for item in store.claimable(max_retries=3)])
+
+    def test_reads_available_original_from_regular_file_under_root(self) -> None:
+        root = Path(self.temporary_directory.name) / "images"
+        root.mkdir()
+        content = b"raw-image"
+        (root / "m1.jpg").write_bytes(content)
+        store = ChatVisionStore(self.db_path)
+        asset = store.ensure_pending(100, "m1", 1, "https://cdn.example/1.jpg", 1000)
+        store.mark_downloaded(
+            asset.id,
+            "m1.jpg",
+            "image/jpeg",
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+            "2099-08-28 00:00:00",
+        )
+        asset = store.for_message(100, "m1")[0]
+        self.assertEqual(
+            content,
+            read_original_image(asset, root, now_text="2026-08-21 00:00:00"),
+        )
+
+    def test_rejects_expired_deleted_outside_and_symlink_originals(self) -> None:
+        root = Path(self.temporary_directory.name) / "images"
+        root.mkdir()
+        outside = Path(self.temporary_directory.name) / "outside.jpg"
+        outside.write_bytes(b"outside")
+        (root / "link.jpg").symlink_to(outside)
+        (root / "directory.jpg").mkdir()
+        store = ChatVisionStore(self.db_path)
+        fixtures = (
+            ("expired", "link.jpg", "2026-08-20 00:00:00", None),
+            ("deleted", "link.jpg", "2099-08-28 00:00:00", "2026-08-21 00:00:00"),
+            ("outside", "../outside.jpg", "2099-08-28 00:00:00", None),
+            ("symlink", "link.jpg", "2099-08-28 00:00:00", None),
+            ("directory", "directory.jpg", "2099-08-28 00:00:00", None),
+            ("missing", "missing.jpg", "2099-08-28 00:00:00", None),
+        )
+        assets = []
+        for ordinal, (message_id, relative_path, expires_at, deleted_at) in enumerate(
+            fixtures, start=1
+        ):
+            asset = store.ensure_pending(
+                100, message_id, ordinal, "https://cdn.example/image.jpg", 1000
+            )
+            store.mark_downloaded(
+                asset.id, relative_path, "image/jpeg", 7, "unused", expires_at
+            )
+            if deleted_at is not None:
+                store.mark_deleted(asset.id, deleted_at)
+            assets.append(store.for_message(100, message_id)[0])
+        for asset in assets:
+            with self.subTest(message_id=asset.message_id):
+                self.assertIsNone(
+                    read_original_image(
+                        asset, root, now_text="2026-08-21 00:00:00"
+                    )
+                )
 
 
 if __name__ == "__main__":

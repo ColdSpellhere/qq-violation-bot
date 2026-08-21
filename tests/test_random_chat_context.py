@@ -1,25 +1,30 @@
+import hashlib
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageSegment
 
 from plugins.chat_archive.db import SCHEMA, ContextMessage, recent_text_context
-from plugins.random_chat.ai import _format_turn
+from plugins.chat_vision.store import ChatVisionStore
+from plugins.random_chat.ai import RandomChatAIError, _format_turn
 from plugins.random_chat.matcher import send_random_reply
 
 
 class RecentTextContextTests(unittest.TestCase):
     def _database(self, directory: str) -> Path:
         path = Path(directory) / "chat.db"
-        with sqlite3.connect(path) as conn:
+        with closing(sqlite3.connect(path)) as conn:
             conn.executescript(SCHEMA)
+            conn.commit()
         return path
 
     def _insert(
@@ -36,7 +41,7 @@ class RecentTextContextTests(unittest.TestCase):
         segments: list[dict] | None = None,
         reply_message_id: str | None = None,
     ) -> None:
-        with sqlite3.connect(path) as conn:
+        with closing(sqlite3.connect(path)) as conn:
             conn.execute(
                 """
                 INSERT INTO chat_messages(
@@ -56,6 +61,7 @@ class RecentTextContextTests(unittest.TestCase):
                     "2026-08-06 00:00:00",
                 ),
             )
+            conn.commit()
 
     def _insert_image_asset(
         self,
@@ -68,7 +74,7 @@ class RecentTextContextTests(unittest.TestCase):
         description: str | None,
         deleted_at: str | None = None,
     ) -> None:
-        with sqlite3.connect(path) as conn:
+        with closing(sqlite3.connect(path)) as conn:
             conn.execute(
                 """
                 INSERT INTO chat_image_assets(
@@ -88,11 +94,12 @@ class RecentTextContextTests(unittest.TestCase):
                     deleted_at,
                 ),
             )
+            conn.commit()
 
     def test_includes_ready_image_descriptions_after_original_is_deleted(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self._database(directory)
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 conn.executescript(
                     """
                     CREATE TABLE chat_image_assets (
@@ -109,6 +116,7 @@ class RecentTextContextTests(unittest.TestCase):
                     );
                     """
                 )
+                conn.commit()
             self._insert(
                 path,
                 message_id="m1",
@@ -286,8 +294,8 @@ class RecentTextContextTests(unittest.TestCase):
                 )
 
 
-def _event() -> GroupMessageEvent:
-    message = Message("当前消息")
+def _event(message: Message | None = None) -> GroupMessageEvent:
+    message = message or Message("当前消息")
     return GroupMessageEvent(
         time=2000,
         self_id=999,
@@ -306,6 +314,47 @@ def _event() -> GroupMessageEvent:
 
 
 class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def _stored_image(
+        self,
+        store: ChatVisionStore,
+        root: Path,
+        *,
+        message_id: str,
+        ordinal: int,
+        content: bytes,
+        description: str,
+        expires_at: str = "2099-08-28 00:00:00",
+    ) -> None:
+        filename = f"{message_id}-{ordinal}.jpg"
+        (root / filename).write_bytes(content)
+        asset = store.ensure_pending(
+            789,
+            message_id,
+            ordinal,
+            f"https://example.invalid/{filename}",
+            2000,
+        )
+        store.mark_downloaded(
+            asset.id,
+            filename,
+            "image/jpeg",
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+            expires_at,
+        )
+        store.mark_ready(asset.id, description)
+
+    @staticmethod
+    def _vision_config(database: Path, root: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            chat_archive_path=database,
+            chat_vision_root=root,
+            member_memory_summary_enabled=False,
+            random_chat_sticker_root=root / "stickers",
+            random_chat_special_sticker="special.gif",
+            random_chat_sticker_probability=0.0,
+        )
+
     async def test_reads_expected_window_and_sends_contextual_reply(self):
         bot = AsyncMock()
         context = [ContextMessage("小明", "前文", message_id="1", user_id="11")]
@@ -385,6 +434,178 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(sent)
         self.assertEqual("自然回复", bot.send_group_msg.await_args.kwargs["message"])
+
+    async def test_passes_current_and_unexpired_quoted_originals_to_ai(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "images"
+            root.mkdir()
+            database = Path(directory) / "chat.db"
+            store = ChatVisionStore(database)
+            self._stored_image(
+                store,
+                root,
+                message_id="456",
+                ordinal=1,
+                content=b"current-raw",
+                description="当前图片是一朵花",
+            )
+            self._stored_image(
+                store,
+                root,
+                message_id="111",
+                ordinal=1,
+                content=b"quoted-raw",
+                description="引用图片是一只蝴蝶",
+            )
+            self._stored_image(
+                store,
+                root,
+                message_id="111",
+                ordinal=2,
+                content=b"expired-raw",
+                description="已过期图片仍有永久描述",
+                expires_at="2020-08-20 00:00:00",
+            )
+            context = [
+                ContextMessage(
+                    "引用者",
+                    "[图片]",
+                    message_id="111",
+                    user_id="321",
+                    image_descriptions=(
+                        "引用图片是一只蝴蝶",
+                        "已过期图片仍有永久描述",
+                    ),
+                )
+            ]
+            message = Message(
+                [
+                    MessageSegment.reply(111),
+                    MessageSegment.image("https://example.invalid/current.jpg"),
+                ]
+            )
+            bot = AsyncMock()
+            with patch(
+                "plugins.random_chat.matcher.CONFIG",
+                self._vision_config(database, root),
+            ), patch(
+                "plugins.random_chat.matcher.recent_text_context", return_value=context
+            ), patch(
+                "plugins.random_chat.matcher.archived_message_author", return_value="321"
+            ), patch(
+                "plugins.random_chat.matcher.load_profiles", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.generate_reply",
+                new=AsyncMock(return_value="看到了"),
+            ) as generate, patch(
+                "plugins.random_chat.matcher.choose_sticker", return_value=None
+            ):
+                sent = await send_random_reply(bot, _event(message), "")
+
+        self.assertTrue(sent)
+        generated = generate.await_args.kwargs
+        self.assertIn("images", generated)
+        if "images" not in generated:
+            return
+        self.assertEqual(
+            [b"current-raw", b"quoted-raw"],
+            [item.content for item in generated["images"]],
+        )
+        self.assertEqual(
+            ["456", "111"],
+            [item.message_id for item in generated["images"]],
+        )
+        self.assertEqual("[图片]", generated["current"].text)
+        self.assertEqual(
+            ("当前图片是一朵花",), generated["current"].image_descriptions
+        )
+        self.assertEqual(context, generated["context"])
+        self.assertIn(
+            "已过期图片仍有永久描述",
+            generated["context"][0].image_descriptions,
+        )
+
+    async def test_deduplicates_originals_by_asset_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "images"
+            root.mkdir()
+            database = Path(directory) / "chat.db"
+            store = ChatVisionStore(database)
+            self._stored_image(
+                store,
+                root,
+                message_id="456",
+                ordinal=1,
+                content=b"same-asset",
+                description="同一张图",
+            )
+            message = Message(
+                [
+                    MessageSegment.reply(456),
+                    MessageSegment.image("https://example.invalid/current.jpg"),
+                ]
+            )
+            with patch(
+                "plugins.random_chat.matcher.CONFIG",
+                self._vision_config(database, root),
+            ), patch(
+                "plugins.random_chat.matcher.recent_text_context", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.archived_message_author", return_value="123"
+            ), patch(
+                "plugins.random_chat.matcher.load_profiles", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.generate_reply",
+                new=AsyncMock(return_value="看到了"),
+            ) as generate, patch(
+                "plugins.random_chat.matcher.choose_sticker", return_value=None
+            ):
+                await send_random_reply(AsyncMock(), _event(message), "")
+
+        generated = generate.await_args.kwargs
+        self.assertIn("images", generated)
+        if "images" not in generated:
+            return
+        self.assertEqual(1, len(generated["images"]))
+
+    async def test_direct_vision_failure_returns_false_without_sending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "images"
+            root.mkdir()
+            database = Path(directory) / "chat.db"
+            store = ChatVisionStore(database)
+            self._stored_image(
+                store,
+                root,
+                message_id="456",
+                ordinal=1,
+                content=b"current-raw",
+                description="当前图片是一朵花",
+            )
+            message = Message(
+                [MessageSegment.image("https://example.invalid/current.jpg")]
+            )
+            bot = AsyncMock()
+            with patch(
+                "plugins.random_chat.matcher.CONFIG",
+                self._vision_config(database, root),
+            ), patch(
+                "plugins.random_chat.matcher.recent_text_context", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.archived_message_author", return_value=None
+            ), patch(
+                "plugins.random_chat.matcher.load_profiles", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.generate_reply",
+                new=AsyncMock(side_effect=RandomChatAIError("vision failed")),
+            ) as generate:
+                sent = await send_random_reply(bot, _event(message), "")
+
+        self.assertFalse(sent)
+        bot.send_group_msg.assert_not_awaited()
+        self.assertIn("images", generate.await_args.kwargs)
+        if "images" in generate.await_args.kwargs:
+            self.assertEqual(1, len(generate.await_args.kwargs["images"]))
 
     async def test_archive_ai_and_send_failures_do_not_escape(self):
         bot = AsyncMock()

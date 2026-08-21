@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
 
@@ -7,6 +11,9 @@ from plugins.violation_record.config import CONFIG
 
 from .ai import RandomChatAIError, generate_reply
 from .stickers import choose_sticker
+
+if TYPE_CHECKING:
+    from plugins.chat_vision.client import VisionImage
 
 
 async def send_random_reply(
@@ -37,9 +44,50 @@ async def send_random_reply(
         ),
         None,
     )
+    current_text = text.strip() or "[图片]"
+    current_descriptions: tuple[str, ...] = ()
+    images: list[VisionImage] = []
+    if any(segment.type == "image" for segment in event.message) or reply_message_id:
+        try:
+            from plugins.chat_vision.client import VisionImage
+            from plugins.chat_vision.store import ChatVisionStore, read_original_image
+
+            store = ChatVisionStore(CONFIG.chat_archive_path)
+            assets = []
+            seen_asset_ids: set[int] = set()
+            for message_id in (str(event.message_id), reply_message_id):
+                if message_id is None:
+                    continue
+                for asset in store.for_message(int(event.group_id), message_id):
+                    if asset.id in seen_asset_ids:
+                        continue
+                    seen_asset_ids.add(asset.id)
+                    assets.append(asset)
+            current_descriptions = tuple(
+                asset.description.strip()
+                for asset in assets
+                if asset.message_id == str(event.message_id)
+                and asset.status == "ready"
+                and asset.description
+                and asset.description.strip()
+            )
+            for asset in assets:
+                content = read_original_image(asset, CONFIG.chat_vision_root)
+                if content is None or not asset.mime_type:
+                    continue
+                images.append(
+                    VisionImage(
+                        content=content,
+                        mime_type=asset.mime_type,
+                        message_id=asset.message_id,
+                        ordinal=asset.ordinal,
+                    )
+                )
+        except Exception as exc:
+            logger.warning(f"随机闲聊读取图片原图失败：{type(exc).__name__}")
     current = ContextMessage(
         event.sender.card or event.sender.nickname or str(event.user_id),
-        text,
+        current_text,
         message_id=str(event.message_id),
         user_id=str(event.user_id),
         at_user_ids=at_user_ids,
@@ -49,6 +97,7 @@ async def send_random_reply(
             group_id=int(event.group_id),
             message_id=reply_message_id,
         ),
+        image_descriptions=current_descriptions,
     )
     memory_context = [*context, current]
     profiles = load_profiles(
@@ -60,11 +109,12 @@ async def send_random_reply(
     )
     try:
         reply = await generate_reply(
-            text,
+            current_text,
             context=context,
             current=current,
             profiles=profiles,
             addressed=addressed,
+            images=images,
         )
     except RandomChatAIError as exc:
         logger.warning(f"随机闲聊 AI 回复失败：{exc}")

@@ -33,13 +33,17 @@ def _group_event(
     *,
     group_id: int = TARGET_GROUP_ID,
     addressed: bool = False,
+    image: bool = False,
     user_id: int = 123,
     self_id: int = 999,
 ) -> GroupMessageEvent:
     segments = []
     if addressed:
         segments.append(MessageSegment.at(self_id))
-    segments.append(MessageSegment.text(text))
+    if image:
+        segments.append(MessageSegment.image("https://example.invalid/chat.jpg"))
+    if text:
+        segments.append(MessageSegment.text(text))
     message = Message(segments)
     return GroupMessageEvent(
         time=2000,
@@ -184,6 +188,66 @@ class GroupRouterTests(unittest.IsolatedAsyncioTestCase):
 
         should_reply.assert_not_called()
         casual.assert_awaited_once_with(bot, event, "在吗", addressed=True)
+
+    async def test_addressed_image_only_message_always_chats_without_probability_sample(
+        self,
+    ) -> None:
+        bot = AsyncMock()
+        event = _group_event("", group_id=CHAT_GROUP_ID, addressed=True, image=True)
+        with patch.object(group_router, "FEATURES", self.controller()), patch.object(
+            group_router,
+            "CONFIG",
+            SimpleNamespace(
+                target_group_id=TARGET_GROUP_ID,
+                random_chat_probability=0.0,
+            ),
+        ), patch.object(group_router, "should_reply") as should_reply, patch.object(
+            group_router, "send_random_reply", new=AsyncMock(return_value=True)
+        ) as casual:
+            await group_router.route_group_message(bot, event)
+
+        should_reply.assert_not_called()
+        casual.assert_awaited_once_with(bot, event, "", addressed=True)
+
+    async def test_unaddressed_image_only_message_uses_probability_once(self) -> None:
+        bot = AsyncMock()
+        event = _group_event("", group_id=CHAT_GROUP_ID, image=True)
+        config = SimpleNamespace(
+            target_group_id=TARGET_GROUP_ID,
+            random_chat_probability=0.25,
+        )
+        for decision in (False, True):
+            with self.subTest(decision=decision), patch.object(
+                group_router, "FEATURES", self.controller()
+            ), patch.object(group_router, "CONFIG", config), patch.object(
+                group_router, "should_reply", return_value=decision
+            ) as sample, patch.object(
+                group_router, "send_random_reply", new=AsyncMock(return_value=True)
+            ) as casual:
+                await group_router.route_group_message(bot, event)
+
+            sample.assert_called_once_with(0.25)
+            if decision:
+                casual.assert_awaited_once_with(bot, event, "")
+            else:
+                casual.assert_not_awaited()
+
+    async def test_image_with_text_uses_ordinary_text_probability_once(self) -> None:
+        bot = AsyncMock()
+        event = _group_event("看看这朵花", group_id=CHAT_GROUP_ID, image=True)
+        config = SimpleNamespace(
+            target_group_id=TARGET_GROUP_ID,
+            random_chat_probability=0.25,
+        )
+        with patch.object(group_router, "FEATURES", self.controller()), patch.object(
+            group_router, "CONFIG", config
+        ), patch.object(group_router, "should_reply", return_value=True) as sample, patch.object(
+            group_router, "send_random_reply", new=AsyncMock(return_value=True)
+        ) as casual:
+            await group_router.route_group_message(bot, event)
+
+        sample.assert_called_once_with(0.25)
+        casual.assert_awaited_once_with(bot, event, "看看这朵花")
 
     async def test_ordinary_allowed_group_is_probability_gated(self) -> None:
         bot = AsyncMock()
