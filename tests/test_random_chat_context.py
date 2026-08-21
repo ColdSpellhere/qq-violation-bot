@@ -4,7 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -294,9 +294,25 @@ class RecentTextContextTests(unittest.TestCase):
                 )
 
 
-def _event(message: Message | None = None) -> GroupMessageEvent:
-    message = message or Message("当前消息")
-    return GroupMessageEvent(
+def _reply(message_id: int = 111) -> dict:
+    return {
+        "time": 1000,
+        "message_type": "group",
+        "message_id": message_id,
+        "real_id": message_id,
+        "sender": {"user_id": 321, "nickname": "引用者"},
+        "message": Message("原消息"),
+    }
+
+
+def _event(
+    message: Message | None = None,
+    *,
+    original_message: Message | None = None,
+    reply: dict | None = None,
+) -> GroupMessageEvent:
+    message = message if message is not None else Message("当前消息")
+    event = GroupMessageEvent(
         time=2000,
         self_id=999,
         post_type="message",
@@ -310,7 +326,11 @@ def _event(message: Message | None = None) -> GroupMessageEvent:
         raw_message="当前消息",
         font=0,
         sender={"user_id": 123, "nickname": "成员", "role": "member"},
+        reply=reply,
     )
+    if original_message is not None:
+        event.original_message = original_message
+    return event
 
 
 class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -478,9 +498,12 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
             ]
-            message = Message(
+            processed_message = Message(
+                [MessageSegment.image("https://example.invalid/current.jpg")]
+            )
+            original_message = Message(
                 [
-                    MessageSegment.reply(111),
+                    MessageSegment.reply(222),
                     MessageSegment.image("https://example.invalid/current.jpg"),
                 ]
             )
@@ -500,7 +523,15 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ) as generate, patch(
                 "plugins.random_chat.matcher.choose_sticker", return_value=None
             ):
-                sent = await send_random_reply(bot, _event(message), "")
+                sent = await send_random_reply(
+                    bot,
+                    _event(
+                        processed_message,
+                        original_message=original_message,
+                        reply=_reply(111),
+                    ),
+                    "",
+                )
 
         self.assertTrue(sent)
         generated = generate.await_args.kwargs
@@ -539,7 +570,10 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 content=b"same-asset",
                 description="同一张图",
             )
-            message = Message(
+            processed_message = Message(
+                [MessageSegment.image("https://example.invalid/current.jpg")]
+            )
+            original_message = Message(
                 [
                     MessageSegment.reply(456),
                     MessageSegment.image("https://example.invalid/current.jpg"),
@@ -560,13 +594,18 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ) as generate, patch(
                 "plugins.random_chat.matcher.choose_sticker", return_value=None
             ):
-                await send_random_reply(AsyncMock(), _event(message), "")
+                await send_random_reply(
+                    AsyncMock(),
+                    _event(processed_message, original_message=original_message),
+                    "",
+                )
 
         generated = generate.await_args.kwargs
         self.assertIn("images", generated)
         if "images" not in generated:
             return
         self.assertEqual(1, len(generated["images"]))
+        self.assertEqual("456", generated["current"].reply_message_id)
 
     async def test_direct_vision_failure_returns_false_without_sending(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -606,6 +645,202 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("images", generate.await_args.kwargs)
         if "images" in generate.await_args.kwargs:
             self.assertEqual(1, len(generate.await_args.kwargs["images"]))
+
+    async def test_pure_image_without_available_current_original_returns_false(self):
+        for mode in ("missing", "expired", "read_error"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "images"
+                root.mkdir()
+                database = Path(directory) / "chat.db"
+                store = ChatVisionStore(database)
+                if mode != "missing":
+                    self._stored_image(
+                        store,
+                        root,
+                        message_id="456",
+                        ordinal=1,
+                        content=b"expired-current",
+                        description="已经过期的当前图片描述",
+                        expires_at=(
+                            "2020-08-20 00:00:00"
+                            if mode == "expired"
+                            else "2099-08-20 00:00:00"
+                        ),
+                    )
+                message = Message(
+                    [MessageSegment.image("https://example.invalid/current.jpg")]
+                )
+                bot = AsyncMock()
+                read_original = (
+                    patch(
+                        "plugins.chat_vision.store.read_original_image",
+                        side_effect=OSError("read failed"),
+                    )
+                    if mode == "read_error"
+                    else nullcontext()
+                )
+                with read_original, patch(
+                    "plugins.random_chat.matcher.CONFIG",
+                    self._vision_config(database, root),
+                ), patch(
+                    "plugins.random_chat.matcher.recent_text_context", return_value=[]
+                ), patch(
+                    "plugins.random_chat.matcher.archived_message_author",
+                    return_value=None,
+                ), patch(
+                    "plugins.random_chat.matcher.load_profiles", return_value=[]
+                ) as profiles, patch(
+                    "plugins.random_chat.matcher.generate_reply",
+                    new=AsyncMock(return_value="我看到了花"),
+                ) as generate:
+                    sent = await send_random_reply(bot, _event(message), "")
+
+                self.assertFalse(sent)
+                generate.assert_not_awaited()
+                profiles.assert_not_called()
+                bot.send_group_msg.assert_not_awaited()
+
+    async def test_mixed_image_without_original_degrades_to_real_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "images"
+            root.mkdir()
+            database = Path(directory) / "chat.db"
+            store = ChatVisionStore(database)
+            self._stored_image(
+                store,
+                root,
+                message_id="456",
+                ordinal=1,
+                content=b"expired-current",
+                description="不可用的当前图片描述",
+                expires_at="2020-08-20 00:00:00",
+            )
+            self._stored_image(
+                store,
+                root,
+                message_id="111",
+                ordinal=1,
+                content=b"quoted-raw",
+                description="引用图片描述",
+            )
+            processed_message = Message(
+                [
+                    MessageSegment.image("https://example.invalid/current.jpg"),
+                    MessageSegment.text("你觉得这个配色怎么样"),
+                ]
+            )
+            original_message = Message(
+                [
+                    MessageSegment.reply(111),
+                    MessageSegment.image("https://example.invalid/current.jpg"),
+                    MessageSegment.text("你觉得这个配色怎么样"),
+                ]
+            )
+            bot = AsyncMock()
+            with patch(
+                "plugins.random_chat.matcher.CONFIG",
+                self._vision_config(database, root),
+            ), patch(
+                "plugins.random_chat.matcher.recent_text_context", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.archived_message_author", return_value="321"
+            ), patch(
+                "plugins.random_chat.matcher.load_profiles", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.generate_reply",
+                new=AsyncMock(return_value="我没拿到图片，只能先说配色要看整体。"),
+            ) as generate, patch(
+                "plugins.random_chat.matcher.choose_sticker", return_value=None
+            ):
+                sent = await send_random_reply(
+                    bot,
+                    _event(
+                        processed_message,
+                        original_message=original_message,
+                        reply=_reply(111),
+                    ),
+                    "你觉得这个配色怎么样",
+                )
+
+        self.assertTrue(sent)
+        self.assertEqual((), tuple(generate.await_args.kwargs["images"]))
+        self.assertEqual("你觉得这个配色怎么样", generate.await_args.args[0])
+        self.assertEqual(
+            "你觉得这个配色怎么样", generate.await_args.kwargs["current"].text
+        )
+        self.assertEqual((), generate.await_args.kwargs["current"].image_descriptions)
+
+    async def test_empty_text_without_image_does_not_use_image_placeholder(self):
+        message = Message([MessageSegment.at(999)])
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value=None),
+        ) as generate:
+            sent = await send_random_reply(AsyncMock(), _event(message), "", addressed=True)
+
+        self.assertFalse(sent)
+        self.assertEqual("", generate.await_args.args[0])
+        self.assertEqual("", generate.await_args.kwargs["current"].text)
+
+    async def test_explicit_old_quoted_image_description_is_added_to_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "images"
+            root.mkdir()
+            database = Path(directory) / "chat.db"
+            store = ChatVisionStore(database)
+            self._stored_image(
+                store,
+                root,
+                message_id="111",
+                ordinal=1,
+                content=b"expired-quoted",
+                description="一张很久以前的白花照片",
+                expires_at="2020-08-20 00:00:00",
+            )
+            processed_message = Message("这张图是什么")
+            original_message = Message(
+                [MessageSegment.reply(111), MessageSegment.text("这张图是什么")]
+            )
+            with patch(
+                "plugins.random_chat.matcher.CONFIG",
+                self._vision_config(database, root),
+            ), patch(
+                "plugins.random_chat.matcher.recent_text_context", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.archived_message_author", return_value="321"
+            ), patch(
+                "plugins.random_chat.matcher.load_profiles", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.generate_reply",
+                new=AsyncMock(return_value=None),
+            ) as generate:
+                await send_random_reply(
+                    AsyncMock(),
+                    _event(
+                        processed_message,
+                        original_message=original_message,
+                        reply=_reply(111),
+                    ),
+                    "这张图是什么",
+                    addressed=True,
+                )
+
+        self.assertEqual((), tuple(generate.await_args.kwargs["images"]))
+        quoted = [
+            item
+            for item in generate.await_args.kwargs["context"]
+            if item.message_id == "111"
+        ]
+        self.assertEqual(1, len(quoted))
+        self.assertEqual(
+            ("一张很久以前的白花照片",), quoted[0].image_descriptions
+        )
 
     async def test_archive_ai_and_send_failures_do_not_escape(self):
         bot = AsyncMock()

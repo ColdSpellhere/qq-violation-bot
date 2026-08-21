@@ -16,6 +16,22 @@ if TYPE_CHECKING:
     from plugins.chat_vision.client import VisionImage
 
 
+def _reply_message_id(event: GroupMessageEvent) -> str | None:
+    if event.reply:
+        for name in ("message_id", "id"):
+            value = getattr(event.reply, name, None)
+            if value not in (None, ""):
+                return str(value)
+    for message in (event.original_message, event.message):
+        for segment in message:
+            if segment.type != "reply":
+                continue
+            value = segment.data.get("id") or segment.data.get("message_id")
+            if value not in (None, ""):
+                return str(value)
+    return None
+
+
 async def send_random_reply(
     bot: Bot, event: GroupMessageEvent, text: str, *, addressed: bool = False
 ) -> bool:
@@ -36,18 +52,14 @@ async def send_random_reply(
         for segment in event.message
         if segment.type == "at" and str(segment.data.get("qq") or "").isdigit()
     )
-    reply_message_id = next(
-        (
-            str(segment.data.get("id") or segment.data.get("message_id"))
-            for segment in event.message
-            if segment.type == "reply" and (segment.data.get("id") or segment.data.get("message_id"))
-        ),
-        None,
-    )
-    current_text = text.strip() or "[图片]"
+    reply_message_id = _reply_message_id(event)
+    stripped_text = text.strip()
+    current_has_image = any(segment.type == "image" for segment in event.message)
+    current_text = stripped_text or ("[图片]" if current_has_image else "")
     current_descriptions: tuple[str, ...] = ()
+    referenced_descriptions: tuple[str, ...] = ()
     images: list[VisionImage] = []
-    if any(segment.type == "image" for segment in event.message) or reply_message_id:
+    if current_has_image or reply_message_id:
         try:
             from plugins.chat_vision.client import VisionImage
             from plugins.chat_vision.store import ChatVisionStore, read_original_image
@@ -71,6 +83,15 @@ async def send_random_reply(
                 and asset.description
                 and asset.description.strip()
             )
+            referenced_descriptions = tuple(
+                asset.description.strip()
+                for asset in assets
+                if reply_message_id
+                and asset.message_id == reply_message_id
+                and asset.status == "ready"
+                and asset.description
+                and asset.description.strip()
+            )
             for asset in assets:
                 content = read_original_image(asset, CONFIG.chat_vision_root)
                 if content is None or not asset.mime_type:
@@ -85,6 +106,31 @@ async def send_random_reply(
                 )
         except Exception as exc:
             logger.warning(f"随机闲聊读取图片原图失败：{type(exc).__name__}")
+    has_current_original = any(
+        image.message_id == str(event.message_id) for image in images
+    )
+    if current_has_image and not has_current_original:
+        if not stripped_text:
+            return False
+        current_descriptions = ()
+        images.clear()
+    replied_to_user_id = archived_message_author(
+        CONFIG.chat_archive_path,
+        group_id=int(event.group_id),
+        message_id=reply_message_id,
+    )
+    if referenced_descriptions and not any(
+        item.message_id == reply_message_id for item in context
+    ):
+        context.append(
+            ContextMessage(
+                replied_to_user_id or "被引用消息",
+                "[图片]",
+                message_id=reply_message_id or "",
+                user_id=replied_to_user_id or "",
+                image_descriptions=referenced_descriptions,
+            )
+        )
     current = ContextMessage(
         event.sender.card or event.sender.nickname or str(event.user_id),
         current_text,
@@ -92,11 +138,7 @@ async def send_random_reply(
         user_id=str(event.user_id),
         at_user_ids=at_user_ids,
         reply_message_id=reply_message_id,
-        replied_to_user_id=archived_message_author(
-            CONFIG.chat_archive_path,
-            group_id=int(event.group_id),
-            message_id=reply_message_id,
-        ),
+        replied_to_user_id=replied_to_user_id,
         image_descriptions=current_descriptions,
     )
     memory_context = [*context, current]

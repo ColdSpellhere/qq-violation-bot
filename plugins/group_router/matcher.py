@@ -46,6 +46,7 @@ async def route_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         group_id == CONFIG.target_group_id
         and FEATURES.business_allowed(group_id, CONFIG.target_group_id)
         and addressed
+        and (text or not has_image(event))
         and await handle_business_message(bot, event, text)
     ):
         return
