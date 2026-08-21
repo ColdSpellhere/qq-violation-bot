@@ -85,6 +85,9 @@ class ChatVisionStore:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+
+    def recover_interrupted_claims(self) -> None:
+        with self._connect() as conn:
             conn.execute(
                 "UPDATE chat_image_assets SET status='pending' WHERE status='processing'"
             )
@@ -123,7 +126,7 @@ class ChatVisionStore:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 "UPDATE chat_image_assets SET status='processing',attempts=attempts+1 "
-                "WHERE id=? AND status='pending' AND attempts<?",
+                "WHERE id=? AND status IN ('pending','failed') AND attempts<?",
                 (asset_id, max_retries),
             )
             if cursor.rowcount != 1:
@@ -183,7 +186,8 @@ class ChatVisionStore:
             rows = conn.execute(
                 "SELECT id,group_id,message_id,ordinal,source_url,event_time,status,attempts,"
                 "relative_path,mime_type,byte_size,sha256,description,expires_at,deleted_at "
-                "FROM chat_image_assets WHERE status='pending' AND attempts<? ORDER BY id",
+                "FROM chat_image_assets WHERE status IN ('pending','failed') "
+                "AND attempts<? ORDER BY id",
                 (max_retries,),
             ).fetchall()
         return [_asset(row) for row in rows]
