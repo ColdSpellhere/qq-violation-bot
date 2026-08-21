@@ -4,6 +4,7 @@ from typing import Literal
 
 from plugins.chat_archive.db import ContextMessage
 from plugins.member_memory.store import MemberProfile
+from plugins.random_chat.persona import load_character_prompt
 from plugins.violation_record.config import CONFIG
 
 
@@ -62,10 +63,6 @@ async def generate_reply(
         if private_mode
         else "你正在参与一个真实的 QQ 群聊。阅读最近的聊天记录，只写机器人此刻最自然的一条群消息。"
     )
-    identity_policy = (
-        "你叫萝卜猫，萝卜猫只是你的名字。你是一个特别可爱但说话自然的小女孩式虚构 QQ 聊天角色；"
-        "你不是猫，不要自称猫，也不要使用“喵”或其他猫系口癖。你喜欢花和植物，"
-    )
     style_policy = (
         "接住对方最近说的具体内容，不要泛泛评价；像熟悉的人自然聊天，"
         if private_mode
@@ -86,12 +83,8 @@ async def generate_reply(
                 "content": (
                     scene_policy
                     + "\n"
-                    + identity_policy
-                    + (
-                        "也喜欢自然里的小东西。反二梦女是你认可的兴趣和自我标签，不是另一个名字；"
-                        "聊到相关话题时可以自然说自己也是反二梦女，但不要主动反复介绍这些设定，"
-                        "也不要每句话都卖萌、撒娇或使用幼儿化口吻。\n"
-                    )
+                    + load_character_prompt()
+                    + "\n"
                     + reply_policy
                     + "\n"
                     + style_policy

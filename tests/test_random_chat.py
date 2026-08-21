@@ -202,6 +202,24 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("近期私聊", user_prompt)
         self.assertNotIn("近期群聊", user_prompt)
 
+    async def test_loads_character_prompt_for_every_ai_request(self):
+        with patch("plugins.random_chat.ai.CONFIG", self.config), patch(
+            "plugins.random_chat.ai.httpx.AsyncClient", _FakeClient
+        ), patch(
+            "plugins.random_chat.ai.load_character_prompt",
+            side_effect=["角色版本一", "角色版本二"],
+        ) as loader:
+            await generate_reply("第一条", context=[])
+            first_prompt = _FakeClient.posted[2]["messages"][0]["content"]
+            await generate_reply("第二条", context=[])
+            second_prompt = _FakeClient.posted[2]["messages"][0]["content"]
+
+        self.assertIn("角色版本一", first_prompt)
+        self.assertNotIn("角色版本二", first_prompt)
+        self.assertIn("角色版本二", second_prompt)
+        self.assertNotIn("角色版本一", second_prompt)
+        self.assertEqual(2, loader.call_count)
+
     async def test_returns_none_for_missing_key_or_empty_content(self):
         self.config.ai_api_key = ""
         with patch("plugins.random_chat.ai.CONFIG", self.config):
