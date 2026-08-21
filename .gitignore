@@ -14,6 +14,8 @@ data/*
 data/member_memory/*
 !data/member_memory/.gitignore
 !data/member_memory/README.md
+/data/runtime_features.json
+/data/runtime_features.json.bak
 backups/
 exports/
 logs/

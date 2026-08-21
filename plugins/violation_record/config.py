@@ -38,6 +38,26 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _id_tuple_env(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    values = [item.strip() for item in raw.split(",")]
+    if not values or any(not item.isdigit() or int(item) <= 0 for item in values):
+        return default
+    return tuple(sorted({int(item) for item in values}))
+
+
+def _string_id_tuple_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    values = [item.strip() for item in raw.split(",")]
+    if not values or any(not item.isdigit() or int(item) <= 0 for item in values):
+        return default
+    return tuple(str(item) for item in sorted({int(item) for item in values}))
+
+
 def _target_group_id_env() -> int:
     raw = str(os.getenv("TARGET_GROUP_ID") or "").strip()
     if not raw.isdigit():
@@ -57,6 +77,7 @@ def _database_path(url: str) -> Path:
 
 
 _TARGET_GROUP_ID = _target_group_id_env()
+legacy_private_ids = _string_id_tuple_env("PRIVATE_CHAT_ALLOWED_USER_ID", ())
 
 
 @dataclass(frozen=True)
@@ -108,6 +129,18 @@ class AppConfig:
     private_chat_allowed_user_id: str = str(
         os.getenv("PRIVATE_CHAT_ALLOWED_USER_ID") or ""
     ).strip()
+    business_enabled: bool = _bool_env("BUSINESS_ENABLED", True)
+    chat_enabled: bool = _bool_env(
+        "CHAT_ENABLED", random_chat_enabled or private_chat_enabled
+    )
+    group_chat_enabled: bool = _bool_env("GROUP_CHAT_ENABLED", random_chat_enabled)
+    group_chat_allowed_group_ids: tuple[int, ...] = _id_tuple_env(
+        "GROUP_CHAT_ALLOWED_GROUP_IDS", (_TARGET_GROUP_ID,)
+    )
+    private_chat_allowed_user_ids: tuple[str, ...] = _string_id_tuple_env(
+        "PRIVATE_CHAT_ALLOWED_USER_IDS", legacy_private_ids
+    )
+    runtime_features_path: Path = DATA_DIR / "runtime_features.json"
     admin_seed: str = os.getenv("ADMIN_SEED", "")
 
 
