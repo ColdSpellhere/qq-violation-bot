@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 模块化功能控制
+
+- 新增业务、聊天、群聊和私聊的持久化运行时开关，以及群聊群/私聊用户白名单；新安装默认只开启业务，聊天入口默认关闭。
+- 仅 NoneBot `SUPERUSERS` 可通过 QQ 命令查看状态、切换模块和维护白名单。运行时状态写入 Git 忽略的 `data/runtime_features.json`，有效状态优先于 `.env` 默认值。
+- 业务群与聊天群路由隔离：聊天白名单中的非业务群不进入业务判断；群聊归档和成员记忆受聊天总开关、群聊子开关和群白名单共同约束。
+- v1.0.2beta 策略提醒在业务关闭、QQ/OneBot 离线或发送失败时保留，恢复后以一次合并转发概览处理，发送成功前不标记完成。
+- 保留 `TARGET_GROUP_ID`、`RANDOM_CHAT_ENABLED`、`PRIVATE_CHAT_ENABLED` 和 `PRIVATE_CHAT_ALLOWED_USER_ID` 作为首次启动/升级兼容输入；新私聊白名单使用 `PRIVATE_CHAT_ALLOWED_USER_IDS`。
+
 ### 群友记忆
 
 - 原始特性和历史昵称改为追加式永久账本，不再因 8 条兼容视图上限淘汰。

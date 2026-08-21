@@ -73,21 +73,21 @@ AI_MODEL=deepseek-chat
 RANDOM_CHAT_ENABLED=false
 RANDOM_CHAT_PROBABILITY=0.10
 PRIVATE_CHAT_ENABLED=false
+PRIVATE_CHAT_ALLOWED_USER_IDS=
+# 仅为旧版私聊白名单兼容保留；新部署使用上面的多值配置
 PRIVATE_CHAT_ALLOWED_USER_ID=
 ADMIN_SEED=123456:ColdSpell:冷|spell;654321:企鹅
 ```
 
 `AI_API_KEY` 缺失时，机器人会回复：`AI 未启用或缺少 AI_API_KEY，无法进行自然语言解析。`
 
-`RANDOM_CHAT_ENABLED=false` 默认关闭随机 AI 群聊回复。设为 `true` 后，只在当前 `TARGET_GROUP_ID` 对普通成员文字按 `RANDOM_CHAT_PROBABILITY` 概率回复，默认值 `0.10` 表示 10%。命中后会读取当前群最近 30 分钟内最多 20 条纯文本，按群名片、QQ 昵称、QQ号的顺序标注成员并交给 AI 理解上下文；不读取图片或业务数据库。机器人自身消息、@ 机器人消息、空消息和 `/` 开头命令不会触发；归档、AI 或发送异常时静默降级，不影响违规记录等现有模块。紧急停用时将开关恢复为 `false`，再执行 `systemctl restart qq-violation-bot.service`。
+`RANDOM_CHAT_ENABLED` 是旧版首次群聊默认值兼容输入；运行时实际由下文的聊天总开关、群聊子开关和群聊白名单决定。允许群内，明确 @ 机器人的文字会直接进入聊天回复；普通成员文字仍按 `RANDOM_CHAT_PROBABILITY` 概率回复，默认值 `0.10` 表示 10%。命中后会读取当前群最近 30 分钟内最多 20 条纯文本，按群名片、QQ 昵称、QQ号的顺序标注成员并交给 AI 理解上下文；不读取图片或业务数据库。机器人自身消息、空消息和 `/` 开头命令不会触发。归档、AI 或发送异常时静默降级，不影响业务模块。
 
-`TARGET_GROUP_ID` 只允许配置一个群号。其他群的消息在框架接收入口后立即丢弃，不进入 NLP、业务查询、数据库写入、消息归档、图片下载、管理员同步或自定义日志。目标群的全部消息都会归档，不要求必须 @ 机器人；归档保存消息及相关元数据，但不会因此下载消息中的普通图片。
+`TARGET_GROUP_ID` 只允许配置一个业务群号。只有该群会进入业务 NLP、业务查询、数据库写入和管理员同步；加入聊天白名单的其他群只进入聊天流程。允许聊天的群消息都会归档，不要求必须 @ 机器人；归档保存消息及相关元数据，但不会因此下载消息中的普通图片。
 
-`RANDOM_CHAT_ENABLED=true` 时，萝卜猫以 `RANDOM_CHAT_PROBABILITY` 概率尝试参与目标群普通聊天；当前生产运行配置为 `0.03`（3%）。萝卜猫只是她的名字，她不是猫，不自称猫或使用“喵”等猫系口癖；她喜欢花和植物，并把“反二梦女”视为自己的兴趣和自我标签。上下文会保留发送者 QQ、昵称、艾特对象和引用对象，避免把群友之间的话误当成对机器人说。
+萝卜猫只是角色名字，不自称猫或使用“喵”等猫系口癖；她喜欢花和植物，并把“反二梦女”视为自己的兴趣和自我标签。上下文会保留发送者 QQ、昵称、艾特对象和引用对象，避免把群友之间的话误当成对机器人说。查询、记录、减数、禁言等已识别业务始终优先于聊天回复。成功的聊天回复以 `RANDOM_CHAT_STICKER_PROBABILITY=0.20` 的概率附带最多一张表情包；指定首图在已决定附图时占 10%，其余图片均分 90%。表情包只保存在 `data/random_chat/stickers/incoming/`，不会提交到 GitHub，业务回复永不附图。
 
-`RANDOM_CHAT_DIRECT_FALLBACK_ENABLED=true` 允许点名或回复机器人、但业务路由判定为 `unknown` 的消息转为正常闲聊；查询、记录、减数、禁言等已识别业务仍优先处理。若该功能异常，将它改为 `false` 并重启 `qq-violation-bot.service` 即可关闭，无需回滚版本。成功的闲聊回复以 `RANDOM_CHAT_STICKER_PROBABILITY=0.20` 的概率附带最多一张表情包；指定首图在已决定附图时占 10%，其余图片均分 90%。表情包只保存在 `data/random_chat/stickers/incoming/`，不会提交到 GitHub，业务回复永不附图。
-
-`PRIVATE_CHAT_ENABLED=true` 时，机器人只回复 `PRIVATE_CHAT_ALLOWED_USER_ID` 指定的 QQ 私聊白名单，多个 QQ号使用英文逗号分隔，其他账号完全静默。允许账号的每条非空普通文字都会由萝卜猫回复，不使用群聊 3% 概率；以 `/` 开头的命令和纯图片消息忽略。最近 20 条双方文字只保存在进程内存中，服务重启即清空，不写入群归档、成员记忆或业务数据库。私聊回复沿用 20% 表情包概率。紧急关闭时将 `PRIVATE_CHAT_ENABLED=false` 并重启机器人服务，无需回滚代码。
+`PRIVATE_CHAT_ENABLED=true` 且聊天总开关开启时，机器人只回复 `PRIVATE_CHAT_ALLOWED_USER_IDS` 指定的 QQ 私聊白名单，多个 QQ号使用英文逗号分隔，其他账号完全静默。旧的 `PRIVATE_CHAT_ALLOWED_USER_ID` 仅作兼容输入。允许账号的每条非空普通文字都会由萝卜猫回复，不使用群聊概率；以 `/` 开头的命令和纯图片消息忽略。最近 20 条双方文字只保存在进程内存中，服务重启即清空，不写入群归档、成员记忆或业务数据库。私聊回复沿用 20% 表情包概率；紧急关闭请使用下文的 `/私聊 关`。
 
 成员记忆独立于随机回复概率持续收集。原始特性和历史昵称以追加式账本永久保存在服务器 SQLite 中，不再按 8 条上限淘汰；本地 JSON 镜像包含完整历史。每累计 5 条新特性会生成一次不超过 300 字的滚动摘要，聊天 AI 只读取摘要、最多 5 个近期旧称和最多 8 条尚未摘要的特性。`MEMBER_MEMORY_SUMMARY_ENABLED=false` 只关闭摘要生成，永久账本仍继续写入。真实成员记忆与镜像不会提交到 GitHub。
 
@@ -96,6 +96,55 @@ ADMIN_SEED=123456:ColdSpell:冷|spell;654321:企鹅
 `MUTE_ENABLED=false` 默认关闭群禁言执行；启用后才会调用 OneBot/Napcat 的群管理接口。该开关不改变现有违规记录、查询和确认流程。
 
 `DEDUCTION_POLICY_V102_ENABLED=false` 默认保留原每周减计机制。准确数据完成预演、迁移和回滚演练后才可改为 `true`；启用后只运行 v1.0.2beta 策略引擎，旧减计任务停止结算，避免重复减数。`DEDUCTION_POLICY_RULE_VERSION` 用于事件审计，生产环境应保持为发布版本 `v1.0.2beta`。
+
+## 模块化运行时功能控制
+
+新部署请在 `.env` 中保留以下安全默认值；示例中的群号是合成占位值，不是实际运行群号：
+
+```dotenv
+BUSINESS_ENABLED=true
+CHAT_ENABLED=false
+GROUP_CHAT_ENABLED=false
+GROUP_CHAT_ALLOWED_GROUP_IDS=123456789
+PRIVATE_CHAT_ENABLED=false
+PRIVATE_CHAT_ALLOWED_USER_IDS=
+```
+
+`BUSINESS_ENABLED` 控制当前 `TARGET_GROUP_ID` 的违规记录、查询、导出、减数策略和业务提醒。`CHAT_ENABLED` 是聊天总开关；它关闭时，群聊和私聊子功能都不能处理消息。`GROUP_CHAT_ENABLED` 与 `GROUP_CHAT_ALLOWED_GROUP_IDS` 共同控制群聊回复、消息归档和成员记忆；`PRIVATE_CHAT_ENABLED` 与 `PRIVATE_CHAT_ALLOWED_USER_IDS` 共同控制私聊回复。两个白名单都使用英文逗号分隔的正整数 QQ号，群聊白名单填群号，私聊白名单填用户 QQ号。
+
+父开关不会删除子开关或白名单。因此，重新开启 `CHAT_ENABLED` 后会恢复原有群聊/私聊子配置；仅开启子开关不足以绕过关闭的聊天总开关。关闭 `GROUP_CHAT_ENABLED` 只暂停群聊回复、归档和成员记忆，不影响私聊；关闭 `PRIVATE_CHAT_ENABLED` 只暂停私聊，不影响群聊。业务功能和聊天功能独立：业务群只有在 `GROUP_CHAT_ALLOWED_GROUP_IDS` 中时才会聊天；聊天白名单中的其他群永远不进入业务意图判断。
+
+`.env` 只提供首次启动默认值。首次通过 QQ 管理命令修改后，状态会原子写入 `data/runtime_features.json`，并保留上一份有效备份 `data/runtime_features.json.bak`；两者都被 Git 忽略。有效的运行时状态优先于 `.env`，如需恢复 `.env` 默认值，应在停服后按运维变更流程备份并移除这两个运行时状态文件，再启动服务。
+
+为兼容旧部署，`TARGET_GROUP_ID` 仍是唯一业务群来源，`RANDOM_CHAT_ENABLED` 仍可提供首次群聊默认值，`PRIVATE_CHAT_ENABLED` 仍可提供首次私聊默认值。旧的 `PRIVATE_CHAT_ALLOWED_USER_ID`（可用英文逗号分隔多个 QQ号）仍作为 `PRIVATE_CHAT_ALLOWED_USER_IDS` 的兼容输入；新部署和后续维护应使用 `PRIVATE_CHAT_ALLOWED_USER_IDS`。
+
+### QQ 运维命令与恢复
+
+只有 NoneBot `SUPERUSERS` 可执行以下命令。`/模块状态` 只显示白名单数量；使用列表命令时才向授权操作者显示相应白名单。
+
+```text
+/模块状态
+/业务 开
+/业务 关
+/聊天 开
+/聊天 关
+/群聊 开
+/群聊 关
+/群聊群 添加 <群号>
+/群聊群 删除 <群号>
+/群聊群 列表
+/私聊 开
+/私聊 关
+/私聊用户 添加 <QQ号>
+/私聊用户 删除 <QQ号>
+/私聊用户 列表
+```
+
+紧急止损时，优先使用对应的 QQ 命令，无需重启或回滚代码：`/业务 关` 停止新业务请求和 v1.0.2beta 业务提醒；`/聊天 关` 停止全部聊天入口；`/群聊 关` 只停群聊、归档和成员记忆；`/私聊 关` 只停私聊。开关修改失败会保留旧状态并返回失败信息，不能把失败当作已生效。
+
+启用 `DEDUCTION_POLICY_V102_ENABLED=true` 时，业务关闭、QQ/OneBot 离线或发送失败造成的策略提醒会保留在持久化队列中。业务重新开启且发送通道恢复后，机器人只发送一次 QQ 合并转发的“未发送业务提醒概览”：首节点给出时间范围、提醒总数及各失败原因数量，后续节点列出待处理提醒；不会逐条以普通群消息补发。只有该合并转发成功后，对应记录才标记为已处理；发送失败时记录保留，等待后续检查重试。
+
+未来的 OA 集中管理平台不在本次交付范围内。本次只保留单一功能控制服务作为运行状态的读写边界；未来 OA 应调用该边界或其上层 API，而不应让插件直接读写运行时 JSON 文件。
 
 ## Napcat 与 Nonebot 连接
 
