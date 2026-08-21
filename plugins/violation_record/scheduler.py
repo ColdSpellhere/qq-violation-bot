@@ -21,6 +21,16 @@ _OUTBOX_RETRY_MINUTES = 5
 _OUTBOX_DELIVERY_BATCH = 10
 
 
+class _DeferredFeatures:
+    def business_allowed(self, group_id: int, target_group_id: int) -> bool:
+        from plugins.feature_control.runtime import FEATURES
+
+        return FEATURES.business_allowed(group_id, target_group_id)
+
+
+FEATURES = _DeferredFeatures()
+
+
 async def _send_group(text: str) -> None:
     try:
         bot = get_bot()
@@ -95,7 +105,7 @@ def _claim_policy_outbox(as_of: str, limit: int) -> list[dict]:
         rows = conn.execute(
             """
             SELECT * FROM v102_notification_outbox
-            WHERE status IN ('pending', 'failed') AND scheduled_at<=?
+            WHERE status='pending' AND scheduled_at<=?
             ORDER BY scheduled_at, id LIMIT ?
             """,
             (as_of, limit),
@@ -107,7 +117,7 @@ def _claim_policy_outbox(as_of: str, limit: int) -> list[dict]:
                 UPDATE v102_notification_outbox
                 SET status='sending', attempt_count=attempt_count+1,
                     updated_at=?
-                WHERE id=? AND status IN ('pending', 'failed')
+                WHERE id=? AND status='pending'
                 """,
                 (as_of, row["id"]),
             )
@@ -130,12 +140,14 @@ def _claim_policy_outbox(as_of: str, limit: int) -> list[dict]:
         return claimed
 
 
-def _claimed_outbox_valid(row: dict) -> tuple[bool, str]:
+def _policy_outbox_valid(
+    row: dict, *, expected_status: str
+) -> tuple[bool, str]:
     with connect() as conn:
         current = conn.execute(
             "SELECT * FROM v102_notification_outbox WHERE id=?", (row["id"],)
         ).fetchone()
-        if current is None or current["status"] != "sending":
+        if current is None or current["status"] != expected_status:
             return False, "通知任务已不处于发送状态"
         event = conn.execute(
             """
@@ -181,6 +193,139 @@ def _claimed_outbox_valid(row: dict) -> tuple[bool, str]:
             ):
                 return False, "管理待办已处理或取消"
     return True, ""
+
+
+def _claimed_outbox_valid(row: dict) -> tuple[bool, str]:
+    return _policy_outbox_valid(row, expected_status="sending")
+
+
+def defer_policy_outbox(reason: str, as_of: str) -> int:
+    if reason not in {"business_disabled", "bot_offline"}:
+        raise ValueError(f"unsupported policy outbox deferral reason: {reason}")
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE v102_notification_outbox
+            SET status='failed', last_error=?, updated_at=?
+            WHERE status='pending' AND scheduled_at<=?
+            """,
+            (reason, as_of, as_of),
+        )
+        return cursor.rowcount
+
+
+def _missed_policy_node(bot, content: str) -> dict:
+    return {
+        "type": "node",
+        "data": {
+            "user_id": str(getattr(bot, "self_id", "0")),
+            "nickname": "违规记录机器人",
+            "content": content,
+        },
+    }
+
+
+def _missed_reason(last_error: str | None) -> str:
+    if last_error == "business_disabled":
+        return "业务关闭"
+    if last_error == "bot_offline":
+        return "QQ离线"
+    return "发送失败"
+
+
+async def deliver_missed_policy_summary(
+    bot, *, as_of: str | None = None
+) -> int:
+    moment = as_of or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with connect() as conn:
+        selected = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM v102_notification_outbox
+                WHERE status='failed' AND scheduled_at<=?
+                ORDER BY scheduled_at, id
+                """,
+                (moment,),
+            )
+        ]
+
+    valid_rows: list[dict] = []
+    seen_ids: set[int] = set()
+    for row in selected:
+        outbox_id = int(row["id"])
+        if outbox_id in seen_ids:
+            continue
+        seen_ids.add(outbox_id)
+        valid, invalid_reason = _policy_outbox_valid(
+            row, expected_status="failed"
+        )
+        if valid:
+            valid_rows.append(row)
+            continue
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE v102_notification_outbox
+                SET status='cancelled', last_error=?, updated_at=?
+                WHERE id=? AND status='failed'
+                """,
+                (invalid_reason, moment, outbox_id),
+            )
+
+    if not valid_rows:
+        return 0
+
+    reason_counts = {"业务关闭": 0, "QQ离线": 0, "发送失败": 0}
+    for row in valid_rows:
+        reason_counts[_missed_reason(row.get("last_error"))] += 1
+    first = valid_rows[0]["scheduled_at"]
+    last = valid_rows[-1]["scheduled_at"]
+    overview = (
+        "未发送业务提醒概览\n"
+        f"时间范围：{first} 至 {last}\n"
+        f"涉及提醒：{len(valid_rows)} 条\n"
+        f"原因：业务关闭 {reason_counts['业务关闭']} / "
+        f"QQ离线 {reason_counts['QQ离线']} / "
+        f"发送失败 {reason_counts['发送失败']}"
+    )
+    nodes = [_missed_policy_node(bot, overview)]
+    nodes.extend(
+        _missed_policy_node(
+            bot,
+            (
+                f"未发送提醒 #{row['id']}\n"
+                f"时间：{row['scheduled_at']}\n"
+                f"原因：{_missed_reason(row.get('last_error'))}\n"
+                f"{row['message_text']}"
+            ),
+        )
+        for row in valid_rows
+    )
+    try:
+        await bot.call_api(
+            "send_group_forward_msg",
+            group_id=CONFIG.target_group_id,
+            messages=nodes,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"未发送业务提醒汇总失败 error={type(exc).__name__}"
+        )
+        return 0
+
+    outbox_ids = [int(row["id"]) for row in valid_rows]
+    placeholders = ",".join("?" for _ in outbox_ids)
+    with connect() as conn:
+        cursor = conn.execute(
+            f"""
+            UPDATE v102_notification_outbox
+            SET status='sent', sent_at=?, last_error=NULL, updated_at=?
+            WHERE status='failed' AND id IN ({placeholders})
+            """,
+            (moment, moment, *outbox_ids),
+        )
+        return cursor.rowcount
 
 
 def _finish_outbox_attempt(
@@ -298,8 +443,15 @@ async def maintenance_tick(
         stats = policy_bridge.run_policy_maintenance(moment)
         if any(stats.values()):
             logger.info(f"v102策略维护完成：{stats}")
-        if bots:
+        if not FEATURES.business_allowed(
+            CONFIG.target_group_id, CONFIG.target_group_id
+        ):
+            defer_policy_outbox("business_disabled", moment)
+        elif not bots:
+            defer_policy_outbox("bot_offline", moment)
+        else:
             bot = next(iter(bots.values()))
+            await deliver_missed_policy_summary(bot, as_of=moment)
             await deliver_policy_outbox(
                 bot, as_of=moment, limit=_OUTBOX_DELIVERY_BATCH
             )

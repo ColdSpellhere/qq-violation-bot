@@ -82,26 +82,22 @@ from plugins.violation_record.policy_schema import (
 
 
 class FakeBot:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, fail_forward: bool = False) -> None:
         self.fail = fail
+        self.fail_forward = fail_forward
+        self.self_id = "10000"
         self.sent: list[dict] = []
+        self.forwarded: list[dict] = []
 
     async def send_group_msg(self, **kwargs):
         if self.fail:
             raise RuntimeError("offline")
         self.sent.append(kwargs)
 
-
-class FlakyBot:
-    def __init__(self) -> None:
-        self.calls = 0
-        self.sent: list[dict] = []
-
-    async def send_group_msg(self, **kwargs):
-        self.calls += 1
-        if self.calls == 1:
-            raise RuntimeError("offline once")
-        self.sent.append(kwargs)
+    async def call_api(self, api: str, **kwargs):
+        self.forwarded.append({"api": api, **kwargs})
+        if self.fail_forward:
+            raise RuntimeError("forward offline")
 
 
 class FakeDriver:
@@ -418,54 +414,240 @@ class PolicySchedulerTests(unittest.TestCase):
         )
         self.assertEqual(early_bot.sent, [])
 
-        recovered_bot = FakeBot()
-        recovered = asyncio.run(
+        individually_recovered = asyncio.run(
             scheduler.deliver_policy_outbox(
-                recovered_bot, as_of="2026-08-02 12:06:00"
+                FakeBot(), as_of="2026-08-02 12:06:00"
             )
         )
 
-        self.assertGreaterEqual(recovered, 1)
-        self.assertTrue(recovered_bot.sent)
+        self.assertEqual(individually_recovered, 0)
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM v102_notification_outbox ORDER BY id LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["attempt_count"], 1)
+        self.assertEqual(
+            self._attempt_statuses(int(row["id"])),
+            ["lease_expired"],
+        )
+
+        summary_bot = FakeBot()
+        summarized = asyncio.run(
+            scheduler.deliver_missed_policy_summary(
+                summary_bot, as_of="2026-08-02 12:06:00"
+            )
+        )
+
+        self.assertGreaterEqual(summarized, 1)
+        self.assertEqual(len(summary_bot.forwarded), 1)
         with db.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM v102_notification_outbox ORDER BY id LIMIT 1"
             ).fetchone()
         self.assertEqual(row["status"], "sent")
-        self.assertEqual(row["attempt_count"], 2)
+        self.assertEqual(row["attempt_count"], 1)
         self.assertEqual(
             self._attempt_statuses(int(row["id"])),
-            ["lease_expired", "sent"],
+            ["lease_expired"],
         )
 
-    def test_failed_delivery_retries_after_schedule_and_records_each_attempt(self) -> None:
+    def test_failed_delivery_waits_for_summary_instead_of_individual_retry(self) -> None:
         self._record()
         policy_bridge.run_policy_maintenance("2026-08-02 12:01:00")
-        bot = FlakyBot()
+        failing_bot = FakeBot(fail=True)
 
         first = asyncio.run(
-            scheduler.deliver_policy_outbox(bot, as_of="2026-08-02 12:01:00")
+            scheduler.deliver_policy_outbox(
+                failing_bot, as_of="2026-08-02 12:01:00"
+            )
         )
         too_early = asyncio.run(
-            scheduler.deliver_policy_outbox(bot, as_of="2026-08-02 12:05:59")
+            scheduler.deliver_policy_outbox(
+                failing_bot, as_of="2026-08-02 12:05:59"
+            )
         )
-        retry = asyncio.run(
-            scheduler.deliver_policy_outbox(bot, as_of="2026-08-02 12:06:00")
+        individual_retry = asyncio.run(
+            scheduler.deliver_policy_outbox(
+                FakeBot(), as_of="2026-08-02 12:06:00"
+            )
         )
 
-        self.assertEqual((first, too_early, retry), (0, 0, 1))
-        self.assertEqual(bot.calls, 2)
+        self.assertEqual((first, too_early, individual_retry), (0, 0, 0))
         with db.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM v102_notification_outbox ORDER BY id LIMIT 1"
             ).fetchone()
-        self.assertEqual(row["status"], "sent")
-        self.assertEqual(row["attempt_count"], 2)
-        self.assertIsNone(row["last_error"])
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["attempt_count"], 1)
         self.assertEqual(
             self._attempt_statuses(int(row["id"])),
-            ["failed", "sent"],
+            ["failed"],
         )
+
+    def test_business_off_records_pending_rows_without_sending(self) -> None:
+        self._record("禁言一小时")
+        bot = FakeBot()
+        features = MagicMock()
+        features.business_allowed.return_value = False
+
+        with (
+            patch.object(scheduler, "FEATURES", features),
+            patch.object(scheduler, "get_bots", return_value={"bot": bot}),
+        ):
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 12:01:00", run_periodic_files=False
+                )
+            )
+
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(bot.forwarded, [])
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM v102_notification_outbox ORDER BY id"
+            ).fetchall()
+        self.assertTrue(rows)
+        self.assertEqual({row["status"] for row in rows}, {"failed"})
+        self.assertEqual(
+            {row["last_error"] for row in rows}, {"business_disabled"}
+        )
+        self.assertEqual({row["attempt_count"] for row in rows}, {0})
+
+    def test_no_bot_marks_pending_rows_as_offline(self) -> None:
+        self._record("禁言一小时")
+        features = MagicMock()
+        features.business_allowed.return_value = True
+
+        with (
+            patch.object(scheduler, "FEATURES", features),
+            patch.object(scheduler, "get_bots", return_value={}),
+        ):
+            asyncio.run(
+                scheduler.maintenance_tick(
+                    now="2026-08-02 12:01:00", run_periodic_files=False
+                )
+            )
+
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM v102_notification_outbox ORDER BY id"
+            ).fetchall()
+        self.assertTrue(rows)
+        self.assertEqual({row["status"] for row in rows}, {"failed"})
+        self.assertEqual({row["last_error"] for row in rows}, {"bot_offline"})
+        self.assertEqual({row["attempt_count"] for row in rows}, {0})
+
+    def test_failed_rows_recover_as_one_forward_summary(self) -> None:
+        self._record("禁言一小时")
+        policy_bridge.run_policy_maintenance("2026-08-02 12:01:00")
+        deferred = scheduler.defer_policy_outbox(
+            "bot_offline", "2026-08-02 12:01:00"
+        )
+        bot = FakeBot()
+
+        handled = asyncio.run(
+            scheduler.deliver_missed_policy_summary(
+                bot, as_of="2026-08-02 12:02:00"
+            )
+        )
+
+        self.assertGreaterEqual(deferred, 2)
+        self.assertEqual(handled, deferred)
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(len(bot.forwarded), 1)
+        forward = bot.forwarded[0]
+        self.assertEqual(forward["api"], "send_group_forward_msg")
+        self.assertEqual(forward["group_id"], 123456789)
+        self.assertEqual(len(forward["messages"]), deferred + 1)
+        overview = forward["messages"][0]["data"]["content"]
+        self.assertIn("未发送业务提醒概览", overview)
+        self.assertIn(
+            "时间范围：2026-08-02 12:00:00 至 2026-08-02 12:01:00",
+            overview,
+        )
+        self.assertIn(f"涉及提醒：{deferred} 条", overview)
+        self.assertIn(f"业务关闭 0 / QQ离线 {deferred} / 发送失败 0", overview)
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM v102_notification_outbox ORDER BY id"
+            ).fetchall()
+        self.assertEqual({row["status"] for row in rows}, {"sent"})
+        self.assertEqual(
+            {row["sent_at"] for row in rows}, {"2026-08-02 12:02:00"}
+        )
+        self.assertEqual({row["last_error"] for row in rows}, {None})
+
+    def test_summary_failure_keeps_rows_failed(self) -> None:
+        self._record()
+        policy_bridge.run_policy_maintenance("2026-08-02 12:01:00")
+        deferred = scheduler.defer_policy_outbox(
+            "business_disabled", "2026-08-02 12:01:00"
+        )
+        bot = FakeBot(fail_forward=True)
+
+        handled = asyncio.run(
+            scheduler.deliver_missed_policy_summary(
+                bot, as_of="2026-08-02 12:02:00"
+            )
+        )
+
+        self.assertEqual(handled, 0)
+        self.assertEqual(len(bot.forwarded), 1)
+        self.assertEqual(bot.sent, [])
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM v102_notification_outbox ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len(rows), deferred)
+        self.assertEqual({row["status"] for row in rows}, {"failed"})
+        self.assertEqual(
+            {row["last_error"] for row in rows}, {"business_disabled"}
+        )
+        self.assertEqual({row["sent_at"] for row in rows}, {None})
+
+    def test_successful_summary_marks_valid_rows_sent_and_deduplicates(self) -> None:
+        self._record("禁言一小时")
+        policy_bridge.run_policy_maintenance("2026-08-02 12:01:00")
+        scheduler.defer_policy_outbox("bot_offline", "2026-08-02 12:01:00")
+        with db.connect() as conn:
+            reminder = conn.execute(
+                """
+                SELECT * FROM v102_notification_outbox
+                WHERE message_type='pending_reminder'
+                """
+            ).fetchone()
+            conn.execute(
+                """
+                UPDATE v102_pending_actions SET status='resolved', updated_at=?
+                WHERE id=?
+                """,
+                ("2026-08-02 12:01:30", reminder["pending_action_id"]),
+            )
+        bot = FakeBot()
+
+        first = asyncio.run(
+            scheduler.deliver_missed_policy_summary(
+                bot, as_of="2026-08-02 12:02:00"
+            )
+        )
+        duplicate = asyncio.run(
+            scheduler.deliver_missed_policy_summary(
+                bot, as_of="2026-08-02 12:03:00"
+            )
+        )
+
+        self.assertGreaterEqual(first, 1)
+        self.assertEqual(duplicate, 0)
+        self.assertEqual(len(bot.forwarded), 1)
+        self.assertEqual(len(bot.forwarded[0]["messages"]), first + 1)
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT message_type, status FROM v102_notification_outbox"
+            ).fetchall()
+        statuses = {row["message_type"]: row["status"] for row in rows}
+        self.assertEqual(statuses["policy_event"], "sent")
+        self.assertEqual(statuses["pending_reminder"], "cancelled")
 
     def test_claimed_policy_event_is_cancelled_if_event_becomes_ineffective(self) -> None:
         self._record()
