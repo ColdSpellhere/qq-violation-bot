@@ -24,6 +24,15 @@ SENSITIVE_KEYS = (
     "AI_API_KEY",
     "ADMIN_SEED",
 )
+CHAT_VISION_EXAMPLE_DEFAULTS = {
+    "CHAT_VISION_ENABLED": "false",
+    "CHAT_VISION_MODEL": "deepseek-v4-flash-vision-exp",
+    "CHAT_VISION_IMAGE_ROOT": "data/chat_vision/images",
+    "CHAT_VISION_RETENTION_DAYS": "7",
+    "CHAT_VISION_MAX_BYTES": "10485760",
+    "CHAT_VISION_TIMEOUT": "60",
+    "CHAT_VISION_MAX_RETRIES": "3",
+}
 
 
 def _tracked_paths() -> list[Path]:
@@ -90,6 +99,16 @@ class PublicSourceBoundaryTests(unittest.TestCase):
         text = (ROOT / ".env.example").read_text(encoding="utf-8")
         self.assertIn("TARGET_GROUP_ID=123456789", text)
         self.assertIn("NAPCAT_ACCESS_TOKEN=replace-with-random-token", text)
+
+        target_group_id = str(os.getenv("TARGET_GROUP_ID") or "").strip()
+        if target_group_id:
+            self.assertNotIn(f"TARGET_GROUP_ID={target_group_id}", text)
+
+    def test_chat_vision_example_has_safe_defaults(self) -> None:
+        values = dotenv_values(ROOT / ".env.example")
+        self.assertEqual(CHAT_VISION_EXAMPLE_DEFAULTS, {
+            key: values.get(key) for key in CHAT_VISION_EXAMPLE_DEFAULTS
+        })
 
 
 if __name__ == "__main__":

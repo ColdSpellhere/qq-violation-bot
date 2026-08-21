@@ -70,6 +70,13 @@ DATABASE_URL=sqlite:////opt/qq-violation-bot/data/violation_records.db
 AI_BASE_URL=https://api.deepseek.com
 AI_API_KEY=你的 DeepSeek Key
 AI_MODEL=deepseek-chat
+CHAT_VISION_ENABLED=false
+CHAT_VISION_MODEL=deepseek-v4-flash-vision-exp
+CHAT_VISION_IMAGE_ROOT=data/chat_vision/images
+CHAT_VISION_RETENTION_DAYS=7
+CHAT_VISION_MAX_BYTES=10485760
+CHAT_VISION_TIMEOUT=60
+CHAT_VISION_MAX_RETRIES=3
 RANDOM_CHAT_ENABLED=false
 RANDOM_CHAT_PROBABILITY=0.10
 BUSINESS_ENABLED=true
@@ -84,6 +91,16 @@ ADMIN_SEED=123456:ColdSpell:冷|spell;654321:企鹅
 ```
 
 `AI_API_KEY` 缺失时，机器人会回复：`AI 未启用或缺少 AI_API_KEY，无法进行自然语言解析。`
+
+### 群聊图片理解
+
+`CHAT_VISION_ENABLED=false` 是安全默认值。启用后，插件只处理部署后实时到达、同时通过聊天总开关、群聊子开关和群聊白名单的真人群消息；不会扫描聊天归档、回填或重新识别历史图片。每条新消息内的每一张图片都会独立识别并保存简洁、事实性的中文描述，识别不依赖随机回复是否命中。
+
+聊天图片原图只写入 `data/chat_vision/images/`，单图最大 `CHAT_VISION_MAX_BYTES=10485760` 字节；原图在 `CHAT_VISION_RETENTION_DAYS=7` 天后清理，已生成的文字描述、哈希和审计记录永久保留。视觉功能复用现有 `AI_BASE_URL` 和同一个 `AI_API_KEY`，只通过 `CHAT_VISION_MODEL` 选择视觉模型，不新增或复制另一份密钥。
+
+未艾特机器人的纯图片消息仍按 `RANDOM_CHAT_PROBABILITY` 决定是否回复；明确艾特机器人且含图片时必须基于当前可用原图回复，不走概率抽样。图文混合消息继续沿用普通聊天概率，业务文字仍优先进入业务路由。当前或被引用的原图过期、缺失或视觉请求失败时，不会伪造“已看图”的回复；可用的永久描述仍可用于聊天上下文。
+
+聊天视觉数据与违规证据硬隔离：视觉模块只使用 `data/chat_vision/images/` 和聊天归档数据库，不读取、迁移、索引、重新识别或清理 `evidence/`；证据数据库、证据文件及现有查询行为不受 7 天原图策略影响。
 
 `RANDOM_CHAT_ENABLED` 是旧版首次群聊默认值兼容输入；运行时实际由下文的聊天总开关、群聊子开关和群聊白名单决定。允许群内，明确 @ 机器人的文字会直接进入聊天回复；普通成员文字仍按 `RANDOM_CHAT_PROBABILITY` 概率回复，默认值 `0.10` 表示 10%。命中后会读取当前群最近 30 分钟内最多 20 条纯文本，按群名片、QQ 昵称、QQ号的顺序标注成员并交给 AI 理解上下文；不读取图片或业务数据库。机器人自身消息、空消息和 `/` 开头命令不会触发。归档、AI 或发送异常时静默降级，不影响业务模块。
 
