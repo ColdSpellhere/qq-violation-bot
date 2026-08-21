@@ -74,19 +74,24 @@ async def download_chat_image(
     if not addresses or any(not _is_public_address(address) for address in addresses):
         raise ValueError("chat image URL resolves to a non-public address")
 
-    async with client.stream("GET", url, follow_redirects=False) as response:
-        if response.is_redirect:
-            raise ValueError("chat image redirects are not allowed")
-        response.raise_for_status()
-        mime_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-        extension = _IMAGE_EXTENSIONS.get(mime_type)
-        if extension is None:
-            raise ValueError("chat image payload is not a supported image")
-        content = bytearray()
-        async for chunk in response.aiter_bytes():
-            content.extend(chunk)
-            if len(content) > max_bytes:
-                raise ValueError("chat image exceeds size limit")
+    try:
+        async with client.stream("GET", url, follow_redirects=False) as response:
+            if response.is_redirect:
+                raise ValueError("chat image redirects are not allowed")
+            response.raise_for_status()
+            mime_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            extension = _IMAGE_EXTENSIONS.get(mime_type)
+            if extension is None:
+                raise ValueError("chat image payload is not a supported image")
+            content = bytearray()
+            async for chunk in response.aiter_bytes():
+                content.extend(chunk)
+                if len(content) > max_bytes:
+                    raise ValueError("chat image exceeds size limit")
+    except httpx.HTTPStatusError:
+        raise ValueError("chat image HTTP status error") from None
+    except httpx.HTTPError:
+        raise ValueError("chat image request failed") from None
 
     payload = bytes(content)
     if not _valid_signature(payload, mime_type):

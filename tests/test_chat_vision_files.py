@@ -94,6 +94,38 @@ class ChatVisionFileTests(unittest.IsolatedAsyncioTestCase):
                     max_bytes=1024,
                 )
 
+    async def test_download_redacts_url_from_http_status_error(self) -> None:
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(404, request=request)
+        )
+        async with httpx.AsyncClient(transport=transport) as client:
+            with self.assertRaisesRegex(ValueError, "HTTP status error") as raised:
+                await download_chat_image(
+                    "https://cdn.example/image.jpg?access_token=secret-token",
+                    client=client,
+                    resolver=PUBLIC_RESOLVER,
+                    max_bytes=1024,
+                )
+
+        self.assertNotIn("secret-token", str(raised.exception))
+        self.assertNotIn("cdn.example", str(raised.exception))
+
+    async def test_download_redacts_url_from_transport_error(self) -> None:
+        def failing_transport(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("request to https://cdn.example/?token=secret-token failed", request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(failing_transport)) as client:
+            with self.assertRaisesRegex(ValueError, "request failed") as raised:
+                await download_chat_image(
+                    "https://cdn.example/image.jpg?access_token=secret-token",
+                    client=client,
+                    resolver=PUBLIC_RESOLVER,
+                    max_bytes=1024,
+                )
+
+        self.assertNotIn("secret-token", str(raised.exception))
+        self.assertNotIn("cdn.example", str(raised.exception))
+
     async def test_write_refuses_a_symlinked_destination_directory(self) -> None:
         chat_root = self.root / "data" / "chat_vision" / "images"
         outside = self.root / "outside"
@@ -164,10 +196,66 @@ class ChatVisionFileTests(unittest.IsolatedAsyncioTestCase):
         asset_path = chat_root / "100" / "2026-08-21" / "m1-1.jpg"
         asset_path.parent.mkdir(parents=True)
         asset_path.write_bytes(b"chat")
+        asset = self.store.ensure_pending(100, "m1", 1, "https://cdn.example/1.jpg", 1000)
+        self.store.mark_downloaded(
+            asset.id,
+            "100/2026-08-21/m1-1.jpg",
+            "image/jpeg",
+            len(JPEG),
+            hashlib.sha256(JPEG).hexdigest(),
+            "2026-08-28 00:00:00",
+        )
 
         await cleanup_expired(self.store, chat_root, now_text="2026-08-29 00:00:00")
 
+        self.assertFalse(asset_path.exists())
+        self.assertIsNone(self.store.for_message(100, "m1")[0].relative_path)
         self.assertEqual(b"evidence", sentinel.read_bytes())
+
+    async def test_cleanup_refuses_root_symlink_that_points_to_evidence(self) -> None:
+        evidence_root = self.root / "evidence"
+        asset_path = evidence_root / "100" / "2026-08-21" / "m1-1.jpg"
+        asset_path.parent.mkdir(parents=True)
+        asset_path.write_bytes(b"evidence")
+        chat_root = self.root / "data" / "chat_vision" / "images"
+        chat_root.parent.mkdir(parents=True)
+        os.symlink(evidence_root, chat_root)
+        asset = self.store.ensure_pending(100, "m1", 1, "https://cdn.example/1.jpg", 1000)
+        self.store.mark_downloaded(
+            asset.id,
+            "100/2026-08-21/m1-1.jpg",
+            "image/jpeg",
+            len(JPEG),
+            hashlib.sha256(JPEG).hexdigest(),
+            "2026-08-28 00:00:00",
+        )
+
+        await cleanup_expired(self.store, chat_root, now_text="2026-08-29 00:00:00")
+
+        self.assertEqual(b"evidence", asset_path.read_bytes())
+        self.assertEqual("100/2026-08-21/m1-1.jpg", self.store.for_message(100, "m1")[0].relative_path)
+
+    async def test_cleanup_refuses_an_intermediate_symlink_inside_the_root(self) -> None:
+        chat_root = self.root / "data" / "chat_vision" / "images"
+        alternate = chat_root / "alternate"
+        asset_path = alternate / "2026-08-21" / "m1-1.jpg"
+        asset_path.parent.mkdir(parents=True)
+        asset_path.write_bytes(b"chat")
+        os.symlink(alternate, chat_root / "100")
+        asset = self.store.ensure_pending(100, "m1", 1, "https://cdn.example/1.jpg", 1000)
+        self.store.mark_downloaded(
+            asset.id,
+            "100/2026-08-21/m1-1.jpg",
+            "image/jpeg",
+            len(JPEG),
+            hashlib.sha256(JPEG).hexdigest(),
+            "2026-08-28 00:00:00",
+        )
+
+        await cleanup_expired(self.store, chat_root, now_text="2026-08-29 00:00:00")
+
+        self.assertEqual(b"chat", asset_path.read_bytes())
+        self.assertEqual("100/2026-08-21/m1-1.jpg", self.store.for_message(100, "m1")[0].relative_path)
 
 
 if __name__ == "__main__":
