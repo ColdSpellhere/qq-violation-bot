@@ -1,6 +1,6 @@
 # QQ 群违规记录机器人
 
-基于 Napcat + Nonebot2 的 QQ 群违规记录与群管理助手。机器人只处理允许群内 @ 机器人的消息，允许群成员会自动登记为可操作 admin，业务理解优先交给 AI Intent Router，再由后端用严格字段校验、成员解析、状态锁定和二次确认执行。群禁言会直接调用 OneBot/Napcat 的群管理接口。
+基于 Napcat + Nonebot2 的 QQ 群违规记录与群管理助手。业务路径只处理 `TARGET_GROUP_ID` 内 @ 机器人的消息；允许群成员会自动登记为可操作 admin，业务理解优先交给 AI Intent Router，再由后端用严格字段校验、成员解析、状态锁定和二次确认执行。群禁言会直接调用 OneBot/Napcat 的群管理接口。聊天路径由 `CHAT_ENABLED`、`GROUP_CHAT_ENABLED` 和群聊白名单控制：白名单群内明确 @ 机器人会进入聊天回复，普通消息仍按 `RANDOM_CHAT_PROBABILITY` 概率处理。
 
 ## 技术栈
 
@@ -72,6 +72,10 @@ AI_API_KEY=你的 DeepSeek Key
 AI_MODEL=deepseek-chat
 RANDOM_CHAT_ENABLED=false
 RANDOM_CHAT_PROBABILITY=0.10
+BUSINESS_ENABLED=true
+CHAT_ENABLED=false
+GROUP_CHAT_ENABLED=false
+GROUP_CHAT_ALLOWED_GROUP_IDS=123456789
 PRIVATE_CHAT_ENABLED=false
 PRIVATE_CHAT_ALLOWED_USER_IDS=
 # 仅为旧版私聊白名单兼容保留；新部署使用上面的多值配置
@@ -169,7 +173,7 @@ cd /opt/qq-violation-bot
 bash scripts/start_bot.sh
 ```
 
-验证收到群消息：在 `TARGET_GROUP_ID` 配置的群里发送 `@违规记录助手 帮助`。其他群、未 @ 机器人的普通消息会被忽略。
+验证业务：在 `TARGET_GROUP_ID` 配置的群里发送 `@违规记录助手 帮助`。业务路径只处理该群中 @ 机器人的消息；其他群或未 @ 机器人的消息不会进入业务处理。验证群聊：由超级管理员开启 `CHAT_ENABLED` 与 `GROUP_CHAT_ENABLED`，并将测试群加入 `GROUP_CHAT_ALLOWED_GROUP_IDS` 后，在该群 @ 机器人；普通聊天消息仍按 `RANDOM_CHAT_PROBABILITY` 概率回复，不适合作为必回验证。
 
 ## 管理员列表维护
 
@@ -339,7 +343,8 @@ systemctl start qq-violation-bot.service
 
 ## 常见问题
 
-- 机器人不回复：确认消息来自 `TARGET_GROUP_ID`，并且 @ 的是 `BOT_SELF_ID` 对应机器人。
+- 业务指令不回复：确认消息来自 `TARGET_GROUP_ID`，并且 @ 的是 `BOT_SELF_ID` 对应机器人；其他群或未 @ 机器人的消息不会进入业务路径。
+- 聊天不回复：确认 `CHAT_ENABLED`、`GROUP_CHAT_ENABLED` 均已开启且群号在 `GROUP_CHAT_ALLOWED_GROUP_IDS` 中；明确 @ 机器人应进入聊天回复，普通消息仅按 `RANDOM_CHAT_PROBABILITY` 概率回复。
 - 提示缺少群聊：业务指令必须写 `蜂巢 / 蜂窝 / 蜂箱`。
 - AI 解析失败：检查 `AI_API_KEY`、`AI_BASE_URL`、服务器网络。
 - 处理人匹配不到：先在允许群里 @ 机器人触发群成员同步，或用 `scripts/manage_admin.py list/add` 检查管理员昵称和别名。
