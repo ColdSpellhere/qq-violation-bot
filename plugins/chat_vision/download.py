@@ -84,7 +84,7 @@ class PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
     ):
         if host.casefold() != self.expected_host:
             raise ValueError("chat image connection host changed")
-        last_error: BaseException | None = None
+        last_error: Exception | None = None
         for address in self.addresses:
             try:
                 stream = await self.backend.connect_tcp(
@@ -94,7 +94,7 @@ class PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
                     local_address=local_address,
                     socket_options=socket_options,
                 )
-            except BaseException as exc:
+            except Exception as exc:
                 last_error = exc
                 continue
             peer = stream.get_extra_info("server_addr")

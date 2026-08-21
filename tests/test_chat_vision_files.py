@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import stat
@@ -193,6 +194,59 @@ class ChatVisionFileTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["93.184.216.34"], backend.hosts)
         self.assertTrue(backend.stream.closed)
+
+    async def test_pinned_backend_propagates_cancellation_without_trying_next_address(
+        self,
+    ) -> None:
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.hosts: list[str] = []
+
+            async def connect_tcp(self, host: str, port: int, **kwargs):
+                self.hosts.append(host)
+                raise asyncio.CancelledError()
+
+        backend = FakeBackend()
+        pinned = download_module.PinnedNetworkBackend(
+            "cdn.example",
+            ("93.184.216.34", "1.1.1.1"),
+            backend=backend,
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await pinned.connect_tcp("cdn.example", 443)
+
+        self.assertEqual(["93.184.216.34"], backend.hosts)
+
+    async def test_pinned_backend_retries_next_address_after_connection_error(
+        self,
+    ) -> None:
+        class FakeStream:
+            def get_extra_info(self, name: str):
+                return ("1.1.1.1", 443) if name == "server_addr" else None
+
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.hosts: list[str] = []
+                self.stream = FakeStream()
+
+            async def connect_tcp(self, host: str, port: int, **kwargs):
+                self.hosts.append(host)
+                if host == "93.184.216.34":
+                    raise httpcore.ConnectError("unreachable")
+                return self.stream
+
+        backend = FakeBackend()
+        pinned = download_module.PinnedNetworkBackend(
+            "cdn.example",
+            ("93.184.216.34", "1.1.1.1"),
+            backend=backend,
+        )
+
+        stream = await pinned.connect_tcp("cdn.example", 443)
+
+        self.assertIs(backend.stream, stream)
+        self.assertEqual(["93.184.216.34", "1.1.1.1"], backend.hosts)
 
     async def test_download_rejects_content_over_the_byte_limit(self) -> None:
         with self.assertRaisesRegex(ValueError, "size limit"):
