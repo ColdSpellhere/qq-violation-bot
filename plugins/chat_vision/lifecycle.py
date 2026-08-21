@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import weakref
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from functools import partial
 
 from nonebot import get_driver, logger
@@ -25,7 +25,7 @@ _registered_drivers: weakref.WeakSet[object] = weakref.WeakSet()
 
 
 def _now_text() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 async def _cleanup_once(store: ChatVisionStore) -> None:

@@ -8,7 +8,7 @@ import socket
 import ssl
 import tempfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -226,7 +226,7 @@ def write_chat_image(
 
     root = ensure_private_managed_root(Path(root))
     root_resolved = root.resolve()
-    date_text = datetime.fromtimestamp(event_time, UTC).date().isoformat()
+    date_text = datetime.fromtimestamp(event_time, timezone.utc).date().isoformat()
     group_directory = root / str(group_id)
     _create_directory(group_directory)
     destination_directory = group_directory / date_text

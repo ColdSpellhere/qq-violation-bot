@@ -6,7 +6,7 @@ import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .paths import validate_existing_managed_root
@@ -102,7 +102,7 @@ def read_original_image(
     *,
     now_text: str | None = None,
 ) -> bytes | None:
-    current_time = now_text or datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    current_time = now_text or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     if (
         asset.deleted_at is not None
         or asset.expires_at is None

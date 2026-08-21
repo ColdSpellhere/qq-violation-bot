@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import stat
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -142,7 +142,7 @@ def _image_segments(event: GroupMessageEvent) -> list[tuple[int, str]]:
 
 
 def _expiry_text(event_time: int) -> str:
-    expires_at = datetime.fromtimestamp(event_time, UTC) + timedelta(
+    expires_at = datetime.fromtimestamp(event_time, timezone.utc) + timedelta(
         days=CONFIG.chat_vision_retention_days
     )
     return expires_at.strftime("%Y-%m-%d %H:%M:%S")
