@@ -65,7 +65,7 @@ def _claim_policy_outbox(as_of: str, limit: int) -> list[dict]:
         stale_rows = conn.execute(
             """
             SELECT * FROM v102_notification_outbox
-            WHERE status='sending' AND updated_at<=?
+            WHERE status='sending' AND last_error IS NULL AND updated_at<=?
             ORDER BY updated_at, id
             """,
             (lease_cutoff,),
@@ -102,6 +102,15 @@ def _claim_policy_outbox(as_of: str, limit: int) -> list[dict]:
                 """,
                 (as_of, as_of, stale["id"]),
             )
+        conn.execute(
+            """
+            UPDATE v102_notification_outbox
+            SET status='failed', updated_at=?
+            WHERE status='sending' AND last_error IS NOT NULL
+              AND updated_at<=?
+            """,
+            (as_of, lease_cutoff),
+        )
         rows = conn.execute(
             """
             SELECT * FROM v102_notification_outbox
@@ -140,59 +149,82 @@ def _claim_policy_outbox(as_of: str, limit: int) -> list[dict]:
         return claimed
 
 
+def _policy_outbox_valid_in_conn(
+    conn,
+    row: dict,
+    *,
+    expected_status: str,
+    expected_updated_at: str | None = None,
+) -> tuple[bool, str]:
+    current = conn.execute(
+        "SELECT * FROM v102_notification_outbox WHERE id=?", (row["id"],)
+    ).fetchone()
+    if current is None or current["status"] != expected_status:
+        return False, "通知任务已不处于发送状态"
+    if (
+        expected_updated_at is not None
+        and current["updated_at"] != expected_updated_at
+    ):
+        return False, "通知任务发送所有权已变更"
+    event = conn.execute(
+        """
+        SELECT e.is_effective, e.event_type,
+               cause.event_type AS cause_event_type
+        FROM v102_policy_events e
+        LEFT JOIN v102_policy_events cause ON cause.id=e.caused_by_event_id
+        WHERE e.id=?
+        """,
+        (row["event_id"],),
+    ).fetchone()
+    if event is None or not int(event["is_effective"] or 0):
+        return False, "来源事件已失效"
+    if (
+        event["event_type"] == "cycle_started"
+        and event["cause_event_type"] == "baseline_migrated"
+    ):
+        return False, "基线迁移初始化事件只保留审计，不对外通知"
+    if row["message_type"] == "pending_reminder":
+        if row.get("pending_action_id") is not None:
+            pending = conn.execute(
+                """
+                SELECT status, caused_by_event_id
+                FROM v102_pending_actions WHERE id=?
+                """,
+                (row["pending_action_id"],),
+            ).fetchone()
+        else:
+            pending = conn.execute(
+                """
+                SELECT status, caused_by_event_id
+                FROM v102_pending_actions
+                WHERE member_id=? AND group_area=?
+                  AND caused_by_event_id=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (row["member_id"], row["group_area"], row["event_id"]),
+            ).fetchone()
+        if (
+            pending is None
+            or pending["status"] != "pending"
+            or int(pending["caused_by_event_id"] or 0) != int(row["event_id"])
+        ):
+            return False, "管理待办已处理或取消"
+    return True, ""
+
+
 def _policy_outbox_valid(
-    row: dict, *, expected_status: str
+    row: dict,
+    *,
+    expected_status: str,
+    expected_updated_at: str | None = None,
 ) -> tuple[bool, str]:
     with connect() as conn:
-        current = conn.execute(
-            "SELECT * FROM v102_notification_outbox WHERE id=?", (row["id"],)
-        ).fetchone()
-        if current is None or current["status"] != expected_status:
-            return False, "通知任务已不处于发送状态"
-        event = conn.execute(
-            """
-            SELECT e.is_effective, e.event_type,
-                   cause.event_type AS cause_event_type
-            FROM v102_policy_events e
-            LEFT JOIN v102_policy_events cause ON cause.id=e.caused_by_event_id
-            WHERE e.id=?
-            """,
-            (row["event_id"],),
-        ).fetchone()
-        if event is None or not int(event["is_effective"] or 0):
-            return False, "来源事件已失效"
-        if (
-            event["event_type"] == "cycle_started"
-            and event["cause_event_type"] == "baseline_migrated"
-        ):
-            return False, "基线迁移初始化事件只保留审计，不对外通知"
-        if row["message_type"] == "pending_reminder":
-            if row.get("pending_action_id") is not None:
-                pending = conn.execute(
-                    """
-                    SELECT status, caused_by_event_id
-                    FROM v102_pending_actions WHERE id=?
-                    """,
-                    (row["pending_action_id"],),
-                ).fetchone()
-            else:
-                pending = conn.execute(
-                    """
-                    SELECT status, caused_by_event_id
-                    FROM v102_pending_actions
-                    WHERE member_id=? AND group_area=?
-                      AND caused_by_event_id=?
-                    ORDER BY id DESC LIMIT 1
-                    """,
-                    (row["member_id"], row["group_area"], row["event_id"]),
-                ).fetchone()
-            if (
-                pending is None
-                or pending["status"] != "pending"
-                or int(pending["caused_by_event_id"] or 0) != int(row["event_id"])
-            ):
-                return False, "管理待办已处理或取消"
-    return True, ""
+        return _policy_outbox_valid_in_conn(
+            conn,
+            row,
+            expected_status=expected_status,
+            expected_updated_at=expected_updated_at,
+        )
 
 
 def _claimed_outbox_valid(row: dict) -> tuple[bool, str]:
@@ -233,22 +265,63 @@ def _missed_reason(last_error: str | None) -> str:
     return "发送失败"
 
 
+def _claim_missed_policy_outbox(as_of: str) -> list[dict]:
+    with connect() as conn:
+        claimed = [
+            dict(row)
+            for row in conn.execute(
+                """
+                UPDATE v102_notification_outbox
+                SET status='sending', updated_at=?
+                WHERE status='failed' AND scheduled_at<=?
+                RETURNING *
+                """,
+                (as_of, as_of),
+            )
+        ]
+    return sorted(claimed, key=lambda row: (row["scheduled_at"], row["id"]))
+
+
+def _cancel_missed_policy_claim(
+    conn, row: dict, *, reason: str, as_of: str
+) -> int:
+    cursor = conn.execute(
+        """
+        UPDATE v102_notification_outbox
+        SET status='cancelled', last_error=?, updated_at=?
+        WHERE id=? AND status='sending' AND updated_at=?
+        """,
+        (reason, as_of, row["id"], row["updated_at"]),
+    )
+    return cursor.rowcount
+
+
+def _restore_missed_policy_claims(rows: list[dict], *, as_of: str) -> int:
+    restored = 0
+    with connect() as conn:
+        for row in rows:
+            cursor = conn.execute(
+                """
+                UPDATE v102_notification_outbox
+                SET status='failed', last_error=?, updated_at=?
+                WHERE id=? AND status='sending' AND updated_at=?
+                """,
+                (
+                    row.get("last_error"),
+                    as_of,
+                    row["id"],
+                    row["updated_at"],
+                ),
+            )
+            restored += cursor.rowcount
+    return restored
+
+
 async def deliver_missed_policy_summary(
     bot, *, as_of: str | None = None
 ) -> int:
     moment = as_of or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with connect() as conn:
-        selected = [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT * FROM v102_notification_outbox
-                WHERE status='failed' AND scheduled_at<=?
-                ORDER BY scheduled_at, id
-                """,
-                (moment,),
-            )
-        ]
+    selected = _claim_missed_policy_outbox(moment)
 
     valid_rows: list[dict] = []
     seen_ids: set[int] = set()
@@ -258,19 +331,16 @@ async def deliver_missed_policy_summary(
             continue
         seen_ids.add(outbox_id)
         valid, invalid_reason = _policy_outbox_valid(
-            row, expected_status="failed"
+            row,
+            expected_status="sending",
+            expected_updated_at=row["updated_at"],
         )
         if valid:
             valid_rows.append(row)
             continue
         with connect() as conn:
-            conn.execute(
-                """
-                UPDATE v102_notification_outbox
-                SET status='cancelled', last_error=?, updated_at=?
-                WHERE id=? AND status='failed'
-                """,
-                (invalid_reason, moment, outbox_id),
+            _cancel_missed_policy_claim(
+                conn, row, reason=invalid_reason, as_of=moment
             )
 
     if not valid_rows:
@@ -312,20 +382,34 @@ async def deliver_missed_policy_summary(
         logger.warning(
             f"未发送业务提醒汇总失败 error={type(exc).__name__}"
         )
+        _restore_missed_policy_claims(valid_rows, as_of=moment)
         return 0
 
-    outbox_ids = [int(row["id"]) for row in valid_rows]
-    placeholders = ",".join("?" for _ in outbox_ids)
+    handled = 0
     with connect() as conn:
-        cursor = conn.execute(
-            f"""
-            UPDATE v102_notification_outbox
-            SET status='sent', sent_at=?, last_error=NULL, updated_at=?
-            WHERE status='failed' AND id IN ({placeholders})
-            """,
-            (moment, moment, *outbox_ids),
-        )
-        return cursor.rowcount
+        conn.execute("BEGIN IMMEDIATE")
+        for row in valid_rows:
+            valid, invalid_reason = _policy_outbox_valid_in_conn(
+                conn,
+                row,
+                expected_status="sending",
+                expected_updated_at=row["updated_at"],
+            )
+            if not valid:
+                _cancel_missed_policy_claim(
+                    conn, row, reason=invalid_reason, as_of=moment
+                )
+                continue
+            cursor = conn.execute(
+                """
+                UPDATE v102_notification_outbox
+                SET status='sent', sent_at=?, last_error=NULL, updated_at=?
+                WHERE id=? AND status='sending' AND updated_at=?
+                """,
+                (moment, moment, row["id"], row["updated_at"]),
+            )
+            handled += cursor.rowcount
+    return handled
 
 
 def _finish_outbox_attempt(
