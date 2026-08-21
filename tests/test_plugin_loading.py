@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PluginLoadingTests(unittest.TestCase):
-    def test_bot_import_registers_business_and_archive_plugins(self) -> None:
+    def test_bot_import_registers_control_router_and_background_plugins(self) -> None:
         env = os.environ.copy()
         env.update(
             {
@@ -22,6 +22,7 @@ class PluginLoadingTests(unittest.TestCase):
         script = """
 import nonebot
 import bot
+from nonebot.matcher import matchers
 
 loaded = {plugin.name for plugin in nonebot.get_loaded_plugins()}
 loaded_modules = {plugin.module_name for plugin in nonebot.get_loaded_plugins()}
@@ -31,6 +32,7 @@ required = {
     "random_chat",
     "private_chat",
     "feature_control",
+    "group_router",
 }
 missing = sorted(required - loaded)
 if missing:
@@ -44,6 +46,30 @@ if "plugins.feature_control.matcher" not in loaded_modules:
     raise SystemExit(
         "missing loaded plugin module: plugins.feature_control.matcher; "
         f"loaded_modules={sorted(loaded_modules)}"
+    )
+registered = {
+    (priority, matcher.module.__name__)
+    for priority, priority_matchers in matchers.items()
+    for matcher in priority_matchers
+}
+expected_background = {
+    (1, "plugins.chat_archive.matcher"),
+    (2, "plugins.member_memory.matcher"),
+}
+if not expected_background.issubset(registered):
+    raise SystemExit(f"missing background matcher priorities: {sorted(registered)}")
+group_response_modules = {
+    module
+    for _, module in registered
+    if module in {
+        "plugins.group_router.matcher",
+        "plugins.random_chat.matcher",
+        "plugins.violation_record.matcher",
+    }
+}
+if group_response_modules != {"plugins.group_router.matcher"}:
+    raise SystemExit(
+        f"expected one group response matcher, got {sorted(group_response_modules)}"
     )
 """
 

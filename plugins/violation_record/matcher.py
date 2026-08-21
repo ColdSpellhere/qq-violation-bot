@@ -3,9 +3,8 @@ from pathlib import Path
 import re
 from typing import Any
 
-from nonebot import logger, on_message
-from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, MessageSegment
-from nonebot.rule import Rule
+from nonebot import logger
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
 
 from .admin_resolver import grant_admin, grant_admins
 from .ai_router import AIRouterError, parse_intent
@@ -236,26 +235,26 @@ async def _sync_group_admins(bot: Bot, group_id: int) -> None:
     logger.info(f"已同步群成员到管理员表 group={group_id} count={count}")
 
 
-async def only_allowed_group(event: Event) -> bool:
-    return (
-        isinstance(event, GroupMessageEvent)
-        and int(event.group_id) == CONFIG.target_group_id
-    )
-
-
-matcher = on_message(rule=Rule(only_allowed_group), priority=10, block=True)
-
-
-@matcher.handle()
-async def _(bot: Bot, event: GroupMessageEvent):
-    at_me = _is_at_me(event)
-    if not at_me:
+async def _send_business_reply(
+    bot: Bot, event: GroupMessageEvent, reply: str | StructuredReply
+) -> None:
+    if isinstance(reply, StructuredReply):
+        await _send_structured_reply(bot, int(event.group_id), reply)
         return
+    reply = await _upload_export_files(bot, int(event.group_id), reply)
+    await bot.send_group_msg(group_id=int(event.group_id), message=reply)
+
+
+async def handle_business_message(
+    bot: Bot, event: GroupMessageEvent, text: str
+) -> bool:
     grant_admin(str(event.user_id), _sender_name(event))
     await _sync_group_admins(bot, int(event.group_id))
-    text = _plain_without_at(event)
     if not text:
-        await matcher.finish("请发送业务内容。")
+        await bot.send_group_msg(
+            group_id=int(event.group_id), message="请发送业务内容。"
+        )
+        return True
     try:
         policy_reply = handle_policy_text(
             text,
@@ -265,30 +264,24 @@ async def _(bot: Bot, event: GroupMessageEvent):
             message_id=str(event.message_id),
         )
     except PolicyCommandError as exc:
-        await matcher.finish(str(exc))
+        await bot.send_group_msg(group_id=int(event.group_id), message=str(exc))
+        return True
     except Exception as exc:
         logger.exception(f"处理减数固定命令失败：{exc}")
-        await matcher.finish("减数命令处理失败，请联系维护者查看日志。")
-    if policy_reply is not None:
-        if isinstance(policy_reply, StructuredReply):
-            await _send_structured_reply(bot, int(event.group_id), policy_reply)
-            await matcher.finish()
-        policy_reply = await _upload_export_files(
-            bot, int(event.group_id), policy_reply
+        await bot.send_group_msg(
+            group_id=int(event.group_id),
+            message="减数命令处理失败，请联系维护者查看日志。",
         )
-        await matcher.finish(policy_reply)
+        return True
+    if policy_reply is not None:
+        await _send_business_reply(bot, event, policy_reply)
+        return True
     try:
         referenced_time = await _referenced_message_time(bot, event)
         intent = await parse_intent(text, referenced_time=referenced_time)
         intent["_raw"] = text
-        if (
-            intent.get("intent") == "unknown"
-            and CONFIG.random_chat_direct_fallback_enabled
-        ):
-            from plugins.random_chat.matcher import send_random_reply
-
-            await send_random_reply(bot, event, text, addressed=True)
-            return
+        if intent.get("intent") == "unknown":
+            return False
         if intent.get("intent") == "create_violation":
             try:
                 batch_id, evidence_count = await capture_referenced_images(
@@ -335,8 +328,5 @@ async def _(bot: Bot, event: GroupMessageEvent):
     except Exception as exc:
         logger.exception(f"处理群消息失败：{exc}")
         reply = "处理失败，请稍后重试或联系维护者查看日志。"
-    if isinstance(reply, StructuredReply):
-        await _send_structured_reply(bot, int(event.group_id), reply)
-        await matcher.finish()
-    reply = await _upload_export_files(bot, int(event.group_id), reply)
-    await matcher.finish(reply)
+    await _send_business_reply(bot, event, reply)
+    return True

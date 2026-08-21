@@ -17,7 +17,7 @@ except ValueError:
 
 from plugins.chat_archive.db import archive_payload
 from plugins.chat_archive import matcher as archive_matcher
-from plugins.violation_record import matcher as violation_matcher
+from plugins.feature_control.state import FeatureController, FeatureState
 
 
 def _group_event(group_id: int) -> GroupMessageEvent:
@@ -40,39 +40,70 @@ def _group_event(group_id: int) -> GroupMessageEvent:
 
 
 class ChatArchiveTests(unittest.IsolatedAsyncioTestCase):
-    async def test_non_target_event_is_rejected_before_all_custom_processing(self) -> None:
+    def _controller(
+        self, directory: str, *, allowed: tuple[int, ...], chat_enabled: bool = True
+    ) -> FeatureController:
+        return FeatureController(
+            Path(directory) / "features.json",
+            FeatureState(
+                business_enabled=True,
+                chat_enabled=chat_enabled,
+                group_chat_enabled=True,
+                private_chat_enabled=False,
+                group_chat_allowed_group_ids=allowed,
+                private_chat_allowed_user_ids=(),
+            ),
+        )
+
+    async def test_disallowed_group_is_rejected_before_archive_processing(self) -> None:
         event = _group_event(987654321)
 
-        with (
-            patch.object(violation_matcher, "parse_intent") as parse_intent,
-            patch.object(violation_matcher, "grant_admin") as grant_admin,
-            patch.object(
-                violation_matcher,
-                "capture_referenced_images",
-            ) as capture_referenced_images,
-            patch.object(archive_matcher, "archive_payload") as archive_insert,
-        ):
-            self.assertFalse(await violation_matcher.only_allowed_group(event))
-            self.assertFalse(archive_matcher._target_group(event))
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            archive_matcher,
+            "FEATURES",
+            self._controller(directory, allowed=(123456789,)),
+        ), patch.object(archive_matcher, "archive_payload") as archive_insert:
+            self.assertFalse(archive_matcher._chat_group(event))
 
-        parse_intent.assert_not_called()
-        grant_admin.assert_not_called()
-        capture_referenced_images.assert_not_called()
         archive_insert.assert_not_called()
 
-    async def test_successful_archive_updates_identity_without_coupling_failures(self) -> None:
-        event = _group_event(archive_matcher.CONFIG.target_group_id)
-        with patch.object(archive_matcher, "archive_payload", return_value=True), patch.object(
+    async def test_allowed_group_archive_uses_actual_group_and_updates_identity(self) -> None:
+        group_id = 987654321
+        event = _group_event(group_id)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            archive_matcher,
+            "FEATURES",
+            self._controller(directory, allowed=(group_id,)),
+        ), patch.object(
+            archive_matcher, "archive_payload", return_value=True
+        ) as archive_insert, patch.object(
             archive_matcher, "remember_identity"
         ) as remember:
-            await archive_matcher.archive_target_message(event)
+            self.assertTrue(archive_matcher._chat_group(event))
+            await archive_matcher.archive_chat_message(event)
+
+        self.assertEqual(group_id, archive_insert.call_args.args[1])
         remember.assert_called_once()
         self.assertEqual("456791", remember.call_args.kwargs["user_id"])
 
-        with patch.object(archive_matcher, "archive_payload", return_value=True), patch.object(
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            archive_matcher,
+            "FEATURES",
+            self._controller(directory, allowed=(group_id,)),
+        ), patch.object(archive_matcher, "archive_payload", return_value=True), patch.object(
             archive_matcher, "remember_identity", side_effect=RuntimeError("memory failed")
         ):
-            await archive_matcher.archive_target_message(event)
+            await archive_matcher.archive_chat_message(event)
+
+    async def test_global_chat_switch_blocks_archive_candidate(self) -> None:
+        group_id = 987654321
+        event = _group_event(group_id)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            archive_matcher,
+            "FEATURES",
+            self._controller(directory, allowed=(group_id,), chat_enabled=False),
+        ):
+            self.assertFalse(archive_matcher._chat_group(event))
 
     def test_only_target_group_is_archived_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

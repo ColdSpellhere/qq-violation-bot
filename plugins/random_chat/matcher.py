@@ -1,27 +1,12 @@
-from nonebot import logger, on_message
-from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, MessageSegment
-from nonebot.rule import Rule
+from nonebot import logger
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
 
 from plugins.chat_archive.db import ContextMessage, archived_message_author, recent_text_context
 from plugins.member_memory.store import load_profiles
 from plugins.violation_record.config import CONFIG
 
 from .ai import RandomChatAIError, generate_reply
-from .policy import eligible_text, is_candidate, should_reply
 from .stickers import choose_sticker
-
-
-async def random_chat_candidate(event: Event) -> bool:
-    return isinstance(event, GroupMessageEvent) and is_candidate(
-        CONFIG.random_chat_enabled,
-        CONFIG.target_group_id,
-        int(event.group_id),
-        int(event.user_id),
-        int(event.self_id),
-    )
-
-
-matcher = on_message(rule=Rule(random_chat_candidate), priority=9, block=False)
 
 
 async def send_random_reply(
@@ -100,17 +85,3 @@ async def send_random_reply(
         except Exception as exc:
             logger.warning(f"随机闲聊群消息发送失败：{type(exc).__name__}")
     return False
-@matcher.handle()
-async def _(bot: Bot, event: GroupMessageEvent) -> None:
-    text_parts: list[str] = []
-    at_bot = False
-    self_id = str(event.self_id)
-    for segment in event.message:
-        if segment.type == "at" and str(segment.data.get("qq")) == self_id:
-            at_bot = True
-        elif segment.type == "text":
-            text_parts.append(str(segment.data.get("text", "")))
-    text = eligible_text(" ".join(text_parts), at_bot=at_bot)
-    if text is None or not should_reply(CONFIG.random_chat_probability):
-        return
-    await send_random_reply(bot, event, text)

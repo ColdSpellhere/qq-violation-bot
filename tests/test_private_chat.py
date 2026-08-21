@@ -2,6 +2,7 @@ import os
 import asyncio
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
 from plugins.chat_archive.db import ContextMessage
+from plugins.feature_control.state import FeatureController, FeatureState
 from plugins.private_chat.conversation import PrivateConversation
 from plugins.private_chat.policy import eligible_private_text, is_private_candidate
 from nonebot.adapters.onebot.v11 import Message, PrivateMessageEvent
@@ -98,6 +100,45 @@ class PrivateConversationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_gate_requires_parent_child_and_allowlist(self):
+        event = _private_event("你好")
+
+        def controller(
+            directory: str,
+            *,
+            chat_enabled: bool = True,
+            private_chat_enabled: bool = True,
+            allowed: tuple[str, ...] = ("123456",),
+        ) -> FeatureController:
+            return FeatureController(
+                Path(directory) / "features.json",
+                FeatureState(
+                    business_enabled=True,
+                    chat_enabled=chat_enabled,
+                    group_chat_enabled=False,
+                    private_chat_enabled=private_chat_enabled,
+                    group_chat_allowed_group_ids=(),
+                    private_chat_allowed_user_ids=allowed,
+                ),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            for features in (
+                controller(directory, chat_enabled=False),
+                controller(directory, private_chat_enabled=False),
+                controller(directory, allowed=("654321",)),
+            ):
+                with patch.object(private_matcher, "FEATURES", features):
+                    self.assertFalse(await private_matcher.private_chat_candidate(event))
+
+            with patch.object(private_matcher, "FEATURES", controller(directory)):
+                self.assertTrue(await private_matcher.private_chat_candidate(event))
+                self.assertFalse(
+                    await private_matcher.private_chat_candidate(
+                        _private_event("你好", user_id=999999)
+                    )
+                )
+
     async def test_allowed_text_always_replies_in_private_mode_with_sticker(self):
         bot = AsyncMock()
         conversation = PrivateConversation()

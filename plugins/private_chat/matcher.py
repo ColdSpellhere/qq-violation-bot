@@ -9,23 +9,23 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.rule import Rule
 
 from plugins.chat_archive.db import ContextMessage
+from plugins.feature_control.runtime import FEATURES
 from plugins.random_chat.ai import RandomChatAIError, generate_reply
 from plugins.random_chat.stickers import choose_sticker
 from plugins.violation_record.config import CONFIG
 
 from .conversation import PrivateConversation
-from .policy import eligible_private_text, is_private_candidate
+from .policy import eligible_private_text
 
 
 CONVERSATION = PrivateConversation(limit=20)
 
 
 async def private_chat_candidate(event: Event) -> bool:
-    return isinstance(event, PrivateMessageEvent) and is_private_candidate(
-        CONFIG.private_chat_enabled,
-        CONFIG.private_chat_allowed_user_id,
-        str(event.user_id),
-        str(event.self_id),
+    return (
+        isinstance(event, PrivateMessageEvent)
+        and str(event.user_id) != str(event.self_id)
+        and FEATURES.private_chat_allowed(str(event.user_id))
     )
 
 

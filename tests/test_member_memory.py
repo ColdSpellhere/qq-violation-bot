@@ -15,6 +15,7 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
 from plugins.chat_archive.db import ContextMessage
+from plugins.feature_control.state import FeatureController, FeatureState
 from plugins.member_memory.ai import extract_memory_candidates
 from plugins.member_memory.store import (
     MemberProfile,
@@ -60,10 +61,29 @@ def _group_event(
 
 
 class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
+    def _controller(
+        self, directory: str, *, allowed: tuple[int, ...], chat_enabled: bool = True
+    ) -> FeatureController:
+        return FeatureController(
+            Path(directory) / "features.json",
+            FeatureState(
+                business_enabled=True,
+                chat_enabled=chat_enabled,
+                group_chat_enabled=True,
+                private_chat_enabled=False,
+                group_chat_allowed_group_ids=allowed,
+                private_chat_allowed_user_ids=(),
+            ),
+        )
+
     async def test_target_group_text_is_submitted_to_independent_batcher(self):
         event = _group_event()
 
-        with patch.object(memory_matcher.BATCHER, "add") as add:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            memory_matcher,
+            "FEATURES",
+            self._controller(directory, allowed=(int(event.group_id),)),
+        ), patch.object(memory_matcher.BATCHER, "add") as add:
             await memory_matcher.collect_member_memory(event)
 
         add.assert_called_once_with(
@@ -81,7 +101,13 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
             _group_event(group_id=memory_matcher.CONFIG.target_group_id + 1),
         )
 
-        with patch.object(memory_matcher.BATCHER, "add") as add:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            memory_matcher,
+            "FEATURES",
+            self._controller(
+                directory, allowed=(memory_matcher.CONFIG.target_group_id,)
+            ),
+        ), patch.object(memory_matcher.BATCHER, "add") as add:
             for event in events:
                 if memory_matcher._target_member_message(event):
                     await memory_matcher.collect_member_memory(event)
@@ -94,7 +120,9 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
             {"user_id": "7", "trait": "喜欢火锅"},
             {"user_id": "8", "trait": "喜欢跑步"},
         ]
-        with patch.object(
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            memory_matcher, "FEATURES", self._controller(directory, allowed=(123,))
+        ), patch.object(
             memory_matcher, "recent_text_context", return_value=context
         ) as recent, patch.object(
             memory_matcher,
@@ -129,7 +157,9 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
             bot_self_id="999",
             member_memory_summary_enabled=True,
         )
-        with patch.object(memory_matcher, "CONFIG", config), patch.object(
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            memory_matcher, "FEATURES", self._controller(directory, allowed=(123,))
+        ), patch.object(memory_matcher, "CONFIG", config), patch.object(
             memory_matcher, "recent_text_context", return_value=context
         ), patch.object(
             memory_matcher, "extract_memory_candidates", AsyncMock(return_value=candidates)
@@ -145,12 +175,36 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_analysis_failure_is_caught_at_callback_boundary(self):
-        with patch.object(
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            memory_matcher, "FEATURES", self._controller(directory, allowed=(123,))
+        ), patch.object(
             memory_matcher, "recent_text_context", side_effect=RuntimeError("db failed")
         ), patch.object(memory_matcher.logger, "warning") as warning:
             await memory_matcher.analyze_member_memory(123, "7", 2000)
 
         warning.assert_called_once()
+
+    async def test_disabled_chat_blocks_enqueue_and_delayed_analysis_writes(self):
+        event = _group_event()
+        group_id = int(event.group_id)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            memory_matcher,
+            "FEATURES",
+            self._controller(
+                directory, allowed=(group_id,), chat_enabled=False
+            ),
+        ), patch.object(memory_matcher.BATCHER, "add") as add, patch.object(
+            memory_matcher, "recent_text_context"
+        ) as recent, patch.object(
+            memory_matcher, "apply_candidates"
+        ) as apply:
+            self.assertFalse(memory_matcher._target_member_message(event))
+            await memory_matcher.collect_member_memory(event)
+            await memory_matcher.analyze_member_memory(group_id, "456791", 2000)
+
+        add.assert_not_called()
+        recent.assert_not_called()
+        apply.assert_not_called()
 
 
 class MemberMemoryStoreTests(unittest.TestCase):

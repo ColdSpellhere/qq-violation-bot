@@ -11,9 +11,7 @@ os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
 
 from plugins.chat_archive.db import SCHEMA, ContextMessage, recent_text_context
-from plugins.random_chat import matcher as random_chat_matcher
 from plugins.random_chat.matcher import send_random_reply
-from plugins.violation_record.config import CONFIG
 
 
 class RecentTextContextTests(unittest.TestCase):
@@ -261,18 +259,6 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(sent)
         self.assertEqual("自然回复", bot.send_group_msg.await_args.kwargs["message"])
-
-    async def test_probability_gate_uses_config_and_skips_send_when_false(self):
-        bot = AsyncMock()
-        with patch(
-            "plugins.random_chat.matcher.should_reply", return_value=False
-        ) as should_reply, patch(
-            "plugins.random_chat.matcher.send_random_reply", new=AsyncMock()
-        ) as send:
-            await random_chat_matcher._(bot, _event())
-
-        should_reply.assert_called_once_with(CONFIG.random_chat_probability)
-        send.assert_not_awaited()
 
     async def test_archive_ai_and_send_failures_do_not_escape(self):
         bot = AsyncMock()

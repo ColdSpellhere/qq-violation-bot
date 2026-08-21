@@ -6,8 +6,9 @@ from nonebot import logger, on_message
 from nonebot.adapters.onebot.v11 import Event, GroupMessageEvent
 from nonebot.rule import Rule
 
-from plugins.violation_record.config import CONFIG
+from plugins.feature_control.runtime import FEATURES
 from plugins.member_memory.store import remember_identity
+from plugins.violation_record.config import CONFIG
 from .db import archive_payload
 
 
@@ -31,23 +32,23 @@ def _sender_dict(event: GroupMessageEvent) -> dict[str, Any]:
     }
 
 
-def _target_group(event: Event) -> bool:
+def _chat_group(event: Event) -> bool:
     return (
         isinstance(event, GroupMessageEvent)
-        and int(event.group_id) == CONFIG.target_group_id
+        and FEATURES.group_chat_allowed(int(event.group_id))
     )
 
 
-archive_matcher = on_message(rule=Rule(_target_group), priority=1, block=False)
+archive_matcher = on_message(rule=Rule(_chat_group), priority=1, block=False)
 
 
 @archive_matcher.handle()
-async def archive_target_message(event: GroupMessageEvent) -> None:
+async def archive_chat_message(event: GroupMessageEvent) -> None:
     sender = _sender_dict(event)
     try:
         archived = archive_payload(
             CONFIG.chat_archive_path,
-            CONFIG.target_group_id,
+            int(event.group_id),
             {
                 "message_id": str(event.message_id),
                 "group_id": int(event.group_id),
