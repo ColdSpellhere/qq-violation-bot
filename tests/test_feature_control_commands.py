@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+import os
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+os.environ.setdefault("TARGET_GROUP_ID", "999000111")
+
+import nonebot
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
+
+try:
+    nonebot.get_driver()
+except ValueError:
+    nonebot.init()
+
+from plugins.feature_control.commands import (
+    execute_control_command,
+    is_control_command,
+)
+from plugins.feature_control.matcher import handle_control_command
+from plugins.feature_control.state import FeatureController, FeatureState
+
+
+def _event(text: str, *, user_id: int = 1) -> GroupMessageEvent:
+    message = Message(text)
+    return GroupMessageEvent(
+        time=2000,
+        self_id=999999,
+        post_type="message",
+        sub_type="normal",
+        user_id=user_id,
+        message_type="group",
+        message_id=456,
+        group_id=123456,
+        message=message,
+        original_message=message,
+        raw_message=text,
+        font=0,
+        sender={"user_id": user_id, "nickname": "测试者", "role": "member"},
+    )
+
+
+class FeatureControlCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = TemporaryDirectory()
+        self.controller = FeatureController(
+            Path(self.temporary_directory.name) / "runtime_features.json",
+            FeatureState(
+                business_enabled=True,
+                chat_enabled=True,
+                group_chat_enabled=True,
+                private_chat_enabled=True,
+                group_chat_allowed_group_ids=(100,),
+                private_chat_allowed_user_ids=("200",),
+            ),
+        )
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_recognizes_only_control_command_prefixes(self) -> None:
+        for text in (
+            "/模块状态",
+            "/业务 开",
+            "/聊天 关",
+            "/群聊 开",
+            "/群聊群 添加 123",
+            "/私聊 关",
+            "/私聊用户 列表",
+        ):
+            self.assertTrue(is_control_command(text), text)
+        for text in ("业务 开", "/未知 开", "/聊天会 开", "普通聊天"):
+            self.assertFalse(is_control_command(text), text)
+
+    def test_executes_all_switch_commands(self) -> None:
+        self.assertEqual(
+            "业务功能已关闭。",
+            execute_control_command("/业务 关", self.controller, "1"),
+        )
+        self.assertEqual(
+            "聊天总开关已关闭。",
+            execute_control_command("/聊天 关", self.controller, "1"),
+        )
+        self.assertEqual(
+            "群聊功能已关闭。",
+            execute_control_command("/群聊 关", self.controller, "1"),
+        )
+        self.assertEqual(
+            "私聊功能已关闭。",
+            execute_control_command("/私聊 关", self.controller, "1"),
+        )
+        self.assertFalse(self.controller.snapshot().business_enabled)
+        self.assertFalse(self.controller.snapshot().chat_enabled)
+        self.assertFalse(self.controller.snapshot().group_chat_enabled)
+        self.assertFalse(self.controller.snapshot().private_chat_enabled)
+
+    def test_executes_all_allowlist_commands(self) -> None:
+        self.assertEqual(
+            "已添加群聊群：123。",
+            execute_control_command("/群聊群 添加 123", self.controller, "1"),
+        )
+        self.assertEqual(
+            "群聊群允许列表：100、123。",
+            execute_control_command("/群聊群 列表", self.controller, "1"),
+        )
+        self.assertEqual(
+            "已删除群聊群：123。",
+            execute_control_command("/群聊群 删除 123", self.controller, "1"),
+        )
+        self.assertEqual(
+            "已添加私聊用户：456。",
+            execute_control_command("/私聊用户 添加 456", self.controller, "1"),
+        )
+        self.assertEqual(
+            "私聊用户允许列表：200、456。",
+            execute_control_command("/私聊用户 列表", self.controller, "1"),
+        )
+        self.assertEqual(
+            "已删除私聊用户：456。",
+            execute_control_command("/私聊用户 删除 456", self.controller, "1"),
+        )
+
+    def test_status_does_not_include_allowlist_ids(self) -> None:
+        status = execute_control_command("/模块状态", self.controller, "1")
+
+        self.assertIn("业务功能：开", status)
+        self.assertIn("聊天总开关：开", status)
+        self.assertIn("群聊功能：开（允许群数：1）", status)
+        self.assertIn("私聊功能：开（允许用户数：1）", status)
+        self.assertNotIn("100", status)
+        self.assertNotIn("200", status)
+
+    def test_reports_duplicate_missing_invalid_and_usage_errors(self) -> None:
+        self.assertEqual(
+            "群聊群：100 已在允许列表中。",
+            execute_control_command("/群聊群 添加 100", self.controller, "1"),
+        )
+        self.assertEqual(
+            "私聊用户：999 不在允许列表中。",
+            execute_control_command("/私聊用户 删除 999", self.controller, "1"),
+        )
+        self.assertEqual(
+            "群号必须为正整数。",
+            execute_control_command("/群聊群 添加 abc", self.controller, "1"),
+        )
+        self.assertEqual(
+            "用法：/业务 开|关。",
+            execute_control_command("/业务", self.controller, "1"),
+        )
+        self.assertEqual(
+            "不支持的模块管理命令。",
+            execute_control_command("/未知 开", self.controller, "1"),
+        )
+
+
+class FeatureControlMatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_superuser_is_rejected_without_mutating_state(self) -> None:
+        with TemporaryDirectory() as directory:
+            controller = FeatureController(
+                Path(directory) / "runtime_features.json",
+                FeatureState(True, True, True, True, (), ()),
+            )
+            configured_driver = SimpleNamespace(
+                config=SimpleNamespace(superusers={"2"})
+            )
+            with patch(
+                "plugins.feature_control.matcher.FEATURES", controller
+            ), patch(
+                "plugins.feature_control.matcher.get_driver",
+                return_value=configured_driver,
+            ), patch(
+                "plugins.feature_control.matcher.control_matcher.finish",
+                new=AsyncMock(),
+            ) as finish:
+                await handle_control_command(_event("/业务 关", user_id=1))
+
+            finish.assert_awaited_once_with("你没有模块管理权限。")
+            self.assertTrue(controller.snapshot().business_enabled)
+
+
+if __name__ == "__main__":
+    unittest.main()

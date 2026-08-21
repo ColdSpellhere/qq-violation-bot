@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+from .state import FeatureController
+
+
+_SWITCH_COMMANDS = {
+    "/业务": ("business_enabled", "业务功能"),
+    "/聊天": ("chat_enabled", "聊天总开关"),
+    "/群聊": ("group_chat_enabled", "群聊功能"),
+    "/私聊": ("private_chat_enabled", "私聊功能"),
+}
+_ALLOWLIST_COMMANDS = {
+    "/群聊群": ("group_chat", "群聊群", "群号"),
+    "/私聊用户": ("private_chat", "私聊用户", "QQ号"),
+}
+_COMMAND_PREFIXES = frozenset(
+    {"/模块状态", *_SWITCH_COMMANDS, *_ALLOWLIST_COMMANDS}
+)
+
+
+def is_control_command(text: str) -> bool:
+    parts = text.strip().split(maxsplit=1)
+    return bool(parts) and parts[0] in _COMMAND_PREFIXES
+
+
+def execute_control_command(
+    text: str, controller: FeatureController, actor: str
+) -> str:
+    parts = text.strip().split()
+    if not parts:
+        return "不支持的模块管理命令。"
+    if parts[0] == "/模块状态":
+        return _status(controller) if len(parts) == 1 else "用法：/模块状态。"
+    if parts[0] in _SWITCH_COMMANDS:
+        return _set_switch(parts, controller, actor)
+    if parts[0] in _ALLOWLIST_COMMANDS:
+        return _change_allowlist(parts, controller, actor)
+    return "不支持的模块管理命令。"
+
+
+def _status(controller: FeatureController) -> str:
+    state = controller.snapshot()
+    return "\n".join(
+        (
+            f"业务功能：{_switch_text(state.business_enabled)}",
+            f"聊天总开关：{_switch_text(state.chat_enabled)}",
+            "群聊功能："
+            f"{_switch_text(state.group_chat_enabled)}"
+            f"（允许群数：{len(state.group_chat_allowed_group_ids)}）",
+            "私聊功能："
+            f"{_switch_text(state.private_chat_enabled)}"
+            f"（允许用户数：{len(state.private_chat_allowed_user_ids)}）",
+        )
+    )
+
+
+def _set_switch(parts: list[str], controller: FeatureController, actor: str) -> str:
+    command = parts[0]
+    field_name, label = _SWITCH_COMMANDS[command]
+    if len(parts) != 2 or parts[1] not in {"开", "关"}:
+        return f"用法：{command} 开|关。"
+    enabled = parts[1] == "开"
+    controller.set_switch(field_name, enabled, actor)
+    return f"{label}已{'开启' if enabled else '关闭'}。"
+
+
+def _change_allowlist(
+    parts: list[str], controller: FeatureController, actor: str
+) -> str:
+    command = parts[0]
+    kind, label, id_label = _ALLOWLIST_COMMANDS[command]
+    if len(parts) == 2 and parts[1] == "列表":
+        return _list_allowlist(kind, label, controller)
+    if len(parts) != 3 or parts[1] not in {"添加", "删除"}:
+        return f"用法：{command} 添加|删除 <{id_label}>，或 {command} 列表。"
+
+    value = parts[2]
+    if not _is_positive_numeric_id(value):
+        return f"{id_label}必须为正整数。"
+    normalized = str(int(value))
+    state = controller.snapshot()
+    field_name = (
+        "group_chat_allowed_group_ids"
+        if kind == "group_chat"
+        else "private_chat_allowed_user_ids"
+    )
+    existing = {str(item) for item in getattr(state, field_name)}
+    if parts[1] == "添加":
+        if normalized in existing:
+            return f"{label}：{normalized} 已在允许列表中。"
+        controller.add_allowed(kind, normalized, actor)
+        return f"已添加{label}：{normalized}。"
+    if normalized not in existing:
+        return f"{label}：{normalized} 不在允许列表中。"
+    controller.remove_allowed(kind, normalized, actor)
+    return f"已删除{label}：{normalized}。"
+
+
+def _list_allowlist(kind: str, label: str, controller: FeatureController) -> str:
+    state = controller.snapshot()
+    values = (
+        state.group_chat_allowed_group_ids
+        if kind == "group_chat"
+        else state.private_chat_allowed_user_ids
+    )
+    if not values:
+        return f"{label}允许列表为空。"
+    return f"{label}允许列表：{'、'.join(str(value) for value in values)}。"
+
+
+def _is_positive_numeric_id(value: str) -> bool:
+    return value.isdigit() and int(value) > 0
+
+
+def _switch_text(enabled: bool) -> str:
+    return "开" if enabled else "关"
