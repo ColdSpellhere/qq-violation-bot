@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 from datetime import UTC, datetime
 from functools import partial
 
@@ -20,6 +21,7 @@ from .store import ChatVisionStore
 _CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 _cleanup_task: asyncio.Task[None] | None = None
 _store: ChatVisionStore | None = None
+_registered_drivers: weakref.WeakSet[object] = weakref.WeakSet()
 
 
 def _now_text() -> str:
@@ -44,6 +46,9 @@ def setup_lifecycle() -> None:
         driver = get_driver()
     except ValueError:
         return
+    if driver in _registered_drivers:
+        return
+    _registered_drivers.add(driver)
 
     @driver.on_startup
     async def _startup() -> None:

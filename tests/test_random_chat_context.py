@@ -369,10 +369,115 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             chat_archive_path=database,
             chat_vision_root=root,
+            chat_vision_max_bytes=64,
             member_memory_summary_enabled=False,
             random_chat_sticker_root=root / "stickers",
             random_chat_special_sticker="special.gif",
             random_chat_sticker_probability=0.0,
+        )
+
+    async def test_raw_image_count_budget_degrades_to_all_persisted_descriptions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "data" / "chat_vision" / "images"
+            root.mkdir(parents=True)
+            database = Path(directory) / "chat.db"
+            store = ChatVisionStore(database)
+            for ordinal in range(1, 6):
+                self._stored_image(
+                    store,
+                    root,
+                    message_id="456",
+                    ordinal=ordinal,
+                    content=f"raw-{ordinal}".encode(),
+                    description=f"第{ordinal}张图的事实",
+                )
+            message = Message(
+                [
+                    MessageSegment.image(
+                        f"https://example.invalid/{ordinal}.jpg"
+                    )
+                    for ordinal in range(1, 6)
+                ]
+            )
+            config = self._vision_config(database, root)
+            config.chat_vision_max_bytes = 1024
+            with patch(
+                "plugins.random_chat.matcher.CONFIG",
+                config,
+            ), patch(
+                "plugins.random_chat.matcher.recent_text_context",
+                return_value=[],
+            ), patch(
+                "plugins.random_chat.matcher.archived_message_author",
+                return_value=None,
+            ), patch(
+                "plugins.random_chat.matcher.load_profiles",
+                return_value=[],
+            ), patch(
+                "plugins.random_chat.matcher.generate_reply",
+                new=AsyncMock(return_value="按描述回复"),
+            ) as generate, patch(
+                "plugins.random_chat.matcher.choose_sticker",
+                return_value=None,
+            ):
+                sent = await send_random_reply(AsyncMock(), _event(message), "")
+
+        self.assertTrue(sent)
+        self.assertEqual([], list(generate.await_args.kwargs["images"]))
+        self.assertEqual(
+            tuple(f"第{ordinal}张图的事实" for ordinal in range(1, 6)),
+            generate.await_args.kwargs["current"].image_descriptions,
+        )
+
+    async def test_raw_image_byte_budget_degrades_without_partial_base64_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "data" / "chat_vision" / "images"
+            root.mkdir(parents=True)
+            database = Path(directory) / "chat.db"
+            store = ChatVisionStore(database)
+            for ordinal in range(1, 3):
+                self._stored_image(
+                    store,
+                    root,
+                    message_id="456",
+                    ordinal=ordinal,
+                    content=b"12345678",
+                    description=f"第{ordinal}张图的事实",
+                )
+            message = Message(
+                [
+                    MessageSegment.image("https://example.invalid/1.jpg"),
+                    MessageSegment.image("https://example.invalid/2.jpg"),
+                ]
+            )
+            config = self._vision_config(database, root)
+            config.chat_vision_max_bytes = 12
+            with patch(
+                "plugins.random_chat.matcher.CONFIG",
+                config,
+            ), patch(
+                "plugins.random_chat.matcher.recent_text_context",
+                return_value=[],
+            ), patch(
+                "plugins.random_chat.matcher.archived_message_author",
+                return_value=None,
+            ), patch(
+                "plugins.random_chat.matcher.load_profiles",
+                return_value=[],
+            ), patch(
+                "plugins.random_chat.matcher.generate_reply",
+                new=AsyncMock(return_value="按描述回复"),
+            ) as generate, patch(
+                "plugins.random_chat.matcher.choose_sticker",
+                return_value=None,
+            ):
+                sent = await send_random_reply(AsyncMock(), _event(message), "")
+
+        self.assertTrue(sent)
+        self.assertEqual([], list(generate.await_args.kwargs["images"]))
+        self.assertEqual(
+            ("第1张图的事实", "第2张图的事实"),
+            generate.await_args.kwargs["current"].image_descriptions,
         )
 
     async def test_reads_expected_window_and_sends_contextual_reply(self):
@@ -457,8 +562,8 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_passes_current_and_unexpired_quoted_originals_to_ai(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "images"
-            root.mkdir()
+            root = Path(directory) / "data" / "chat_vision" / "images"
+            root.mkdir(parents=True)
             database = Path(directory) / "chat.db"
             store = ChatVisionStore(database)
             self._stored_image(
@@ -558,8 +663,8 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deduplicates_originals_by_asset_id(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "images"
-            root.mkdir()
+            root = Path(directory) / "data" / "chat_vision" / "images"
+            root.mkdir(parents=True)
             database = Path(directory) / "chat.db"
             store = ChatVisionStore(database)
             self._stored_image(
@@ -609,8 +714,8 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_vision_failure_returns_false_without_sending(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "images"
-            root.mkdir()
+            root = Path(directory) / "data" / "chat_vision" / "images"
+            root.mkdir(parents=True)
             database = Path(directory) / "chat.db"
             store = ChatVisionStore(database)
             self._stored_image(
@@ -649,8 +754,8 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_pure_image_without_available_current_original_returns_false(self):
         for mode in ("missing", "expired", "read_error"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory) / "images"
-                root.mkdir()
+                root = Path(directory) / "data" / "chat_vision" / "images"
+                root.mkdir(parents=True)
                 database = Path(directory) / "chat.db"
                 store = ChatVisionStore(database)
                 if mode != "missing":
@@ -702,8 +807,8 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mixed_image_without_original_degrades_to_real_text(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "images"
-            root.mkdir()
+            root = Path(directory) / "data" / "chat_vision" / "images"
+            root.mkdir(parents=True)
             database = Path(directory) / "chat.db"
             store = ChatVisionStore(database)
             self._stored_image(
@@ -790,8 +895,8 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_old_quoted_image_description_is_added_to_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "images"
-            root.mkdir()
+            root = Path(directory) / "data" / "chat_vision" / "images"
+            root.mkdir(parents=True)
             database = Path(directory) / "chat.db"
             store = ChatVisionStore(database)
             self._stored_image(

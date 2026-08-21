@@ -148,6 +148,19 @@ class ChatVisionClientTests(unittest.IsolatedAsyncioTestCase):
 
         self._assert_redacted(raised.exception)
 
+    async def test_missing_or_empty_choices_raise_redacted_schema_error(self):
+        for result in ({}, {"choices": []}):
+            with self.subTest(result=result):
+                response = _Response()
+                response.json = lambda result=result: result
+                _Client.response = response
+                with (
+                    patch("plugins.chat_vision.client.httpx.AsyncClient", _Client),
+                    self.assertRaisesRegex(ChatVisionAIError, "^ValueError$") as raised,
+                ):
+                    await self._call()
+                self._assert_redacted(raised.exception)
+
     async def test_missing_api_key_raises_redacted_value_error_without_request(self):
         self.api_key = ""
 

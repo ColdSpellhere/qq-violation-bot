@@ -77,11 +77,21 @@ def _database_path(url: str) -> Path:
 
 
 def _chat_vision_root_env() -> Path:
-    allowed_root = (DATA_DIR / "chat_vision").resolve()
+    allowed_root = Path(os.path.abspath(DATA_DIR / "chat_vision"))
     raw = Path(os.getenv("CHAT_VISION_IMAGE_ROOT", "data/chat_vision/images"))
-    configured = (raw if raw.is_absolute() else BASE_DIR / raw).resolve()
+    configured = Path(os.path.abspath(raw if raw.is_absolute() else BASE_DIR / raw))
     if not configured.is_relative_to(allowed_root):
         raise RuntimeError("CHAT_VISION_IMAGE_ROOT must stay under data/chat_vision")
+    current = DATA_DIR
+    for component in configured.relative_to(DATA_DIR).parts:
+        try:
+            if current.is_symlink():
+                raise RuntimeError("CHAT_VISION_IMAGE_ROOT ancestors must not be symlinks")
+        except OSError as exc:
+            raise RuntimeError("CHAT_VISION_IMAGE_ROOT ancestors are unavailable") from exc
+        current /= component
+    if current.is_symlink():
+        raise RuntimeError("CHAT_VISION_IMAGE_ROOT ancestors must not be symlinks")
     return configured
 
 

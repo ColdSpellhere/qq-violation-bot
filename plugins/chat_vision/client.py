@@ -65,7 +65,15 @@ async def describe_image(
             )
             response.raise_for_status()
             result = response.json()
-        description = result["choices"][0]["message"]["content"]
+        if not isinstance(result, dict):
+            raise ValueError("response schema is invalid")
+        choices = result.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("response choices are missing")
+        choice = choices[0]
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            raise ValueError("response message is missing")
+        description = choice["message"].get("content")
         if not isinstance(description, str):
             raise TypeError("response content must be text")
         description = description.strip()

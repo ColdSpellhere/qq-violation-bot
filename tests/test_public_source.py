@@ -101,7 +101,7 @@ class PublicSourceBoundaryTests(unittest.TestCase):
         self.assertIn("NAPCAT_ACCESS_TOKEN=replace-with-random-token", text)
 
         target_group_id = str(os.getenv("TARGET_GROUP_ID") or "").strip()
-        if target_group_id:
+        if target_group_id and target_group_id != "123456789":
             self.assertNotIn(f"TARGET_GROUP_ID={target_group_id}", text)
 
     def test_chat_vision_example_has_safe_defaults(self) -> None:

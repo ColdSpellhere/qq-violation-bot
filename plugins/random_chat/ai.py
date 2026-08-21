@@ -142,7 +142,10 @@ async def generate_reply(
     else:
         payload["temperature"] = 0.8
     try:
-        async with httpx.AsyncClient(timeout=CONFIG.ai_timeout) as client:
+        request_timeout = (
+            CONFIG.chat_vision_timeout if images else CONFIG.ai_timeout
+        )
+        async with httpx.AsyncClient(timeout=request_timeout) as client:
             response = await client.post(
                 f"{CONFIG.ai_base_url}/v1/chat/completions",
                 headers={

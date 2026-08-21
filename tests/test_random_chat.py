@@ -103,6 +103,7 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
             ai_base_url="https://ai.example.com",
             ai_model="chat-model",
             chat_vision_model="vision-model",
+            chat_vision_timeout=29,
             ai_timeout=12,
         )
 
@@ -182,6 +183,7 @@ class RandomChatAITests(unittest.IsolatedAsyncioTestCase):
                 self.fail(f"generate_reply must accept raw images: {exc}")
 
         payload = _FakeClient.posted[2]
+        self.assertEqual(29, _FakeClient.posted[3])
         self.assertEqual("vision-model", payload["model"])
         self.assertEqual({"type": "disabled"}, payload["thinking"])
         self.assertNotIn("temperature", payload)

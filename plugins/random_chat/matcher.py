@@ -16,6 +16,9 @@ if TYPE_CHECKING:
     from plugins.chat_vision.client import VisionImage
 
 
+_RAW_REPLY_MAX_IMAGES = 4
+
+
 def _reply_message_id(event: GroupMessageEvent) -> str | None:
     if event.reply:
         for name in ("message_id", "id"):
@@ -59,6 +62,7 @@ async def send_random_reply(
     current_descriptions: tuple[str, ...] = ()
     referenced_descriptions: tuple[str, ...] = ()
     images: list[VisionImage] = []
+    raw_budget_exceeded = False
     if current_has_image or reply_message_id:
         try:
             from plugins.chat_vision.client import VisionImage
@@ -96,6 +100,13 @@ async def send_random_reply(
                 content = read_original_image(asset, CONFIG.chat_vision_root)
                 if content is None or not asset.mime_type:
                     continue
+                if (
+                    len(images) >= _RAW_REPLY_MAX_IMAGES
+                    or sum(len(item.content) for item in images) + len(content)
+                    > CONFIG.chat_vision_max_bytes
+                ):
+                    raw_budget_exceeded = True
+                    continue
                 images.append(
                     VisionImage(
                         content=content,
@@ -104,16 +115,21 @@ async def send_random_reply(
                         ordinal=asset.ordinal,
                     )
                 )
+            if raw_budget_exceeded:
+                images.clear()
         except Exception as exc:
             logger.warning(f"随机闲聊读取图片原图失败：{type(exc).__name__}")
     has_current_original = any(
         image.message_id == str(event.message_id) for image in images
     )
     if current_has_image and not has_current_original:
-        if not stripped_text:
+        if raw_budget_exceeded and current_descriptions:
+            pass
+        elif not stripped_text:
             return False
-        current_descriptions = ()
-        images.clear()
+        else:
+            current_descriptions = ()
+            images.clear()
     replied_to_user_id = archived_message_author(
         CONFIG.chat_archive_path,
         group_id=int(event.group_id),

@@ -34,6 +34,7 @@ def _group_event(
     group_id: int = TARGET_GROUP_ID,
     addressed: bool = False,
     image: bool = False,
+    reply_image: bool = False,
     user_id: int = 123,
     self_id: int = 999,
 ) -> GroupMessageEvent:
@@ -45,6 +46,18 @@ def _group_event(
     if text:
         segments.append(MessageSegment.text(text))
     message = Message(segments)
+    reply = None
+    if reply_image:
+        reply = {
+            "time": 1900,
+            "message_type": "group",
+            "message_id": 111,
+            "real_id": 111,
+            "sender": {"user_id": 321, "nickname": "引用者"},
+            "message": Message(
+                [MessageSegment.image("https://example.invalid/quoted.jpg")]
+            ),
+        }
     return GroupMessageEvent(
         time=2000,
         self_id=self_id,
@@ -59,6 +72,7 @@ def _group_event(
         raw_message=str(message),
         font=0,
         sender={"user_id": user_id, "nickname": "成员", "role": "member"},
+        reply=reply,
     )
 
 
@@ -234,6 +248,37 @@ class GroupRouterTests(unittest.IsolatedAsyncioTestCase):
         business.assert_not_awaited()
         casual.assert_awaited_once_with(bot, event, "", addressed=True)
         bot.send_group_msg.assert_not_awaited()
+
+    async def test_target_group_addressed_real_reply_image_skips_empty_business_prompt(
+        self,
+    ) -> None:
+        bot = AsyncMock()
+        event = _group_event("", addressed=True, reply_image=True)
+        controller = self.controller(
+            group_chat_allowed_group_ids=(TARGET_GROUP_ID, CHAT_GROUP_ID)
+        )
+        with patch.object(group_router, "FEATURES", controller), patch.object(
+            group_router,
+            "CONFIG",
+            SimpleNamespace(
+                target_group_id=TARGET_GROUP_ID,
+                random_chat_probability=0.0,
+            ),
+        ), patch.object(
+            group_router,
+            "handle_business_message",
+            new=AsyncMock(return_value=True),
+        ) as business, patch.object(
+            group_router,
+            "send_random_reply",
+            new=AsyncMock(return_value=True),
+        ) as casual:
+            await group_router.route_group_message(bot, event)
+
+        self.assertIsNotNone(event.reply)
+        self.assertTrue(any(segment.type == "image" for segment in event.reply.message))
+        business.assert_not_awaited()
+        casual.assert_awaited_once_with(bot, event, "", addressed=True)
 
     async def test_target_group_image_with_business_text_remains_business_first(
         self,

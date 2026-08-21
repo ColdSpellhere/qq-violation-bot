@@ -98,13 +98,220 @@ ADMIN_SEED=123456:ColdSpell:冷|spell;654321:企鹅
 
 聊天图片原图只写入 `data/chat_vision/images/`，单图最大 `CHAT_VISION_MAX_BYTES=10485760` 字节；原图在 `CHAT_VISION_RETENTION_DAYS=7` 天后清理，已生成的文字描述、哈希和审计记录永久保留。视觉功能复用现有 `AI_BASE_URL` 和同一个 `AI_API_KEY`，只通过 `CHAT_VISION_MODEL` 选择视觉模型，不新增或复制另一份密钥。
 
-未艾特机器人的纯图片消息仍按 `RANDOM_CHAT_PROBABILITY` 决定是否回复；明确艾特机器人且含图片时必须基于当前可用原图回复，不走概率抽样。图文混合消息继续沿用普通聊天概率，业务文字仍优先进入业务路由。当前或被引用的原图过期、缺失或视觉请求失败时，不会伪造“已看图”的回复；可用的永久描述仍可用于聊天上下文。
+未艾特机器人的纯图片消息仍按 `RANDOM_CHAT_PROBABILITY` 决定是否回复；明确艾特机器人且含图片时不走概率抽样。当前消息和引用消息的原图总数量不超过 4 张、总字节不超过 `CHAT_VISION_MAX_BYTES` 时，回复会直接使用全部可用原图；任一总预算超限时不会构造无界 Base64，而是改用每张图已经持久化的事实描述。图文混合消息继续沿用普通聊天概率，业务文字仍优先进入业务路由。当前或被引用的原图过期、缺失或视觉请求失败时，不会伪造“已看图”的回复；可用的永久描述仍可用于聊天上下文。
 
 聊天视觉数据与违规证据硬隔离：视觉模块只使用 `data/chat_vision/images/` 和聊天归档数据库，不读取、迁移、索引、重新识别或清理 `evidence/`；证据数据库、证据文件及现有查询行为不受 7 天原图策略影响。
 
-`RANDOM_CHAT_ENABLED` 是旧版首次群聊默认值兼容输入；运行时实际由下文的聊天总开关、群聊子开关和群聊白名单决定。允许群内，明确 @ 机器人的文字会直接进入聊天回复；普通成员文字仍按 `RANDOM_CHAT_PROBABILITY` 概率回复，默认值 `0.10` 表示 10%。命中后会读取当前群最近 30 分钟内最多 20 条纯文本，按群名片、QQ 昵称、QQ号的顺序标注成员并交给 AI 理解上下文；不读取图片或业务数据库。机器人自身消息、空消息和 `/` 开头命令不会触发。归档、AI 或发送异常时静默降级，不影响业务模块。
+`RANDOM_CHAT_ENABLED` 是旧版首次群聊默认值兼容输入；运行时实际由下文的聊天总开关、群聊子开关和群聊白名单决定。允许群内，明确 @ 机器人的文字会直接进入聊天回复；普通成员文字仍按 `RANDOM_CHAT_PROBABILITY` 概率回复，默认值 `0.10` 表示 10%。命中后会读取当前群最近 30 分钟内最多 20 条消息，按群名片、QQ 昵称、QQ号的顺序标注成员并交给 AI 理解上下文；图片使用已持久化的事实描述，不重新下载历史原图，也不读取业务数据库。机器人自身消息、空消息和 `/` 开头命令不会触发。归档、AI 或发送异常时静默降级，不影响业务模块。
 
-`TARGET_GROUP_ID` 只允许配置一个业务群号。只有该群会进入业务 NLP、业务查询、数据库写入和管理员同步；加入聊天白名单的其他群只进入聊天流程。允许聊天的群消息都会归档，不要求必须 @ 机器人；归档保存消息及相关元数据，但不会因此下载消息中的普通图片。
+`TARGET_GROUP_ID` 只允许配置一个业务群号。只有该群会进入业务 NLP、业务查询、数据库写入和管理员同步；加入聊天白名单的其他群只进入聊天流程。允许聊天的群消息都会归档，不要求必须 @ 机器人；归档模块本身只保存消息及相关元数据，不负责下载图片。独立的聊天视觉插件在启用后会下载部署后实时到达的合格群聊图片，并按上面的 7 天策略管理原图。
+
+#### 生产启用、验收与回滚
+
+以下命令在服务器 `/opt/qq-violation-bot` 中以有权管理 `qq-violation-bot.service` 的账号执行。先把 `<release-commit>` 替换为已经审核的发布提交；如果工作区不干净、提交无法快进或任一检查不是 `ok`，立即停止发布，不要覆盖现场修改。
+
+```bash
+cd /opt/qq-violation-bot
+set -euo pipefail
+RELEASE_COMMIT="${RELEASE_COMMIT:?请先执行 export RELEASE_COMMIT=审核通过的完整提交号}"
+CHANGE_ID="chat-vision-$(date +%Y%m%d-%H%M%S)"
+BACKUP_DIR="backups/$CHANGE_ID"
+
+test -z "$(git status --porcelain)"
+git fetch origin
+git rev-parse --verify "$RELEASE_COMMIT^{commit}"
+PREVIOUS_COMMIT="$(git rev-parse HEAD)"
+git branch "rollback/$CHANGE_ID" "$PREVIOUS_COMMIT"
+install -d -m 0700 "$BACKUP_DIR"
+printf '%s\n' "$PREVIOUS_COMMIT" > "$BACKUP_DIR/previous-commit.txt"
+
+systemctl stop qq-violation-bot.service
+cp -p .env "$BACKUP_DIR/env.before"
+```
+
+停服后使用 SQLite 在线备份接口复制业务库、聊天归档库和证据索引库。不存在的库会记录为 `existed: false`，回滚时不会误把它当成旧数据。
+
+```bash
+BACKUP_DIR="$BACKUP_DIR" .venv/bin/python - <<'PY'
+import json
+import os
+import sqlite3
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv('.env')
+from plugins.violation_record.config import CONFIG
+
+backup_dir = Path(os.environ['BACKUP_DIR'])
+sources = {
+    'business': CONFIG.database_path,
+    'chat_archive': CONFIG.chat_archive_path,
+    'evidence_index': CONFIG.evidence_database_path,
+}
+manifest = {}
+for name, source in sources.items():
+    source = Path(source).absolute()
+    existed = source.is_file()
+    manifest[name] = {'path': str(source), 'existed': existed}
+    if not existed:
+        continue
+    destination = backup_dir / f'{name}.sqlite3'
+    with sqlite3.connect(source) as source_db, sqlite3.connect(destination) as backup_db:
+        source_db.backup(backup_db)
+    destination.chmod(0o600)
+(backup_dir / 'database-manifest.json').write_text(
+    json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+)
+PY
+
+EVIDENCE_ROOT="evidence"
+test -d "$EVIDENCE_ROOT"
+find "$EVIDENCE_ROOT" -type f -print0 | sort -z | xargs -0 -r sha256sum \
+  > "$BACKUP_DIR/evidence.before.sha256"
+```
+
+只允许快进到审核提交，然后在视觉开关保持关闭的情况下完成兼容迁移和数据库完整性检查。该迁移只创建或升级 `chat_image_assets`，不会扫描历史归档或证据目录。
+
+```bash
+git merge --ff-only "$RELEASE_COMMIT"
+.venv/bin/pip install -r requirements.txt
+
+CHAT_VISION_ENABLED=false .venv/bin/python - <<'PY'
+from dotenv import load_dotenv
+
+load_dotenv('.env')
+from plugins.chat_vision.store import ChatVisionStore
+from plugins.violation_record.config import CONFIG
+
+ChatVisionStore(CONFIG.chat_archive_path)
+PY
+
+.venv/bin/python - <<'PY'
+import sqlite3
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv('.env')
+from plugins.violation_record.config import CONFIG
+
+for database in (CONFIG.database_path, CONFIG.chat_archive_path, CONFIG.evidence_database_path):
+    database = Path(database)
+    if not database.is_file():
+        continue
+    with sqlite3.connect(database) as connection:
+        result = connection.execute('PRAGMA quick_check').fetchone()[0]
+    print(f'{database}: {result}')
+    if result != 'ok':
+        raise SystemExit(1)
+PY
+
+find "$EVIDENCE_ROOT" -type f -print0 | sort -z | xargs -0 -r sha256sum \
+  > "$BACKUP_DIR/evidence.after-migration.sha256"
+cmp "$BACKUP_DIR/evidence.before.sha256" "$BACKUP_DIR/evidence.after-migration.sha256"
+```
+
+确认检查通过后再启用并启动。`CHAT_VISION_IMAGE_ROOT` 必须是 `data/chat_vision/` 下的目录；服务会把受控目录逐级收紧为 `0700`，原图文件保持 `0600`，任何祖先符号链接都会导致视觉摄取安全失败而不是跟随到证据目录。
+
+```bash
+sed -i 's/^CHAT_VISION_ENABLED=.*/CHAT_VISION_ENABLED=true/' .env
+grep -q '^CHAT_VISION_ENABLED=true$' .env
+systemctl start qq-violation-bot.service
+systemctl is-active --quiet qq-violation-bot.service
+journalctl -u qq-violation-bot.service -n 100 --no-pager
+```
+
+验收时在已加入 `GROUP_CHAT_ALLOWED_GROUP_IDS` 的测试群依次发送一条纯图片消息，以及一条“@机器人 + 图片”消息。纯图片是否回复仍受聊天概率影响，但两条消息中的每张图都应独立留下永久描述；第二条应立即进入视觉聊天。检查最近状态：
+
+```bash
+.venv/bin/python - <<'PY'
+import sqlite3
+
+from dotenv import load_dotenv
+
+load_dotenv('.env')
+from plugins.violation_record.config import CONFIG
+
+with sqlite3.connect(CONFIG.chat_archive_path) as connection:
+    rows = connection.execute(
+        '''SELECT group_id, message_id, ordinal, status,
+                  length(description), created_at, updated_at
+           FROM chat_image_assets
+           ORDER BY id DESC LIMIT 20'''
+    ).fetchall()
+for row in rows:
+    print(row)
+PY
+```
+
+出现错误率上升、图片路由异常或资源占用异常时，先止损而不是回滚全部机器人。下列操作只关闭视觉摄取，文字聊天和业务功能继续运行：
+
+```bash
+cd /opt/qq-violation-bot
+sed -i 's/^CHAT_VISION_ENABLED=.*/CHAT_VISION_ENABLED=false/' .env
+grep -q '^CHAT_VISION_ENABLED=false$' .env
+systemctl restart qq-violation-bot.service
+systemctl is-active --quiet qq-violation-bot.service
+```
+
+只有兼容迁移或发布代码本身有问题时才执行完整回滚。服务停稳后切换到发布前保存的回滚分支，恢复 `.env` 和三个精确数据库目标；脚本只删除这些数据库自己的 `-wal`、`-shm` 边车文件，不访问 `evidence/`。回滚后再次执行上面的 `PRAGMA quick_check`，再启动服务。
+
+```bash
+cd /opt/qq-violation-bot
+set -euo pipefail
+CHANGE_ID="${CHANGE_ID:?请先执行 export CHANGE_ID=发布时生成的变更编号}"
+BACKUP_DIR="backups/$CHANGE_ID"
+systemctl stop qq-violation-bot.service
+git switch "rollback/$CHANGE_ID"
+cp -p "$BACKUP_DIR/env.before" .env
+
+BACKUP_DIR="$BACKUP_DIR" .venv/bin/python - <<'PY'
+import json
+import os
+import shutil
+from pathlib import Path
+
+backup_dir = Path(os.environ['BACKUP_DIR'])
+manifest = json.loads((backup_dir / 'database-manifest.json').read_text(encoding='utf-8'))
+for name, item in manifest.items():
+    destination = Path(item['path'])
+    for suffix in ('-wal', '-shm'):
+        Path(f'{destination}{suffix}').unlink(missing_ok=True)
+    if item['existed']:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(backup_dir / f'{name}.sqlite3', destination)
+    else:
+        destination.unlink(missing_ok=True)
+PY
+
+find evidence -type f -print0 | sort -z | xargs -0 -r sha256sum \
+  > "$BACKUP_DIR/evidence.after-rollback.sha256"
+cmp "$BACKUP_DIR/evidence.before.sha256" "$BACKUP_DIR/evidence.after-rollback.sha256"
+
+.venv/bin/python - <<'PY'
+import sqlite3
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv('.env')
+from plugins.violation_record.config import CONFIG
+
+for database in (CONFIG.database_path, CONFIG.chat_archive_path, CONFIG.evidence_database_path):
+    database = Path(database)
+    if not database.is_file():
+        continue
+    with sqlite3.connect(database) as connection:
+        result = connection.execute('PRAGMA quick_check').fetchone()[0]
+    print(f'{database}: {result}')
+    if result != 'ok':
+        raise SystemExit(1)
+PY
+
+systemctl start qq-violation-bot.service
+systemctl is-active --quiet qq-violation-bot.service
+```
 
 萝卜猫只是角色名字，不自称猫或使用“喵”等猫系口癖；她喜欢花和植物，并把“反二梦女”视为自己的兴趣和自我标签。上下文会保留发送者 QQ、昵称、艾特对象和引用对象，避免把群友之间的话误当成对机器人说。查询、记录、减数、禁言等已识别业务始终优先于聊天回复。成功的聊天回复以 `RANDOM_CHAT_STICKER_PROBABILITY=0.20` 的概率附带最多一张表情包；指定首图在已决定附图时占 10%，其余图片均分 90%。表情包只保存在 `data/random_chat/stickers/incoming/`，不会提交到 GitHub，业务回复永不附图。
 

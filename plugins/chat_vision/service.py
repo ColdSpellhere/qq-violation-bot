@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import stat
 from collections.abc import Awaitable, Callable
@@ -7,7 +8,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import httpx
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
@@ -15,6 +15,7 @@ from plugins.violation_record.config import CONFIG
 
 from .client import describe_image
 from .download import download_chat_image, write_chat_image
+from .paths import exact_configured_root, validate_existing_managed_root
 from .store import ChatImageAsset, ChatVisionStore
 
 if TYPE_CHECKING:
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
 
 
 STORE: ChatVisionStore | None = None
+_PROCESS_CONCURRENCY = 3
+_RECOVERY_BATCH_SIZE = 50
 
 
 def set_store(store: ChatVisionStore) -> None:
@@ -36,15 +39,13 @@ def _active_store() -> ChatVisionStore:
 
 
 def _safe_root(root: Path) -> tuple[Path, Path] | None:
-    root = Path(root)
+    root = validate_existing_managed_root(root)
+    if root is None:
+        return None
     try:
-        mode = root.lstat().st_mode
-        root_resolved = root.resolve(strict=True)
+        return root, root.resolve(strict=True)
     except (OSError, RuntimeError):
         return None
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        return None
-    return root, root_resolved
 
 
 def _has_symlink_component(root: Path, relative_path: Path) -> bool:
@@ -64,7 +65,32 @@ def _has_symlink_component(root: Path, relative_path: Path) -> bool:
     return False
 
 
+def _remove_written_file(relative_path_text: str) -> None:
+    safe_root = _safe_root(CONFIG.chat_vision_root)
+    if safe_root is None:
+        return
+    root, root_resolved = safe_root
+    relative_path = Path(relative_path_text)
+    if relative_path.is_absolute() or _has_symlink_component(root, relative_path):
+        return
+    candidate = root / relative_path
+    try:
+        mode = candidate.lstat().st_mode
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return
+    if not stat.S_ISREG(mode) or not resolved.is_relative_to(root_resolved):
+        return
+    try:
+        candidate.unlink()
+    except OSError:
+        return
+
+
 async def cleanup_expired(store: ChatVisionStore, root: Path, *, now_text: str) -> None:
+    root = exact_configured_root(root, CONFIG.chat_vision_root)
+    if root is None:
+        return
     safe_root = _safe_root(root)
     if safe_root is None:
         return
@@ -164,12 +190,11 @@ async def _finish_claim(store: ChatVisionStore, asset: ChatImageAsset) -> None:
         content = _read_valid_stored_file(asset)
         mime_type = asset.mime_type
         if content is None or mime_type is None:
-            async with httpx.AsyncClient(timeout=CONFIG.chat_vision_timeout) as http_client:
-                image = await download_chat_image(
-                    asset.source_url,
-                    client=http_client,
-                    max_bytes=CONFIG.chat_vision_max_bytes,
-                )
+            image = await download_chat_image(
+                asset.source_url,
+                max_bytes=CONFIG.chat_vision_max_bytes,
+                timeout=CONFIG.chat_vision_timeout,
+            )
             relative_path, digest = write_chat_image(
                 CONFIG.chat_vision_root,
                 group_id=asset.group_id,
@@ -178,14 +203,18 @@ async def _finish_claim(store: ChatVisionStore, asset: ChatImageAsset) -> None:
                 ordinal=asset.ordinal,
                 image=image,
             )
-            store.mark_downloaded(
-                asset.id,
-                relative_path,
-                image.mime_type,
-                len(image.content),
-                digest,
-                _expiry_text(asset.event_time),
-            )
+            try:
+                store.mark_downloaded(
+                    asset.id,
+                    relative_path,
+                    image.mime_type,
+                    len(image.content),
+                    digest,
+                    _expiry_text(asset.event_time),
+                )
+            except BaseException:
+                _remove_written_file(relative_path)
+                raise
             content = image.content
             mime_type = image.mime_type
 
@@ -229,6 +258,7 @@ async def process_image_event(event: GroupMessageEvent) -> list[ChatImageAsset]:
     store = _active_store()
     group_id = int(event.group_id)
     message_id = str(event.message_id)
+    pending: list[ChatImageAsset] = []
     for ordinal, source_url in _image_segments(event):
         try:
             asset = store.ensure_pending(
@@ -238,13 +268,21 @@ async def process_image_event(event: GroupMessageEvent) -> list[ChatImageAsset]:
                 source_url,
                 int(event.time),
             )
-            await process_pending_asset(asset, store=store)
+            pending.append(asset)
         except Exception as exc:
             logger.warning(
                 "群聊图片任务创建失败 "
                 f"group_id={group_id} message_id={message_id} ordinal={ordinal} "
                 f"error={type(exc).__name__}"
             )
+    semaphore = asyncio.Semaphore(_PROCESS_CONCURRENCY)
+
+    async def process(asset: ChatImageAsset) -> None:
+        async with semaphore:
+            await process_pending_asset(asset, store=store)
+
+    if pending:
+        await asyncio.gather(*(process(asset) for asset in pending))
     return store.for_message(group_id, message_id)
 
 
@@ -253,13 +291,29 @@ async def recover_pending(
     processor: Callable[[ChatImageAsset], Awaitable[Any]],
     *,
     max_retries: int,
+    batch_size: int = _RECOVERY_BATCH_SIZE,
 ) -> None:
-    for asset in store.claimable(max_retries):
-        try:
-            await processor(asset)
-        except Exception as exc:
-            logger.warning(
-                "群聊图片恢复失败 "
-                f"group_id={asset.group_id} message_id={asset.message_id} "
-                f"ordinal={asset.ordinal} error={type(exc).__name__}"
-            )
+    after_id = 0
+    while True:
+        assets = store.claimable(
+            max_retries,
+            after_id=after_id,
+            limit=batch_size,
+        )
+        if not assets:
+            return
+        semaphore = asyncio.Semaphore(_PROCESS_CONCURRENCY)
+
+        async def process(asset: ChatImageAsset) -> None:
+            async with semaphore:
+                try:
+                    await processor(asset)
+                except Exception as exc:
+                    logger.warning(
+                        "群聊图片恢复失败 "
+                        f"group_id={asset.group_id} message_id={asset.message_id} "
+                        f"ordinal={asset.ordinal} error={type(exc).__name__}"
+                    )
+
+        await asyncio.gather(*(process(asset) for asset in assets))
+        after_id = max(asset.id for asset in assets)

@@ -36,6 +36,13 @@ def has_image(event: GroupMessageEvent) -> bool:
     return any(segment.type == "image" for segment in event.message)
 
 
+def replied_message_has_image(event: GroupMessageEvent) -> bool:
+    reply = event.reply
+    if reply is None:
+        return False
+    return any(segment.type == "image" for segment in reply.message)
+
+
 @group_matcher.handle()
 async def route_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     group_id = int(event.group_id)
@@ -46,7 +53,7 @@ async def route_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         group_id == CONFIG.target_group_id
         and FEATURES.business_allowed(group_id, CONFIG.target_group_id)
         and addressed
-        and (text or not has_image(event))
+        and (text or not (has_image(event) or replied_message_has_image(event)))
         and await handle_business_message(bot, event, text)
     ):
         return

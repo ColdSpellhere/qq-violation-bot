@@ -5,14 +5,17 @@ import ipaddress
 import os
 import re
 import socket
+import ssl
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
-import httpx
+import httpcore
+
+from .paths import ensure_private_managed_root
 
 
 _IMAGE_EXTENSIONS = {
@@ -57,12 +60,71 @@ def _valid_signature(content: bytes, mime_type: str) -> bool:
     return checks.get(mime_type, False)
 
 
+class PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Connect only to the public addresses approved before the request."""
+
+    def __init__(
+        self,
+        expected_host: str,
+        addresses: tuple[str, ...],
+        *,
+        backend: httpcore.AsyncNetworkBackend | Any | None = None,
+    ) -> None:
+        self.expected_host = expected_host.casefold()
+        self.addresses = addresses
+        self.backend = backend or httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options=None,
+    ):
+        if host.casefold() != self.expected_host:
+            raise ValueError("chat image connection host changed")
+        last_error: BaseException | None = None
+        for address in self.addresses:
+            try:
+                stream = await self.backend.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except BaseException as exc:
+                last_error = exc
+                continue
+            peer = stream.get_extra_info("server_addr")
+            peer_address = str(peer[0]) if isinstance(peer, tuple) and peer else ""
+            if (
+                not peer_address
+                or not _is_public_address(peer_address)
+                or ipaddress.ip_address(peer_address) != ipaddress.ip_address(address)
+            ):
+                await stream.aclose()
+                raise ValueError("chat image connection peer was not the pinned public address")
+            return stream
+        if last_error is not None:
+            raise last_error
+        raise ValueError("chat image URL has no usable public address")
+
+    async def connect_unix_socket(self, *args, **kwargs):
+        raise ValueError("chat image Unix sockets are not allowed")
+
+    async def sleep(self, seconds: float) -> None:
+        await self.backend.sleep(seconds)
+
+
 async def download_chat_image(
     url: str,
     *,
-    client: httpx.AsyncClient,
     max_bytes: int,
+    timeout: float,
     resolver: Callable[[str], list[str]] = _default_resolver,
+    network_backend: httpcore.AsyncNetworkBackend | Any | None = None,
 ) -> DownloadedChatImage:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -70,27 +132,64 @@ async def download_chat_image(
     if max_bytes <= 0:
         raise ValueError("chat image size limit must be positive")
 
-    addresses = resolver(parsed.hostname)
+    addresses = tuple(dict.fromkeys(resolver(parsed.hostname)))
     if not addresses or any(not _is_public_address(address) for address in addresses):
         raise ValueError("chat image URL resolves to a non-public address")
 
+    pinned_backend = PinnedNetworkBackend(
+        parsed.hostname,
+        addresses,
+        backend=network_backend,
+    )
+    pool = httpcore.AsyncConnectionPool(
+        ssl_context=ssl.create_default_context(),
+        max_connections=1,
+        max_keepalive_connections=0,
+        http1=True,
+        http2=False,
+        retries=0,
+        network_backend=pinned_backend,
+    )
+    default_port = 443 if parsed.scheme == "https" else 80
+    host_header = parsed.hostname
+    if parsed.port is not None and parsed.port != default_port:
+        host_header = f"{host_header}:{parsed.port}"
+    request_timeout = {
+        "connect": timeout,
+        "read": timeout,
+        "write": timeout,
+        "pool": timeout,
+    }
     try:
-        async with client.stream("GET", url, follow_redirects=False) as response:
-            if response.is_redirect:
-                raise ValueError("chat image redirects are not allowed")
-            response.raise_for_status()
-            mime_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-            extension = _IMAGE_EXTENSIONS.get(mime_type)
-            if extension is None:
-                raise ValueError("chat image payload is not a supported image")
-            content = bytearray()
-            async for chunk in response.aiter_bytes():
-                content.extend(chunk)
-                if len(content) > max_bytes:
-                    raise ValueError("chat image exceeds size limit")
-    except httpx.HTTPStatusError:
-        raise ValueError("chat image HTTP status error") from None
-    except httpx.HTTPError:
+        async with pool:
+            async with pool.stream(
+                "GET",
+                url,
+                headers=[(b"Host", host_header.encode("ascii")), (b"Accept", b"image/*")],
+                extensions={"timeout": request_timeout},
+            ) as response:
+                if 300 <= response.status < 400:
+                    raise ValueError("chat image redirects are not allowed")
+                if not 200 <= response.status < 300:
+                    raise ValueError("chat image HTTP status error")
+                headers = {
+                    key.decode("latin-1").casefold(): value.decode("latin-1")
+                    for key, value in response.headers
+                }
+                mime_type = headers.get("content-type", "").split(";", 1)[0].lower()
+                extension = _IMAGE_EXTENSIONS.get(mime_type)
+                if extension is None:
+                    raise ValueError("chat image payload is not a supported image")
+                content = bytearray()
+                async for chunk in response.aiter_stream():
+                    content.extend(chunk)
+                    if len(content) > max_bytes:
+                        raise ValueError("chat image exceeds size limit")
+    except ValueError:
+        raise
+    except (httpcore.NetworkError, httpcore.TimeoutException, httpcore.ProtocolError):
+        raise ValueError("chat image request failed") from None
+    except Exception:
         raise ValueError("chat image request failed") from None
 
     payload = bytes(content)
@@ -99,10 +198,11 @@ async def download_chat_image(
     return DownloadedChatImage(payload, mime_type, extension)
 
 
-def _create_directory(path: Path, *, parents: bool = False) -> None:
-    path.mkdir(parents=parents, exist_ok=True)
+def _create_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, exist_ok=True)
     if path.is_symlink() or not path.is_dir():
         raise ValueError("chat image destination contains a symlink")
+    os.chmod(path, 0o700)
 
 
 def write_chat_image(
@@ -124,8 +224,7 @@ def write_chat_image(
     if not _valid_signature(image.content, image.mime_type):
         raise ValueError("chat image payload is not a supported image")
 
-    root = Path(root)
-    _create_directory(root, parents=True)
+    root = ensure_private_managed_root(Path(root))
     root_resolved = root.resolve()
     date_text = datetime.fromtimestamp(event_time, UTC).date().isoformat()
     group_directory = root / str(group_id)

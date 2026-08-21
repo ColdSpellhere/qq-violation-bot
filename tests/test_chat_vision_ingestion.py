@@ -159,6 +159,119 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
             [self.config.chat_vision_max_bytes, self.config.chat_vision_max_bytes],
             [item.kwargs["max_bytes"] for item in download.await_args_list],
         )
+        self.assertEqual(
+            [self.config.chat_vision_timeout, self.config.chat_vision_timeout],
+            [item.kwargs["timeout"] for item in download.await_args_list],
+        )
+
+    async def test_all_ordinals_exist_before_the_first_network_call(self) -> None:
+        event = _event(
+            _image("https://cdn.example/one.jpg"),
+            _image("https://cdn.example/two.jpg"),
+            _image("https://cdn.example/three.jpg"),
+        )
+
+        observed_ordinals: list[list[int]] = []
+
+        async def cancelled_download(*args, **kwargs):
+            observed_ordinals.append(
+                [
+                    asset.ordinal
+                    for asset in self.store.for_message(GROUP_ID, "456")
+                ]
+            )
+            raise asyncio.CancelledError
+
+        with (
+            patch.object(service, "STORE", self.store),
+            patch.object(service, "CONFIG", self.config),
+            patch.object(service, "download_chat_image", new=cancelled_download),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await service.process_image_event(event)
+
+        self.assertTrue(observed_ordinals)
+        self.assertTrue(
+            all(ordinals == [1, 2, 3] for ordinals in observed_ordinals)
+        )
+        self.assertEqual(
+            [1, 2, 3],
+            [asset.ordinal for asset in self.store.for_message(GROUP_ID, "456")],
+        )
+
+    async def test_processing_uses_small_bounded_concurrency_for_all_images(self) -> None:
+        event = _event(
+            *(
+                _image(f"https://cdn.example/{ordinal}.jpg")
+                for ordinal in range(1, 7)
+            )
+        )
+        active = 0
+        maximum_active = 0
+        release = asyncio.Event()
+
+        async def download(*args, **kwargs):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if maximum_active >= 3:
+                release.set()
+            await asyncio.wait_for(release.wait(), timeout=1)
+            await asyncio.sleep(0)
+            active -= 1
+            return DownloadedChatImage(JPEG_ONE, "image/jpeg", "jpg")
+
+        with (
+            patch.object(service, "STORE", self.store),
+            patch.object(service, "CONFIG", self.config),
+            patch.object(service, "download_chat_image", new=download),
+            patch.object(
+                service,
+                "describe_image",
+                new=AsyncMock(return_value="图片"),
+            ),
+        ):
+            assets = await service.process_image_event(event)
+
+        self.assertEqual(3, maximum_active)
+        self.assertEqual(6, len(assets))
+        self.assertTrue(all(asset.status == "ready" for asset in assets))
+
+    async def test_concurrent_duplicate_events_claim_each_ordinal_once(self) -> None:
+        event = _event(
+            _image("https://cdn.example/one.jpg"),
+            _image("https://cdn.example/two.jpg"),
+        )
+        started = 0
+        barrier = asyncio.Event()
+
+        async def download(*args, **kwargs):
+            nonlocal started
+            started += 1
+            if started == 2:
+                barrier.set()
+            await asyncio.wait_for(barrier.wait(), timeout=1)
+            return DownloadedChatImage(JPEG_ONE, "image/jpeg", "jpg")
+
+        with (
+            patch.object(service, "STORE", self.store),
+            patch.object(service, "CONFIG", self.config),
+            patch.object(service, "download_chat_image", new=download),
+            patch.object(
+                service,
+                "describe_image",
+                new=AsyncMock(return_value="图片"),
+            ) as describe,
+        ):
+            first, second = await asyncio.gather(
+                service.process_image_event(event),
+                service.process_image_event(event),
+            )
+
+        self.assertEqual(2, started)
+        self.assertEqual(2, describe.await_count)
+        self.assertEqual([1, 1], [asset.attempts for asset in first])
+        self.assertEqual([1, 1], [asset.attempts for asset in second])
 
     async def test_message_without_images_creates_no_rows(self) -> None:
         with (
@@ -224,17 +337,109 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
         download.assert_awaited_once()
         self.assertEqual(2, describe.await_count)
 
+    async def test_mark_downloaded_failure_removes_the_just_written_file(self) -> None:
+        event = _event(_image("https://cdn.example/one.jpg"))
+        with (
+            patch.object(service, "STORE", self.store),
+            patch.object(service, "CONFIG", self.config),
+            patch.object(
+                service,
+                "download_chat_image",
+                new=AsyncMock(
+                    return_value=DownloadedChatImage(
+                        JPEG_ONE,
+                        "image/jpeg",
+                        "jpg",
+                    )
+                ),
+            ),
+            patch.object(
+                self.store,
+                "mark_downloaded",
+                side_effect=RuntimeError("database write failed"),
+            ),
+            patch.object(service, "describe_image", new=AsyncMock()) as describe,
+        ):
+            assets = await service.process_image_event(event)
+
+        self.assertEqual("failed", assets[0].status)
+        self.assertEqual(
+            [],
+            [path for path in self.config.chat_vision_root.rglob("*") if path.is_file()],
+        )
+        describe.assert_not_awaited()
+
+    async def test_mark_downloaded_failure_never_unlinks_outside_the_managed_root(
+        self,
+    ) -> None:
+        evidence_root = self.root / "evidence"
+        evidence_root.mkdir()
+        sentinel = evidence_root / "keep.jpg"
+        sentinel.write_bytes(b"evidence")
+        self.config.chat_vision_root.mkdir(parents=True)
+        event = _event(_image("https://cdn.example/one.jpg"))
+        with (
+            patch.object(service, "STORE", self.store),
+            patch.object(service, "CONFIG", self.config),
+            patch.object(
+                service,
+                "download_chat_image",
+                new=AsyncMock(
+                    return_value=DownloadedChatImage(
+                        JPEG_ONE,
+                        "image/jpeg",
+                        "jpg",
+                    )
+                ),
+            ),
+            patch.object(
+                service,
+                "write_chat_image",
+                return_value=(
+                    "../../../evidence/keep.jpg",
+                    "synthetic-digest",
+                ),
+            ),
+            patch.object(
+                self.store,
+                "mark_downloaded",
+                side_effect=RuntimeError("database write failed"),
+            ),
+        ):
+            await service.process_image_event(event)
+
+        self.assertEqual(b"evidence", sentinel.read_bytes())
+
     async def test_recovery_reads_only_store_claimable_rows(self) -> None:
-        pending = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+        pending = [
+            SimpleNamespace(id=1),
+            SimpleNamespace(id=2),
+            SimpleNamespace(id=3),
+        ]
         store = MagicMock()
-        store.claimable.return_value = pending
+        store.claimable.side_effect = [pending[:2], pending[2:], []]
         processor = AsyncMock()
 
         with patch("plugins.chat_archive.db.recent_text_context") as archive_scan:
-            await service.recover_pending(store, processor, max_retries=3)
+            await service.recover_pending(
+                store,
+                processor,
+                max_retries=3,
+                batch_size=2,
+            )
 
-        store.claimable.assert_called_once_with(3)
-        self.assertEqual([call(pending[0]), call(pending[1])], processor.await_args_list)
+        self.assertEqual(
+            [
+                call(3, after_id=0, limit=2),
+                call(3, after_id=2, limit=2),
+                call(3, after_id=3, limit=2),
+            ],
+            store.claimable.call_args_list,
+        )
+        self.assertEqual(
+            [call(pending[0]), call(pending[1]), call(pending[2])],
+            processor.await_args_list,
+        )
         archive_scan.assert_not_called()
 
 
@@ -258,6 +463,21 @@ class FakeDriver:
     async def shutdown(self) -> None:
         assert self.shutdown_callback is not None
         await self.shutdown_callback()
+
+
+class RetainingFakeDriver(FakeDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.startup_callbacks = []
+        self.shutdown_callbacks = []
+
+    def on_startup(self, callback):
+        self.startup_callbacks.append(callback)
+        return super().on_startup(callback)
+
+    def on_shutdown(self, callback):
+        self.shutdown_callbacks.append(callback)
+        return super().on_shutdown(callback)
 
 
 class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -379,6 +599,15 @@ class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(first, second)
         self.assertEqual(1, started)
         self.assertTrue(first.cancelled())
+
+    async def test_setup_registers_only_one_callback_pair_per_driver(self) -> None:
+        driver = RetainingFakeDriver()
+        with patch.object(lifecycle, "get_driver", return_value=driver):
+            lifecycle.setup_lifecycle()
+            lifecycle.setup_lifecycle()
+
+        self.assertEqual(1, len(driver.startup_callbacks))
+        self.assertEqual(1, len(driver.shutdown_callbacks))
 
 
 if __name__ == "__main__":
