@@ -109,7 +109,7 @@ def _list_allowlist(kind: str, label: str, controller: FeatureController) -> str
 
 
 def _is_positive_numeric_id(value: str) -> bool:
-    return value.isdigit() and int(value) > 0
+    return value.isascii() and value.isdigit() and int(value) > 0
 
 
 def _switch_text(enabled: bool) -> str:

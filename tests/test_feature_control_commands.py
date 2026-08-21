@@ -156,6 +156,22 @@ class FeatureControlCommandTests(unittest.TestCase):
             execute_control_command("/未知 开", self.controller, "1"),
         )
 
+    def test_rejects_non_ascii_allowlist_ids_without_mutating_state(self) -> None:
+        invalid_commands = (
+            ("/群聊群 添加 ²", "群号必须为正整数。"),
+            ("/群聊群 添加 ٣", "群号必须为正整数。"),
+            ("/私聊用户 添加 ²", "QQ号必须为正整数。"),
+            ("/私聊用户 添加 ٣", "QQ号必须为正整数。"),
+        )
+
+        for command, response in invalid_commands:
+            self.assertEqual(
+                response,
+                execute_control_command(command, self.controller, "1"),
+            )
+        self.assertEqual((100,), self.controller.snapshot().group_chat_allowed_group_ids)
+        self.assertEqual(("200",), self.controller.snapshot().private_chat_allowed_user_ids)
+
 
 class FeatureControlMatcherTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_superuser_is_rejected_without_mutating_state(self) -> None:
