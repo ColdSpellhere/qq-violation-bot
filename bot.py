@@ -17,6 +17,7 @@ nonebot.load_plugin("plugins.feature_control.matcher")
 nonebot.load_plugin("plugins.chat_archive")
 nonebot.load_plugin("plugins.member_memory.matcher")
 nonebot.load_plugin("plugins.random_chat")
+nonebot.load_plugin("plugins.chat_vision")
 nonebot.load_plugin("plugins.group_router")
 nonebot.load_plugin("plugins.private_chat")
 

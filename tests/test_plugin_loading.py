@@ -29,6 +29,7 @@ loaded_modules = {plugin.module_name for plugin in nonebot.get_loaded_plugins()}
 required = {
     "violation_record",
     "chat_archive",
+    "chat_vision",
     "random_chat",
     "private_chat",
     "feature_control",
@@ -47,6 +48,11 @@ if "plugins.feature_control.matcher" not in loaded_modules:
         "missing loaded plugin module: plugins.feature_control.matcher; "
         f"loaded_modules={sorted(loaded_modules)}"
     )
+if "plugins.chat_vision" not in loaded_modules:
+    raise SystemExit(
+        "missing loaded plugin module: plugins.chat_vision; "
+        f"loaded_modules={sorted(loaded_modules)}"
+    )
 registered = {
     (priority, matcher.module.__name__)
     for priority, priority_matchers in matchers.items()
@@ -55,6 +61,7 @@ registered = {
 expected_background = {
     (1, "plugins.chat_archive.matcher"),
     (2, "plugins.member_memory.matcher"),
+    (2, "plugins.chat_vision.matcher"),
 }
 if not expected_background.issubset(registered):
     raise SystemExit(f"missing background matcher priorities: {sorted(registered)}")
