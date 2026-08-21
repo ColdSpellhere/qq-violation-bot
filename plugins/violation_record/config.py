@@ -76,6 +76,15 @@ def _database_path(url: str) -> Path:
     return DATA_DIR / "violation_records.db"
 
 
+def _chat_vision_root_env() -> Path:
+    allowed_root = (DATA_DIR / "chat_vision").resolve()
+    raw = Path(os.getenv("CHAT_VISION_IMAGE_ROOT", "data/chat_vision/images"))
+    configured = (raw if raw.is_absolute() else BASE_DIR / raw).resolve()
+    if not configured.is_relative_to(allowed_root):
+        raise RuntimeError("CHAT_VISION_IMAGE_ROOT must stay under data/chat_vision")
+    return configured
+
+
 _TARGET_GROUP_ID = _target_group_id_env()
 legacy_private_ids = _string_id_tuple_env("PRIVATE_CHAT_ALLOWED_USER_ID", ())
 legacy_group_chat_config = (
@@ -96,6 +105,15 @@ class AppConfig:
     evidence_database_path: Path = DATA_DIR / "evidence.db"
     evidence_root: Path = BASE_DIR / "evidence"
     evidence_required: bool = _bool_env("EVIDENCE_REQUIRED", False)
+    chat_vision_enabled: bool = _bool_env("CHAT_VISION_ENABLED", False)
+    chat_vision_model: str = os.getenv(
+        "CHAT_VISION_MODEL", "deepseek-v4-flash-vision-exp"
+    ).strip()
+    chat_vision_root: Path = _chat_vision_root_env()
+    chat_vision_retention_days: int = max(1, _int_env("CHAT_VISION_RETENTION_DAYS", 7))
+    chat_vision_max_bytes: int = max(1, _int_env("CHAT_VISION_MAX_BYTES", 10 * 1024 * 1024))
+    chat_vision_timeout: int = max(1, _int_env("CHAT_VISION_TIMEOUT", 60))
+    chat_vision_max_retries: int = max(1, _int_env("CHAT_VISION_MAX_RETRIES", 3))
     mute_enabled: bool = _bool_env("MUTE_ENABLED", False)
     deduction_policy_v102_enabled: bool = _bool_env(
         "DEDUCTION_POLICY_V102_ENABLED", False

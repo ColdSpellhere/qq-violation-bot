@@ -213,6 +213,43 @@ class FeatureControllerTests(unittest.TestCase):
 
         self.assertEqual(0, completed.returncode, completed.stderr)
 
+    def test_chat_vision_configuration_defaults_are_isolated_from_evidence(self):
+        environment = os.environ.copy()
+        environment["TARGET_GROUP_ID"] = "999000111"
+        for key in (
+            "CHAT_VISION_ENABLED",
+            "CHAT_VISION_MODEL",
+            "CHAT_VISION_IMAGE_ROOT",
+            "CHAT_VISION_RETENTION_DAYS",
+            "CHAT_VISION_MAX_BYTES",
+            "CHAT_VISION_TIMEOUT",
+            "CHAT_VISION_MAX_RETRIES",
+        ):
+            environment.pop(key, None)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from plugins.violation_record.config import CONFIG; "
+                    "assert CONFIG.chat_vision_enabled is False; "
+                    "assert CONFIG.chat_vision_model == 'deepseek-v4-flash-vision-exp'; "
+                    "assert CONFIG.chat_vision_retention_days == 7; "
+                    "assert CONFIG.chat_vision_max_bytes == 10 * 1024 * 1024; "
+                    "assert CONFIG.chat_vision_root.name == 'images'; "
+                    "assert CONFIG.chat_vision_root.parent.name == 'chat_vision'; "
+                    "assert CONFIG.chat_vision_root != CONFIG.evidence_root"
+                ),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
