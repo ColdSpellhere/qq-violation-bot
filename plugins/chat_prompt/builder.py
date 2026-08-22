@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-from .budget import apply_prompt_budget, prompt_data_chars
+from .budget import apply_prompt_budget
 from .models import (
     BudgetedPromptData,
     ChatPromptInput,
@@ -47,9 +47,6 @@ def _system_text(data: BudgetedPromptData) -> str:
         + "\n"
         + scene
         + "\n表达要求：接住具体内容，像熟悉的人自然聊天；不编造身份、现实经历、聊天事实或已完成动作。"
-        + "\n<persona_data>"
-        + _escape(data.persona)
-        + "</persona_data>"
     )
 
 
@@ -82,6 +79,7 @@ def _user_text(data: BudgetedPromptData) -> str:
     return "\n".join(
         (
             "当前时间：" + _escape(data.now_text),
+            _section("persona_data", data.persona),
             _section("history_data", data.context),
             _section("member_memory_data", data.facts),
             _section("relationship_data", data.relationship),
@@ -109,19 +107,23 @@ def _render(data: BudgetedPromptData) -> RenderedPrompt:
 def build_chat_prompt(
     source: ChatPromptInput, budget: PromptBudget = PromptBudget()
 ) -> RenderedPrompt:
-    allowed_data = budget.total_chars
-    data = apply_prompt_budget(source, replace(budget, total_chars=allowed_data))
-    for _ in range(12):
+    best: RenderedPrompt | None = None
+    low = 1
+    high = budget.total_chars
+    while low <= high:
+        allowed_data = (low + high) // 2
+        data = apply_prompt_budget(
+            source, replace(budget, total_chars=allowed_data)
+        )
         rendered = _render(data)
         if rendered.total_chars <= budget.total_chars:
-            return rendered
-        excess = rendered.total_chars - budget.total_chars
-        next_allowed = prompt_data_chars(data) - excess
-        if next_allowed <= 0 or next_allowed >= allowed_data:
-            raise ValueError("total budget is too small for fixed chat safety rules")
-        allowed_data = next_allowed
-        data = apply_prompt_budget(source, replace(budget, total_chars=allowed_data))
-    raise ValueError("could not satisfy deterministic prompt budget")
+            best = rendered
+            low = allowed_data + 1
+        else:
+            high = allowed_data - 1
+    if best is None:
+        raise ValueError("total budget is too small for fixed chat safety rules")
+    return best
 
 
 __all__ = ["build_chat_prompt"]
