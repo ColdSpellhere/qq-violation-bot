@@ -8,6 +8,20 @@ from typing import Any
 
 import httpx
 
+from plugins.feature_control.runtime import FEATURES
+from plugins.llm_gateway import get_gateway
+from plugins.llm_gateway.errors import (
+    GatewayAuthenticationError,
+    GatewayClientError,
+    GatewayConfigurationError,
+    GatewayContractError,
+    GatewayEmptyContentError,
+    GatewayError,
+    GatewayRateLimitError,
+    GatewayServerError,
+    GatewayTimeout,
+    GatewayTransportError,
+)
 from plugins.violation_record.config import CONFIG
 
 from .models import PrivateFactCandidate, PrivateMessage, RelationshipState
@@ -80,18 +94,28 @@ def _strict_object(
     return value
 
 
-def _bounded_text(value: Any, *, maximum: int, allow_empty: bool = True) -> str:
+def _bounded_text(
+    value: Any,
+    *,
+    maximum: int,
+    allow_empty: bool = True,
+    reject_overflow: bool = False,
+) -> str:
     if not isinstance(value, str):
         raise ContractError()
     compact = " ".join(value.split())
     if not allow_empty and not compact:
         raise ContractError()
+    if reject_overflow and len(compact) > maximum:
+        raise ContractError("value_too_long")
     return compact[:maximum]
 
 
 def _parse_summary(content: str) -> str:
     parsed = _strict_object(content, fields={"summary"})
-    return _bounded_text(parsed["summary"], maximum=600, allow_empty=False)
+    return _bounded_text(
+        parsed["summary"], maximum=600, allow_empty=False, reject_overflow=True
+    )
 
 
 def _parse_facts(content: str, *, user_id: str) -> tuple[PrivateFactCandidate, ...]:
@@ -142,11 +166,19 @@ def _parse_relationship(content: str) -> RelationshipCandidate:
     if not isinstance(topics, list) or len(topics) > MAX_OPEN_TOPICS:
         raise ContractError()
     bounded_topics = tuple(
-        _bounded_text(item, maximum=MAX_OPEN_TOPIC_LENGTH, allow_empty=False)
+        _bounded_text(
+            item,
+            maximum=MAX_OPEN_TOPIC_LENGTH,
+            allow_empty=False,
+            reject_overflow=True,
+        )
         for item in topics
     )
     state_text = _bounded_text(
-        parsed["state_text"], maximum=MAX_STATE_TEXT_LENGTH, allow_empty=True
+        parsed["state_text"],
+        maximum=MAX_STATE_TEXT_LENGTH,
+        allow_empty=True,
+        reject_overflow=True,
     )
     if certainty == "uncertain" and state_text and not any(
         marker in state_text for marker in _UNCERTAIN_MARKERS
@@ -156,15 +188,19 @@ def _parse_relationship(content: str) -> RelationshipCandidate:
         state_text=state_text,
         open_topics=bounded_topics,
         preferred_address=_bounded_text(
-            parsed["preferred_address"], maximum=MAX_PREFERRED_ADDRESS_LENGTH
+            parsed["preferred_address"],
+            maximum=MAX_PREFERRED_ADDRESS_LENGTH,
+            reject_overflow=True,
         ),
         communication_style=_bounded_text(
-            parsed["communication_style"], maximum=MAX_COMMUNICATION_STYLE_LENGTH
+            parsed["communication_style"],
+            maximum=MAX_COMMUNICATION_STYLE_LENGTH,
+            reject_overflow=True,
         ),
     )
 
 
-async def _complete(*, system: str, user: str) -> str:
+async def _legacy_complete(*, system: str, user: str) -> str:
     if not CONFIG.ai_api_key:
         raise TransportError("configuration_error", retryable=False)
     payload = {
@@ -199,6 +235,109 @@ async def _complete(*, system: str, user: str) -> str:
     return content
 
 
+def _map_gateway_error(error: GatewayError) -> PrivateMemoryAIError:
+    if isinstance(error, GatewayConfigurationError):
+        # The background worker can run before the Gateway startup hook or while
+        # an operator is repairing configuration. Keep its durable job retryable.
+        return TransportError("configuration_error", retryable=True)
+    if isinstance(error, GatewayAuthenticationError):
+        return TransportError("auth_error", retryable=False)
+    if isinstance(error, GatewayTimeout):
+        return TransportError("request_timeout", retryable=True)
+    if isinstance(error, GatewayTransportError):
+        return TransportError("transport_error", retryable=True)
+    if isinstance(error, GatewayRateLimitError):
+        return TransportError("rate_limited", retryable=True)
+    if isinstance(error, GatewayServerError):
+        return TransportError("server_error", retryable=True)
+    if isinstance(error, GatewayClientError):
+        return TransportError("client_error", retryable=False)
+    if isinstance(error, GatewayEmptyContentError):
+        return ContractError("empty_response")
+    if isinstance(error, GatewayContractError):
+        return ContractError("response_contract_error")
+    return TransportError("gateway_error", retryable=False)
+
+
+async def _complete(
+    *, task: str, messages: tuple[dict[str, object], dict[str, object]]
+) -> str:
+    if not FEATURES.llm_gateway_allowed("private_memory"):
+        return await _legacy_complete(
+            system=str(messages[0]["content"]), user=str(messages[1]["content"])
+        )
+    try:
+        gateway = await get_gateway()
+        if task == "private_summary":
+            return await gateway.summarize_private_conversation(messages)
+        if task == "relationship":
+            return await gateway.update_relationship_state(messages)
+        raise ValueError("unknown private memory gateway task")
+    except GatewayError as exc:
+        raise _map_gateway_error(exc) from exc
+
+
+def _summary_messages(
+    previous: str, messages: Sequence[PrivateMessage]
+) -> tuple[dict[str, object], dict[str, object]]:
+    return (
+        {
+            "role": "system",
+            "content": (
+                "合并私聊旧摘要和新消息，只保留明确内容，不推测、不记录口令、令牌或私密凭据。"
+                "只输出严格 JSON：{\"summary\":\"不超过600字的滚动摘要\"}。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "previous_summary": previous,
+                    "messages": json.loads(_messages_payload(messages)),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
+    )
+
+
+def _relationship_messages(
+    current: RelationshipState | None, messages: Sequence[PrivateMessage]
+) -> tuple[dict[str, object], dict[str, object]]:
+    current_payload: Mapping[str, Any] | None = None
+    if current is not None:
+        current_payload = {
+            "state_text": current.state_text,
+            "open_topics": current.open_topics,
+            "preferred_address": current.preferred_address,
+            "communication_style": current.communication_style,
+        }
+    return (
+        {
+            "role": "system",
+            "content": (
+                "更新聊天关系状态，只描述互动方式、熟悉程度和未完话题，不生成事实、心理诊断或"
+                "业务判断。推测必须标为 uncertain 并保留可能/似乎等不确定措辞。只输出严格 JSON："
+                "{\"state_text\":\"...\",\"open_topics\":[\"...\"],"
+                "\"preferred_address\":\"\",\"communication_style\":\"\","
+                "\"certainty\":\"explicit|uncertain\"}。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "current": current_payload,
+                    "messages": json.loads(_messages_payload(messages)),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
+    )
+
+
 def _messages_payload(messages: Sequence[PrivateMessage]) -> str:
     return json.dumps(
         [
@@ -222,18 +361,8 @@ async def summarize_private_conversation(
         return None
     try:
         content = await _complete(
-            system=(
-                "合并私聊旧摘要和新消息，只保留明确内容，不推测、不记录口令、令牌或私密凭据。"
-                "只输出严格 JSON：{\"summary\":\"不超过600字的滚动摘要\"}。"
-            ),
-            user=json.dumps(
-                {
-                    "previous_summary": previous,
-                    "messages": json.loads(_messages_payload(messages)),
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
+            task="private_summary",
+            messages=_summary_messages(previous, messages),
         )
         return _parse_summary(content)
     except PrivateMemoryAIError as exc:
@@ -248,7 +377,7 @@ async def extract_private_facts(
         return ()
     user_id = messages[0].user_id
     try:
-        content = await _complete(
+        content = await _legacy_complete(
             system=(
                 "保守提取说话者本人明确表达、未来仍有用的稳定非敏感事实。拒绝推测、情绪、评价、"
                 "密码、令牌、密钥和其他凭据。source_message_id 和 source_quote 必须来自输入。"
@@ -269,31 +398,10 @@ async def generate_relationship_candidate(
 ) -> RelationshipCandidate | None:
     if not messages:
         return None
-    current_payload: Mapping[str, Any] | None = None
-    if current is not None:
-        current_payload = {
-            "state_text": current.state_text,
-            "open_topics": current.open_topics,
-            "preferred_address": current.preferred_address,
-            "communication_style": current.communication_style,
-        }
     try:
         content = await _complete(
-            system=(
-                "更新聊天关系状态，只描述互动方式、熟悉程度和未完话题，不生成事实、心理诊断或"
-                "业务判断。推测必须标为 uncertain 并保留可能/似乎等不确定措辞。只输出严格 JSON："
-                "{\"state_text\":\"...\",\"open_topics\":[\"...\"],"
-                "\"preferred_address\":\"\",\"communication_style\":\"\","
-                "\"certainty\":\"explicit|uncertain\"}。"
-            ),
-            user=json.dumps(
-                {
-                    "current": current_payload,
-                    "messages": json.loads(_messages_payload(messages)),
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
+            task="relationship",
+            messages=_relationship_messages(current, messages),
         )
         return _parse_relationship(content)
     except PrivateMemoryAIError as exc:
