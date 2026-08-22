@@ -21,6 +21,9 @@ SENSITIVE_KEYS = (
 )
 TOKEN_RE = re.compile(r"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})")
 PRIVATE_KEY_RE = re.compile(r"BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY")
+TOKEN_BYTES_RE = re.compile(rb"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})")
+PRIVATE_KEY_BYTES_RE = re.compile(rb"BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY")
+MAX_SCAN_BYTES = 20 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,31 @@ def scan_text(
     return findings
 
 
+def scan_bytes(
+    path: str,
+    raw: bytes,
+    runtime_values: dict[str, str],
+    *,
+    blob_oid: str = "",
+    historical: bool = False,
+) -> list[str]:
+    if len(raw) > MAX_SCAN_BYTES:
+        return [f"{path}: file exceeds scan size limit"]
+    findings: list[str] = []
+    if TOKEN_BYTES_RE.search(raw):
+        findings.append(f"{path}: generic API token")
+    if PRIVATE_KEY_BYTES_RE.search(raw):
+        findings.append(f"{path}: private key material")
+    findings.extend(
+        f"{path}: runtime value for {key}"
+        for key, value in runtime_values.items()
+        if value and value.encode("utf-8") in raw
+    )
+    if historical:
+        return filter_historical_findings(path, blob_oid, findings)
+    return findings
+
+
 def _runtime_values() -> dict[str, str]:
     env_path = ROOT / ".env"
     if not env_path.exists():
@@ -137,14 +165,10 @@ def _tracked_entries(ref: str) -> list[tuple[str, str]]:
     return entries
 
 
-def _text_at(path: str, ref: str | None = None) -> str | None:
+def _bytes_at(path: str, ref: str | None = None) -> bytes:
     if ref:
-        raw = _git("show", f"{ref}:{path}", text=False).stdout
-    else:
-        raw = (ROOT / path).read_bytes()
-    if b"\x00" in raw:
-        return None
-    return raw.decode("utf-8", errors="replace")
+        return _git("show", f"{ref}:{path}", text=False).stdout
+    return (ROOT / path).read_bytes()
 
 
 def scan_ref(
@@ -164,18 +188,12 @@ def scan_ref(
             if identity in seen_history:
                 continue
             seen_history.add(identity)
-        text = _text_at(path, ref) if ref is None else _git(
+        raw = _bytes_at(path, ref) if ref is None else _git(
             "cat-file", "blob", blob_oid, text=False
         ).stdout
-        if isinstance(text, bytes):
-            if b"\x00" in text:
-                continue
-            text = text.decode("utf-8", errors="replace")
-        if text is None:
-            continue
-        item_findings = scan_text(
+        item_findings = scan_bytes(
             path,
-            text,
+            raw,
             runtime_values,
             blob_oid=blob_oid,
             historical=ref is not None,

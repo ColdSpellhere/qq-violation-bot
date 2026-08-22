@@ -110,6 +110,28 @@ class PublicSourceBoundaryTests(unittest.TestCase):
             key: values.get(key) for key in CHAT_VISION_EXAMPLE_DEFAULTS
         })
 
+    def test_private_memory_migration_docs_export_project_dotenv(self) -> None:
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        migration = text[text.index("#### 迁移、启用与回滚"):]
+        self.assertIn("必须从项目根目录执行", migration)
+        self.assertIn("set -a\n. ./.env\nset +a", migration)
+        self.assertIn("TARGET_GROUP_ID", migration)
+
+    def test_private_memory_changelog_distinguishes_checkpoint_outcomes(self) -> None:
+        text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        section = text[text.index("### 私聊连续性记忆与治理"):text.index("### 群聊图片理解")]
+        self.assertIn("治理清空", section)
+        self.assertIn("持久审计", section)
+        self.assertIn("每日保留清理", section)
+        self.assertIn("仅记录脱敏日志", section)
+
+    def test_private_memory_plan_requires_external_synthetic_group_id(self) -> None:
+        plan = (
+            ROOT / "docs/superpowers/plans/2026-08-22-private-continuity-memory-governance.md"
+        ).read_text(encoding="utf-8")
+        self.assertIsNone(re.search(r"TARGET_GROUP_ID=\d{5,}", plan))
+        self.assertIn("${TARGET_GROUP_ID:?", plan)
+
 
 if __name__ == "__main__":
     unittest.main()

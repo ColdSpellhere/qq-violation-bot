@@ -99,7 +99,7 @@ Also test `/模块状态` shows only switch values and counts, never allowlist i
 Run:
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_feature_control tests.test_feature_control_commands -v
 ```
 
@@ -183,7 +183,7 @@ Test that the migration command invokes an online backup before the first schema
 - [ ] **Step 2: Run the schema tests and verify RED**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_private_memory_schema -v
 ```
 
@@ -263,7 +263,7 @@ Use fixed timestamps and assert exact surviving IDs rather than only row counts.
 - [ ] **Step 2: Run store tests and verify RED**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_private_memory_store -v
 ```
 
@@ -332,7 +332,7 @@ Add a boundary test proving no relationship module is imported by `plugins.viola
 - [ ] **Step 2: Run relationship tests and verify RED**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_relationship_state -v
 ```
 
@@ -387,7 +387,7 @@ Assert that shutdown waits for a fast task, then cancels a task exceeding the co
 - [ ] **Step 2: Run queue tests and verify RED**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_memory_jobs tests.test_plugin_loading -v
 ```
 
@@ -468,7 +468,7 @@ assert await processor.process(job) is True
 - [ ] **Step 2: Run processing tests and verify RED**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_private_memory_processing tests.test_member_memory -v
 ```
 
@@ -535,7 +535,7 @@ Test:
 - [ ] **Step 2: Run integration tests and verify RED**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_private_chat tests.test_private_memory_integration -v
 ```
 
@@ -611,7 +611,7 @@ assert command.scope.user_id == "200"
 - [ ] **Step 2: Run governance tests and verify RED**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_memory_governance_commands tests.test_memory_governance_service -v
 ```
 
@@ -681,7 +681,7 @@ Assert:
 - [ ] **Step 2: Run matcher tests and verify RED**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_memory_governance_matcher tests.test_plugin_loading -v
 ```
 
@@ -725,7 +725,7 @@ Use a fake clock and assert startup performs one retention pass, the daily loop 
 - [ ] **Step 2: Run the focused lifecycle test and verify RED**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_memory_jobs -v
 ```
 
@@ -754,7 +754,7 @@ CHANGELOG must describe only delivered behavior and must not include real IDs or
 - [ ] **Step 5: Run complete phase-one verification**
 
 ```bash
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest \
   tests.test_private_memory_schema \
   tests.test_private_memory_store \
   tests.test_relationship_state \
@@ -768,8 +768,8 @@ TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest \
   tests.test_feature_control \
   tests.test_feature_control_commands \
   tests.test_plugin_loading -v
-TARGET_GROUP_ID=918273645 .venv/bin/python -m unittest discover -s tests -v
-TARGET_GROUP_ID=918273645 .venv/bin/python -m compileall -q bot.py plugins scripts tests
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m unittest discover -s tests -v
+TARGET_GROUP_ID="${TARGET_GROUP_ID:?export an untracked synthetic group ID first}" .venv/bin/python -m compileall -q bot.py plugins scripts tests
 .venv/bin/python scripts/check_public_tree.py --history
 git diff --check
 git status --short

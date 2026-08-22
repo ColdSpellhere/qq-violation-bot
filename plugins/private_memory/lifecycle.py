@@ -17,6 +17,7 @@ from .schema import (
     PRIVATE_MEMORY_SCHEMA_VERSION,
     migrate,
     online_backup,
+    prune_private_memory_backups,
     quick_check,
     schema_version,
 )
@@ -38,8 +39,9 @@ def _utc_now() -> datetime:
 
 
 def _purge_retained_messages(store: PrivateMemoryStore) -> None:
+    now = _utc_now()
     report = store.purge_expired(
-        now=_utc_now(),
+        now=now,
         retention_days=CONFIG.private_memory_retention_days,
         max_messages=CONFIG.private_memory_max_messages,
     )
@@ -47,6 +49,11 @@ def _purge_retained_messages(store: PrivateMemoryStore) -> None:
         logger.warning(
             "私聊记忆保留清理已提交，但 WAL checkpoint 尚未完成，将在后续周期重试"
         )
+    prune_private_memory_backups(
+        Path(BACKUP_DIR) / "private_memory",
+        now=now,
+        retention_days=CONFIG.private_memory_retention_days,
+    )
 
 
 async def _run_daily_retention(store: PrivateMemoryStore) -> None:

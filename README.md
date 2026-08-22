@@ -329,7 +329,7 @@ systemctl is-active --quiet qq-violation-bot.service
 
 私聊持久记忆只接收同时通过聊天总开关、私聊开关和 `PRIVATE_CHAT_ALLOWED_USER_IDS` 精确白名单的部署后新消息；不会回溯、导入或重新提炼历史私聊。数据按用户 QQ号隔离，读取、写入、任务和关系状态均限定在同一用户范围。三项新开关默认均为 `false`：`PRIVATE_MEMORY_ENABLED` 控制私聊原文、摘要与长期事实的读取和新增，`RELATIONSHIP_STATE_ENABLED` 控制关系状态与未完话题更新，`MEMORY_GOVERNANCE_ENABLED` 控制超级管理员治理入口。关闭 `PRIVATE_MEMORY_ENABLED` 后不持久化新私聊内容，已有记录不会被开关自动删除。
 
-持久层包含以下五类数据：双方原文、滚动摘要、长期事实、关系状态和未完话题。原文默认每用户最多保留 500 条且最多保留 30 天，分别由 `PRIVATE_MEMORY_MAX_MESSAGES` 和 `PRIVATE_MEMORY_RETENTION_DAYS` 调整；启动时立即清理一次，之后每 24 小时清理一次。清理事务启用 SQLite `secure_delete` 并尝试截断 WAL checkpoint；若 checkpoint 返回 busy，逻辑清理仍已提交，审计/日志会标记物理清理待完成，下一次每日清理会自然重试。系统不会在线自动执行 `VACUUM`。摘要、长期事实、关系状态和未完话题不使用原文的 500 条/30 天自动过期规则。
+持久层包含以下五类数据：双方原文、滚动摘要、长期事实、关系状态和未完话题。原文默认每用户最多保留 500 条且最多保留 30 天，分别由 `PRIVATE_MEMORY_MAX_MESSAGES` 和 `PRIVATE_MEMORY_RETENTION_DAYS` 调整；启动时立即清理一次，之后每 24 小时清理一次。含私聊正文的受管迁移备份和服务自动迁移备份使用同一个保留天数：只按修改时间删除受管目录中符合本服务精确命名规则的过期普通单链接文件，其他文件和符号链接不会删除。备份目录必须为 `0700`，目录本身或非系统路径祖先含符号链接时会拒绝清理。迁移 `--apply` 会在创建新备份前执行一次同样的清理，服务每日任务则清理 `backups/private_memory/`。清理事务启用 SQLite `secure_delete` 并尝试截断 WAL checkpoint；治理清空遇到 checkpoint busy 时会持久记录可检索审计，逻辑清理仍返回成功；每日保留清理遇到 busy 时只写脱敏日志并在下一周期重试。系统不会在线自动执行 `VACUUM`。摘要、长期事实、关系状态和未完话题不使用原文的 500 条/30 天自动过期规则。
 
 这是敏感数据功能：原文、摘要和推断事实可能包含隐私，模型提取也可能不准确。生产数据库、WAL、备份和日志目录应仅允许服务账号访问；不要把真实 QQ号、私聊内容、数据库或备份提交到仓库。管理员应先查看和预览，再凭事实依据治理，不要把模型推断当作已核实事实。
 
@@ -351,10 +351,13 @@ systemctl is-active --quiet qq-violation-bot.service
 
 #### 迁移、启用与回滚
 
-迁移现有 `chat_archive.db` 前先保持 `/私聊记忆`、`/关系状态`、`/记忆治理` 为关闭，确认数据库路径，并创建权限为 `0700` 的备份目录。无 `--apply` 是只读预检；`--apply` 会先为现有数据库创建并校验在线备份，再做迁移和 `quick_check`。不要删除或复制正在使用的 `-wal`/`-shm` 文件代替在线备份。
+迁移现有 `chat_archive.db` 前先保持 `/私聊记忆`、`/关系状态`、`/记忆治理` 为关闭，确认数据库路径，并创建权限为 `0700` 的备份目录。以下命令必须从项目根目录执行；生产已有 `.env` 时先由 shell 安全加载并导出其中的现有配置，使 `TARGET_GROUP_ID` 等必需配置可供迁移子进程使用，命令不会输出这些值。无 `--apply` 是只读预检；`--apply` 会清理受管目录中超过 `PRIVATE_MEMORY_RETENTION_DAYS` 的精确命名旧备份，再为现有数据库创建并校验在线备份，最后做迁移和 `quick_check`。不要删除或复制正在使用的 `-wal`/`-shm` 文件代替在线备份。
 
 ```bash
 cd /opt/qq-violation-bot
+set -a
+. ./.env
+set +a
 install -d -m 0700 backups/private-memory-migration
 .venv/bin/python scripts/migrate_private_memory.py \
   --database data/chat_archive.db \

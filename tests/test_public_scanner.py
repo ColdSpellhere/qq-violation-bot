@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import check_public_tree as scanner
 from scripts.check_public_tree import generic_findings, runtime_findings
@@ -62,6 +64,63 @@ class PublicScannerTests(unittest.TestCase):
                 historical=False,
             ),
         )
+
+    def test_binary_current_rename_delete_and_all_history_are_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def git(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["git", *args], cwd=root, check=True, capture_output=True, text=True
+                )
+
+            git("init", "-q")
+            git("config", "user.name", "Scanner Test")
+            git("config", "user.email", "scanner@example.invalid")
+            token = b"sk-" + (b"a" * 26)
+            private_key = b"BEGIN " + b"OPENSSH PRIVATE KEY"
+            (root / "binary.dat").write_bytes(
+                b"prefix\x00API_KEY=" + token + b"\x00" + private_key + b"\x00"
+            )
+            git("add", "binary.dat")
+            git("commit", "-qm", "add binary fixture")
+
+            with patch.object(scanner, "ROOT", root):
+                self.assertEqual(
+                    [
+                        "binary.dat: generic API token",
+                        "binary.dat: private key material",
+                    ],
+                    scanner.scan_ref(None, {}),
+                )
+
+                git("mv", "binary.dat", "renamed.bin")
+                git("commit", "-qm", "rename binary fixture")
+                git("rm", "-q", "renamed.bin")
+                git("commit", "-qm", "delete binary fixture")
+                self.assertEqual([], scanner.scan_ref(None, {}))
+                revisions = tuple(scanner.revisions())
+                self.assertEqual(3, len(revisions))
+                seen: set[tuple[str, str]] = set()
+                history = [
+                    finding
+                    for revision in revisions
+                    for finding in scanner.scan_ref(
+                        revision, {}, seen_history=seen
+                    )
+                ]
+
+            self.assertTrue(any("binary.dat: generic API token" in item for item in history))
+            self.assertTrue(any("renamed.bin: generic API token" in item for item in history))
+            self.assertTrue(any("private key material" in item for item in history))
+
+    def test_oversized_binary_fails_closed_without_decoding(self) -> None:
+        scan_bytes = getattr(scanner, "scan_bytes", lambda path, raw, values: [])
+        with patch.object(scanner, "MAX_SCAN_BYTES", 4, create=True):
+            self.assertEqual(
+                ["large.bin: file exceeds scan size limit"],
+                scan_bytes("large.bin", b"12345", {}),
+            )
 
 
 if __name__ == "__main__":

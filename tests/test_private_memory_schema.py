@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from plugins.private_memory.schema import (
     online_backup,
     quick_check,
 )
+from plugins.private_memory import schema as schema_module
 from scripts import migrate_private_memory
 
 
@@ -70,7 +72,7 @@ class PrivateMemorySchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.database = self.root / "chat_archive.db"
 
     def test_empty_database_gets_exact_schema_constraints_and_indexes(self) -> None:
@@ -399,6 +401,30 @@ class PrivateMemorySchemaTests(unittest.TestCase):
         migrate_mock.assert_not_called()
         self.assertEqual(before, self.database.read_bytes())
 
+    def test_apply_prunes_expired_managed_backups_before_new_backup(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("CREATE TABLE marker(value TEXT NOT NULL)")
+            connection.commit()
+        backup_dir = self.root / "backups"
+        backup_dir.mkdir(mode=0o700)
+        expired = backup_dir / (
+            "chat_archive_before_private_memory_20200101T000000000000Z.sqlite3"
+        )
+        unrelated = backup_dir / "manual-archive.sqlite3"
+        expired.write_bytes(b"expired managed backup")
+        unrelated.write_bytes(b"operator managed")
+        old_time = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+        os.utime(expired, (old_time, old_time))
+        os.utime(unrelated, (old_time, old_time))
+
+        _report, new_backup = migrate_private_memory.apply_migration(
+            self.database, backup_dir
+        )
+
+        self.assertFalse(expired.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(new_backup.exists())
+
     def test_online_backup_uses_owner_only_permissions_and_refuses_collisions(self) -> None:
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute("CREATE TABLE marker(value TEXT NOT NULL)")
@@ -420,6 +446,96 @@ class PrivateMemorySchemaTests(unittest.TestCase):
         os.link(self.database, hardlink)
         with self.assertRaises(ValueError):
             online_backup(self.database, hardlink)
+
+    def test_backup_retention_deletes_only_expired_managed_regular_files(self) -> None:
+        backup_dir = self.root / "backups"
+        backup_dir.mkdir(mode=0o700)
+        now = datetime(2026, 8, 23, tzinfo=timezone.utc)
+        old = backup_dir / "chat_archive_before_private_memory_20260701T000000000000Z.sqlite3"
+        recent = backup_dir / "chat_archive_before_private_memory_20260822T000000000000Z.sqlite3"
+        lifecycle_old = backup_dir / "chat_archive-pre-private-memory-20260701T000000000000Z-42.sqlite3"
+        unrelated = backup_dir / "unrelated.sqlite3"
+        target = self.root / "outside.sqlite3"
+        symlink = backup_dir / "chat_archive_before_private_memory_20260702T000000000000Z.sqlite3"
+        for path in (old, recent, lifecycle_old, unrelated, target):
+            path.write_bytes(b"fixture")
+        symlink.symlink_to(target)
+        old_time = (now - timedelta(days=31)).timestamp()
+        recent_time = (now - timedelta(days=1)).timestamp()
+        for path in (old, lifecycle_old, unrelated, target):
+            os.utime(path, (old_time, old_time))
+        os.utime(recent, (recent_time, recent_time))
+
+        prune = getattr(
+            schema_module,
+            "prune_private_memory_backups",
+            lambda directory, **kwargs: 0,
+        )
+        deleted = prune(backup_dir, now=now, retention_days=30)
+
+        self.assertEqual(2, deleted)
+        self.assertFalse(old.exists())
+        self.assertFalse(lifecycle_old.exists())
+        self.assertTrue(recent.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(symlink.is_symlink())
+        self.assertTrue(target.exists())
+
+    def test_backup_retention_rejects_symlink_directory_and_ancestor(self) -> None:
+        real_parent = self.root / "real"
+        real_parent.mkdir(mode=0o700)
+        real_backups = real_parent / "backups"
+        real_backups.mkdir(mode=0o700)
+        direct_link = self.root / "direct-link"
+        direct_link.symlink_to(real_backups, target_is_directory=True)
+        ancestor_link = self.root / "ancestor-link"
+        ancestor_link.symlink_to(real_parent, target_is_directory=True)
+        prune = getattr(
+            schema_module,
+            "prune_private_memory_backups",
+            lambda directory, **kwargs: 0,
+        )
+        for directory in (direct_link, ancestor_link / "backups"):
+            with self.subTest(directory=directory), self.assertRaises(ValueError):
+                prune(
+                    directory,
+                    now=datetime(2026, 8, 23, tzinfo=timezone.utc),
+                    retention_days=30,
+                )
+
+    def test_documented_shell_pattern_exports_dotenv_to_migration_subprocess(self) -> None:
+        env_file = self.root / ".env"
+        synthetic_id = "".join(("246", "813", "579"))
+        env_file.write_text(f"TARGET_GROUP_ID={synthetic_id}\n", encoding="utf-8")
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("CREATE TABLE marker(value TEXT)")
+            connection.commit()
+        backup_dir = self.root / "backups"
+        backup_dir.mkdir(mode=0o700)
+        environment = os.environ.copy()
+        environment.pop("TARGET_GROUP_ID", None)
+        environment.update(
+            {
+                "PYTHON_BIN": sys.executable,
+                "MIGRATION_SCRIPT": str(PROJECT_ROOT / "scripts/migrate_private_memory.py"),
+                "DATABASE_PATH": str(self.database),
+                "BACKUP_PATH": str(backup_dir),
+            }
+        )
+        result = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                'set -a\n. ./.env\nset +a\nexec "$PYTHON_BIN" "$MIGRATION_SCRIPT" '
+                '--database "$DATABASE_PATH" --backup-dir "$BACKUP_PATH"',
+            ],
+            cwd=self.root,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("preflight=ok", result.stdout)
 
     def test_online_backup_rejects_existing_insecure_directory_without_chmod(self) -> None:
         with closing(sqlite3.connect(self.database)) as connection:

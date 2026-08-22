@@ -15,11 +15,13 @@ from plugins.private_memory.models import MigrationReport
 from plugins.private_memory.schema import (
     migrate,
     online_backup,
+    prune_private_memory_backups,
     quick_check,
     require_regular_database,
     schema_version,
     validate_backup_directory,
 )
+from plugins.violation_record.config import CONFIG
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -36,7 +38,13 @@ def apply_migration(database: Path, backup_dir: Path) -> tuple[MigrationReport, 
     require_regular_database(database)
     validate_backup_directory(backup_dir)
     quick_check(database)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    now = datetime.now(timezone.utc)
+    prune_private_memory_backups(
+        backup_dir,
+        now=now,
+        retention_days=CONFIG.private_memory_retention_days,
+    )
+    timestamp = now.strftime("%Y%m%dT%H%M%S%fZ")
     backup = online_backup(database, backup_dir / f"chat_archive_before_private_memory_{timestamp}.sqlite3")
     quick_check(backup)
     report = migrate(database)

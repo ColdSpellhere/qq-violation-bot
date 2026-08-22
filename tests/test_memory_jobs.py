@@ -435,7 +435,7 @@ class MemoryWorkerTests(unittest.IsolatedAsyncioTestCase):
 class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.directory = TemporaryDirectory()
-        self.root = Path(self.directory.name)
+        self.root = Path(self.directory.name).resolve()
         from plugins.private_memory import lifecycle
 
         lifecycle._reset_for_tests()
@@ -569,6 +569,7 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(lifecycle, "get_driver", return_value=driver),
             patch.object(lifecycle, "CONFIG", config),
+            patch.object(lifecycle, "BACKUP_DIR", self.root / "backups"),
             patch.object(lifecycle, "MemoryJobQueue", return_value=queue),
             patch.object(lifecycle, "PrivateMemoryStore", return_value=store),
             patch.object(lifecycle, "MemoryJobWorker", return_value=worker),
@@ -616,11 +617,15 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(lifecycle, "get_driver", return_value=driver),
             patch.object(lifecycle, "CONFIG", config),
+            patch.object(lifecycle, "BACKUP_DIR", self.root / "backups"),
             patch.object(lifecycle, "MemoryJobQueue", return_value=queue),
             patch.object(lifecycle, "PrivateMemoryStore", return_value=store),
             patch.object(lifecycle, "MemoryJobWorker", return_value=worker),
             patch.object(lifecycle, "_utc_now", new=clock.now, create=True),
             patch.object(lifecycle, "_sleep", new=clock.sleep, create=True),
+            patch.object(
+                lifecycle, "prune_private_memory_backups", create=True
+            ) as prune_backups,
             patch.object(lifecycle.logger, "warning") as warning,
         ):
             lifecycle.setup_lifecycle(processor=AsyncMock())
@@ -639,6 +644,12 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(NOW + timedelta(days=1), store.purge_expired.call_args.kwargs["now"])
             warning.assert_called_once()
             self.assertIn("checkpoint", warning.call_args.args[0])
+            self.assertEqual(2, prune_backups.call_count)
+            self.assertEqual(
+                self.root / "backups" / "private_memory",
+                prune_backups.call_args.args[0],
+            )
+            self.assertEqual(30, prune_backups.call_args.kwargs["retention_days"])
 
             retention_task = lifecycle._retention_task
             await driver.shutdown()

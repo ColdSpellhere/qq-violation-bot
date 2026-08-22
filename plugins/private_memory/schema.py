@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import stat
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .models import MigrationReport
 
 
 PRIVATE_MEMORY_SCHEMA_VERSION = 1
+_MANAGED_PRIVATE_MEMORY_BACKUP_RE = re.compile(
+    r"(?:chat_archive_before_private_memory_\d{8}T\d{12}Z"
+    r"|[^/]+-pre-private-memory-\d{8}T\d{12}Z-\d+)\.sqlite3\Z"
+)
 
 _TABLE_STATEMENTS = (
     """
@@ -231,6 +237,51 @@ def validate_backup_directory(path: Path) -> Path:
             f"existing backup directory must have mode 0700, got {mode:04o}: {path}"
         )
     return path
+
+
+def _reject_symlink_path(path: Path) -> Path:
+    absolute = Path(path).absolute()
+    for candidate in (absolute, *absolute.parents):
+        if candidate.is_symlink():
+            raise ValueError(f"backup directory path must not contain symlinks: {path}")
+    return absolute
+
+
+def prune_private_memory_backups(
+    directory: Path, *, now: datetime, retention_days: int
+) -> int:
+    if now.utcoffset() is None:
+        raise ValueError("backup retention time must be timezone-aware")
+    if (
+        isinstance(retention_days, bool)
+        or not isinstance(retention_days, int)
+        or retention_days <= 0
+    ):
+        raise ValueError("backup retention days must be a positive integer")
+    directory = _reject_symlink_path(Path(directory))
+    if not directory.exists():
+        return 0
+    validate_backup_directory(directory)
+    cutoff = (now - timedelta(days=retention_days)).timestamp()
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(directory, flags)
+    deleted = 0
+    try:
+        for name in os.listdir(descriptor):
+            if not _MANAGED_PRIVATE_MEMORY_BACKUP_RE.fullmatch(name):
+                continue
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_mtime >= cutoff
+            ):
+                continue
+            os.unlink(name, dir_fd=descriptor)
+            deleted += 1
+    finally:
+        os.close(descriptor)
+    return deleted
 
 
 def schema_version(path: Path) -> int:
