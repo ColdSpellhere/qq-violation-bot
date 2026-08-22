@@ -258,6 +258,48 @@ class LLMGatewayChatMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("最近聊得很熟悉", user)
         self.assertNotIn("下次继续聊月季", user)
 
+    async def test_empty_private_relationship_keeps_exact_legacy_no_profile_prompt(self) -> None:
+        from plugins.private_chat.matcher import _legacy_private_profiles
+
+        relationship = _relationship()
+        relationship = RelationshipState(
+            **{
+                **relationship.__dict__,
+                "state_text": "",
+                "open_topics": (),
+                "preferred_address": "",
+                "communication_style": "",
+            }
+        )
+        legacy_profiles = _legacy_private_profiles(
+            (), relationship=relationship, user_id="100", nickname="用户甲"
+        )
+        self.assertEqual((), legacy_profiles)
+
+        legacy = AsyncMock(side_effect=("基线回复", "空关系回复"))
+        current = ContextMessage("用户甲", "继续聊", message_id="p2", user_id="100")
+        with patch("plugins.random_chat.ai.CONFIG", _config()), patch(
+            "plugins.random_chat.ai.FEATURES",
+            _Features(builder=False, gateway=False),
+        ), patch(
+            "plugins.random_chat.ai._legacy_complete", new=legacy
+        ), patch("plugins.random_chat.ai.load_character_prompt", return_value="角色"):
+            await generate_reply(
+                "继续聊", current=current, addressed=True, chat_mode="private"
+            )
+            await generate_reply(
+                "继续聊",
+                current=current,
+                addressed=True,
+                chat_mode="private",
+                relationship=relationship,
+                legacy_profiles=legacy_profiles,
+            )
+
+        self.assertEqual(
+            legacy.await_args_list[0].args[0], legacy.await_args_list[1].args[0]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -121,6 +121,8 @@ def _legacy_private_profiles(
     if topics:
         summary_parts.append("未完话题：" + "；".join(topics))
     base = profiles[0] if profiles else None
+    if base is None and not summary_parts:
+        return ()
     return (
         MemberProfile(
             group_id=0,
