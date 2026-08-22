@@ -176,18 +176,15 @@ class PrivateMemoryProcessor:
         if job.scope.conversation_kind == "private":
             messages = self._private_messages(
                 job.scope,
-                after=current_watermark,
+                after=max(0, job.input_through_id - 1),
                 through=job.input_through_id,
                 user_only=True,
             )
         elif job.scope.conversation_kind == "group":
-            after = (
-                current_watermark
-                if current is not None
-                else max(0, job.input_through_id - 1)
-            )
             messages = self._group_messages(
-                job.scope, after=after, through=job.input_through_id
+                job.scope,
+                after=max(0, job.input_through_id - 1),
+                through=job.input_through_id,
             )
         else:
             raise ValueError("unknown conversation kind")

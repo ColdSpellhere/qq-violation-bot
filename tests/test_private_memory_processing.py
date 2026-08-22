@@ -171,6 +171,94 @@ class PrivateMemoryProcessorTests(unittest.IsolatedAsyncioTestCase):
         )))
         self.assertEqual(["启用后的第一条"], seen)
 
+    async def test_first_private_relationship_starts_at_job_watermark_not_history(self) -> None:
+        from plugins.private_memory.ai import RelationshipCandidate
+
+        self.append("old", "启用前历史", 1)
+        watermark = self.append("new", "启用后的第一条", 2)
+        seen: list[tuple[str, str]] = []
+
+        async def update(current, messages):
+            seen.extend((message.message_id, message.text) for message in messages)
+            return RelationshipCandidate("新关系", (), "", "")
+
+        processor = self.processor(update_relationship=update)
+        self.assertTrue(await processor.process(_job(
+            "relationship", watermark=watermark
+        )))
+        self.assertEqual([("new", "启用后的第一条")], seen)
+
+    async def test_reenabled_private_relationship_only_uses_first_new_message(self) -> None:
+        from plugins.private_memory.ai import RelationshipCandidate
+
+        first = self.append("before-disable", "关闭前消息", 1)
+        scope = ConversationScope("private", "200")
+        self.assertTrue(self.relationships.commit(RelationshipState(
+            id=0, scope=scope, state_text="旧状态", open_topics=(),
+            preferred_address="", communication_style="",
+            source_message_id="before-disable", source_watermark=first, version=1,
+            created_at="", updated_at="",
+        ), expected_version=0))
+        self.append("while-disabled", "关闭期间消息", 2)
+        target = self.append("after-reenable", "重开后的第一条", 3)
+        seen: list[tuple[str, str]] = []
+
+        async def update(current, messages):
+            seen.extend((message.message_id, message.text) for message in messages)
+            return RelationshipCandidate("重开状态", (), "", "")
+
+        processor = self.processor(update_relationship=update)
+        self.assertTrue(await processor.process(_job(
+            "relationship", watermark=target, expected_version=1
+        )))
+        self.assertEqual([("after-reenable", "重开后的第一条")], seen)
+
+    async def test_reenabled_group_relationship_uses_exact_scope_and_source(self) -> None:
+        from plugins.private_memory.ai import RelationshipCandidate
+
+        def archive(message_id: str, group_id: int, user_id: str, text: str) -> int:
+            archive_payload(self.database, group_id, {
+                "message_id": message_id, "group_id": group_id,
+                "event_time": 1, "user_id": user_id,
+                "sender": {"nickname": "群友"}, "segments": [],
+                "plaintext": text, "reply_message_id": None,
+            })
+            with closing(sqlite3.connect(self.database)) as connection:
+                return int(connection.execute(
+                    "SELECT rowid FROM chat_messages WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()[0])
+
+        first = archive("before-disable", 123, "200", "关闭前消息")
+        scope = ConversationScope("group", "200", 123)
+        self.assertTrue(self.relationships.commit(RelationshipState(
+            id=0, scope=scope, state_text="旧状态", open_topics=(),
+            preferred_address="", communication_style="",
+            source_message_id="before-disable", source_watermark=first, version=1,
+            created_at="", updated_at="",
+        ), expected_version=0))
+        archive("while-disabled", 123, "200", "关闭期间消息")
+        archive("other-user", 123, "201", "同群其他用户")
+        archive("other-group", 124, "200", "同用户其他群")
+        target = archive("after-reenable", 123, "200", "重开后的第一条")
+        seen: list[tuple[int, str, str]] = []
+
+        async def update(current, messages):
+            seen.extend(
+                (message.id, message.message_id, message.text)
+                for message in messages
+            )
+            return RelationshipCandidate("重开状态", (), "", "")
+
+        processor = self.processor(update_relationship=update)
+        self.assertTrue(await processor.process(_job(
+            "relationship", watermark=target, expected_version=1,
+            kind="group", group_id=123,
+        )))
+        self.assertEqual(
+            [(target, "after-reenable", "重开后的第一条")], seen
+        )
+
     async def test_disabled_switch_is_rechecked_after_model_before_commit(self) -> None:
         watermark = self.append("p1", "第一句")
         enabled = True
