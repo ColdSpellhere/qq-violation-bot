@@ -331,6 +331,20 @@ class PrivateMemoryStoreTests(unittest.TestCase):
             updated.version,
         ))
 
+    def test_summary_version_state_exposes_tombstone_without_public_summary(self) -> None:
+        self.assertEqual(
+            (0, 0), self.store.get_summary_version_state(user_id="200")
+        )
+        watermark = self.append_user("before-clear", "清理前消息", 1)
+        self.store.clear_private_layers(
+            user_id="200", actor="1", reason="test", operation_id=41
+        )
+
+        self.assertIsNone(self.store.get_summary(user_id="200"))
+        self.assertEqual(
+            (1, watermark), self.store.get_summary_version_state(user_id="200")
+        )
+
     def test_summary_source_endpoints_cannot_cross_private_users(self) -> None:
         own = self.append_user("own", "自己的消息", 100, user_id="200")
         other = self.append_user("other", "别人的消息", 101, user_id="300")
@@ -646,7 +660,7 @@ class PrivateMemoryStoreTests(unittest.TestCase):
                     "SELECT status FROM memory_jobs WHERE user_id='200' ORDER BY id"
                 )
             ]
-        self.assertEqual(("", 0, 0, 0, 1), tombstone)
+        self.assertEqual(("", 0, 0, old, 1), tombstone)
         self.assertEqual(["cancelled", "cancelled"], statuses)
         self.assertFalse(self.store.commit_summary(
             user_id="200",
@@ -661,7 +675,7 @@ class PrivateMemoryStoreTests(unittest.TestCase):
             summary_text="清空后的新摘要",
             source_start_id=new,
             source_end_id=new,
-            expected_through_id=0,
+            expected_through_id=old,
             expected_version=1,
         ))
 

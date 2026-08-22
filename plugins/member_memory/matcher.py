@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
+from contextlib import closing
+
 from nonebot import logger, on_message
 from nonebot.adapters.onebot.v11 import Event, GroupMessageEvent
 from nonebot.rule import Rule
@@ -16,6 +19,39 @@ from plugins.violation_record.config import CONFIG
 
 
 BATCHER = MemberMemoryBatcher(threshold=5, delay_seconds=60.0)
+
+
+def _enqueue_group_relationship(event: GroupMessageEvent) -> None:
+    """Queue from the archived row; never invoke relationship AI inline."""
+    # This matcher loads before the private-memory NoneBot plugin. Import lazily so
+    # Python does not initialize that package before NoneBot can register it.
+    from plugins.private_memory.jobs import MemoryJobQueue
+    from plugins.private_memory.relationship import RelationshipStore
+
+    group_id = int(event.group_id)
+    user_id = str(event.user_id)
+    message_id = str(event.message_id)
+    with closing(sqlite3.connect(CONFIG.chat_archive_path)) as connection:
+        row = connection.execute(
+            "SELECT rowid FROM chat_messages "
+            "WHERE group_id=? AND user_id=? AND message_id=?",
+            (group_id, user_id, message_id),
+        ).fetchone()
+    if row is None or not FEATURES.snapshot().relationship_state_enabled:
+        return
+    relationship = RelationshipStore(CONFIG.chat_archive_path).get_group(
+        group_id=group_id, user_id=user_id, persona_id="radish-cat"
+    )
+    if not FEATURES.snapshot().relationship_state_enabled:
+        return
+    MemoryJobQueue(CONFIG.chat_archive_path).enqueue(
+        job_type="relationship",
+        conversation_kind="group",
+        group_id=group_id,
+        user_id=user_id,
+        input_through_id=int(row[0]),
+        expected_version=relationship.version if relationship else 0,
+    )
 
 
 def _target_member_message(event: Event) -> bool:
@@ -46,6 +82,16 @@ async def collect_member_memory(event: GroupMessageEvent) -> None:
         event_time=int(event.time),
         callback=analyze_member_memory,
     )
+    if FEATURES.snapshot().relationship_state_enabled:
+        try:
+            _enqueue_group_relationship(event)
+        except Exception as exc:
+            logger.warning(
+                "group relationship enqueue failed group_id=%s user_id=%s error=%s",
+                event.group_id,
+                event.user_id,
+                type(exc).__name__,
+            )
 
 
 async def analyze_member_memory(group_id: int, user_id: str, event_time: int) -> None:

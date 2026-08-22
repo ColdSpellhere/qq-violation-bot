@@ -14,7 +14,7 @@ from .models import ConversationScope, MemoryJob, validate_persona_id
 from .schema import PRIVATE_MEMORY_SCHEMA_VERSION, schema_version
 
 
-JobProcessor = Callable[[MemoryJob], Awaitable[None]]
+JobProcessor = Callable[[MemoryJob], Awaitable[bool | None]]
 AllowedJobTypesProvider = Callable[[], AbstractSet[str]]
 logger = logging.getLogger(__name__)
 
@@ -283,6 +283,7 @@ class MemoryJobQueue:
         status: str,
         error_code: str = "",
         error_summary: str = "",
+        retryable: bool = True,
         now: datetime | None = None,
     ) -> bool:
         if status not in {"succeeded", "failed"}:
@@ -297,7 +298,7 @@ class MemoryJobQueue:
             safe_code = _ERROR_CODE_RE.sub("_", str(error_code).strip().lower()).strip("_")[:64]
             safe_code = safe_code or "processing_error"
             safe_summary = "processing failed"
-            if job.attempts < self.max_attempts:
+            if retryable and job.attempts < self.max_attempts:
                 final_status = "pending"
                 delay = self.backoff_base_seconds * (2 ** (job.attempts - 1))
                 next_run_at = _utc_text(current + timedelta(seconds=delay))
@@ -337,6 +338,40 @@ class MemoryJobQueue:
             )
             connection.commit()
             return int(cursor.rowcount)
+
+    def defer(
+        self, job: MemoryJob, *, worker_id: str, now: datetime | None = None
+    ) -> bool:
+        """Release one still-owned job after a safe no-op processor result."""
+        current = now or _now()
+        now_text = _utc_text(current)
+        exhausted = job.attempts >= self.max_attempts
+        next_run_at = _utc_text(
+            current
+            + timedelta(
+                seconds=self.backoff_base_seconds * (2 ** (job.attempts - 1))
+            )
+        )
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE memory_jobs
+                SET status=?,next_run_at=?,lease_owner=NULL,lease_expires_at=NULL,
+                    error_code=?,error_summary='',updated_at=?
+                WHERE id=? AND status='running' AND lease_owner=? AND claim_version=?
+                """,
+                (
+                    "failed" if exhausted else "pending",
+                    now_text if exhausted else next_run_at,
+                    "no_domain_write" if exhausted else "",
+                    now_text,
+                    job.id,
+                    worker_id,
+                    job.claim_version,
+                ),
+            )
+            connection.commit()
+            return bool(cursor.rowcount)
 
     def get(self, job_id: int) -> MemoryJob:
         with closing(self._connect()) as connection:
@@ -412,7 +447,7 @@ class MemoryJobWorker:
             if self.processor is None:
                 self.queue.release_owned(worker_id=self.worker_id)
                 return
-            await self.processor(job)
+            processed = await self.processor(job)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -421,7 +456,8 @@ class MemoryJobWorker:
                     job,
                     worker_id=self.worker_id,
                     status="failed",
-                    error_code=type(exc).__name__,
+                    error_code=str(getattr(exc, "code", type(exc).__name__)),
+                    retryable=bool(getattr(exc, "retryable", True)),
                 )
             except Exception as finish_exc:
                 logger.warning(
@@ -430,7 +466,10 @@ class MemoryJobWorker:
                 )
         else:
             try:
-                self.queue.finish(job, worker_id=self.worker_id, status="succeeded")
+                if processed is False:
+                    self.queue.defer(job, worker_id=self.worker_id)
+                else:
+                    self.queue.finish(job, worker_id=self.worker_id, status="succeeded")
             except Exception as exc:
                 logger.warning(
                     "memory job success finalization failed error=%s",

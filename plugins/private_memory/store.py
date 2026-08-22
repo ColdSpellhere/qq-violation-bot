@@ -276,6 +276,20 @@ class PrivateMemoryStore:
             updated_at=str(row["updated_at"]),
         )
 
+    def get_summary_version_state(self, *, user_id: str) -> tuple[int, int]:
+        user_id = _validate_user_id(user_id)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT version,summarized_through_id
+                FROM private_conversation_summaries WHERE user_id=?
+                """,
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return (0, 0)
+        return (int(row["version"]), int(row["summarized_through_id"]))
+
     def commit_summary(
         self,
         *,
@@ -591,6 +605,13 @@ class PrivateMemoryStore:
                     (user_id,),
                 ).fetchall()
                 message_ids = [int(row["id"]) for row in message_rows]
+                cleared_through = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(id),0) "
+                        "FROM private_chat_messages WHERE user_id=?",
+                        (user_id,),
+                    ).fetchone()[0]
+                )
                 connection.execute(
                     """
                     UPDATE private_chat_messages SET text='',purged_at=?
@@ -609,19 +630,19 @@ class PrivateMemoryStore:
                         INSERT INTO private_conversation_summaries(
                             user_id,summary_text,source_start_id,source_end_id,
                             summarized_through_id,version,created_at,updated_at
-                        ) VALUES(?,'',0,0,0,1,?,?)
+                        ) VALUES(?,'',0,0,?,1,?,?)
                         """,
-                        (user_id, now, now),
+                        (user_id, cleared_through, now, now),
                     )
                 else:
                     connection.execute(
                         """
                         UPDATE private_conversation_summaries
                         SET summary_text='',source_start_id=0,source_end_id=0,
-                            summarized_through_id=0,version=version+1,updated_at=?
+                            summarized_through_id=?,version=version+1,updated_at=?
                         WHERE user_id=?
                         """,
-                        (now, user_id),
+                        (cleared_through, now, user_id),
                     )
                 topics_cursor = connection.execute(
                     """

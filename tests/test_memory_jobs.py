@@ -689,6 +689,52 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("succeeded", lifecycle._queue.get(1).status)
 
+    async def test_startup_assembles_and_runs_default_private_memory_processor(self) -> None:
+        from plugins.private_memory import lifecycle
+        from plugins.private_memory import processor as processor_module
+        from plugins.private_memory.processor import PrivateMemoryProcessor
+
+        config = self.config(private_memory_shutdown_timeout=1.0)
+        driver = FakeDriver()
+        enabled = SimpleNamespace(
+            private_memory_enabled=True,
+            relationship_state_enabled=False,
+        )
+        features = SimpleNamespace(snapshot=lambda: enabled)
+        with (
+            patch.object(lifecycle, "get_driver", return_value=driver),
+            patch.object(lifecycle, "CONFIG", config),
+            patch.object(lifecycle, "FEATURES", features),
+            patch.object(processor_module, "FEATURES", features),
+            patch.object(lifecycle, "BACKUP_DIR", self.root / "backups"),
+        ):
+            lifecycle.setup_lifecycle(poll_interval=0.005)
+            await driver.startup()
+            self.assertIsInstance(lifecycle._worker.processor, PrivateMemoryProcessor)
+            message_id = lifecycle._store.append_user_message(
+                user_id="200", message_id="p1", text="只测试生产装配",
+                event_time=1, source_kind="text",
+            )
+            lifecycle._worker.processor.summarize = AsyncMock(
+                return_value="装配后的摘要"
+            )
+            job_id = lifecycle._queue.enqueue(
+                job_type="private_summary", conversation_kind="private",
+                user_id="200", group_id=None, input_through_id=message_id,
+                expected_version=0,
+            )
+            async def wait_for_success() -> None:
+                while lifecycle._queue.get(job_id).status != "succeeded":
+                    await asyncio.sleep(0.002)
+
+            await asyncio.wait_for(wait_for_success(), timeout=1)
+            await driver.shutdown()
+
+        self.assertEqual(
+            "装配后的摘要",
+            lifecycle._store.get_summary(user_id="200").summary_text,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,7 +62,8 @@ def _group_event(
 
 class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
     def _controller(
-        self, directory: str, *, allowed: tuple[int, ...], chat_enabled: bool = True
+        self, directory: str, *, allowed: tuple[int, ...], chat_enabled: bool = True,
+        relationship_enabled: bool = False,
     ) -> FeatureController:
         return FeatureController(
             Path(directory) / "features.json",
@@ -73,6 +74,7 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
                 private_chat_enabled=False,
                 group_chat_allowed_group_ids=allowed,
                 private_chat_allowed_user_ids=(),
+                relationship_state_enabled=relationship_enabled,
             ),
         )
 
@@ -205,6 +207,55 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
         add.assert_not_called()
         recent.assert_not_called()
         apply.assert_not_called()
+
+    async def test_archived_group_message_only_enqueues_relationship_by_rowid(self):
+        from plugins.chat_archive.db import archive_payload
+        from plugins.private_memory.jobs import MemoryJobQueue
+        from plugins.private_memory.schema import migrate
+
+        event = _group_event(group_id=123, text="下次聊跑步")
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "chat.db"
+            archive_payload(database, 123, {
+                "message_id": str(event.message_id), "group_id": 123,
+                "event_time": int(event.time), "user_id": str(event.user_id),
+                "sender": {"nickname": "群友"}, "segments": [],
+                "plaintext": event.get_plaintext(), "reply_message_id": None,
+            })
+            migrate(database)
+            config = SimpleNamespace(
+                chat_archive_path=database, member_memory_root=Path(directory) / "memory",
+                bot_self_id="10000", member_memory_summary_enabled=False,
+            )
+            controller = self._controller(
+                directory, allowed=(123,), relationship_enabled=True
+            )
+            with patch.object(memory_matcher, "FEATURES", controller), patch.object(
+                memory_matcher, "CONFIG", config
+            ), patch.object(memory_matcher.BATCHER, "add"):
+                await memory_matcher.collect_member_memory(event)
+
+            with sqlite3.connect(database) as connection:
+                rowid = int(connection.execute(
+                    "SELECT rowid FROM chat_messages WHERE message_id=?",
+                    (str(event.message_id),),
+                ).fetchone()[0])
+                row = connection.execute(
+                    "SELECT job_type,input_through_id,expected_version,status "
+                    "FROM memory_jobs"
+                ).fetchone()
+            self.assertEqual(("relationship", rowid, 0, "pending"), row)
+            self.assertEqual("pending", MemoryJobQueue(database).get(1).status)
+
+    async def test_group_relationship_is_not_enqueued_when_switch_is_disabled(self):
+        event = _group_event(group_id=123)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            memory_matcher, "FEATURES", self._controller(directory, allowed=(123,))
+        ), patch.object(memory_matcher.BATCHER, "add"), patch.object(
+            memory_matcher, "_enqueue_group_relationship"
+        ) as enqueue:
+            await memory_matcher.collect_member_memory(event)
+        enqueue.assert_not_called()
 
 
 class MemberMemoryStoreTests(unittest.TestCase):

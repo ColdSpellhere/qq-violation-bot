@@ -12,6 +12,7 @@ from plugins.feature_control.runtime import FEATURES
 from plugins.violation_record.config import BACKUP_DIR, CONFIG
 
 from .jobs import JobProcessor, MemoryJobQueue, MemoryJobWorker
+from .relationship import RelationshipStore
 from .schema import (
     PRIVATE_MEMORY_SCHEMA_VERSION,
     migrate,
@@ -97,9 +98,17 @@ def setup_lifecycle(
             retention_days=CONFIG.private_memory_retention_days,
             max_messages=CONFIG.private_memory_max_messages,
         )
+        processor = _processor
+        if processor is None:
+            from .processor import PrivateMemoryProcessor
+
+            processor = PrivateMemoryProcessor(
+                store=_store,
+                relationship_store=RelationshipStore(database),
+            )
         _worker = MemoryJobWorker(
             _queue,
-            _processor,
+            processor,
             allowed_job_types=_allowed_job_types,
             concurrency=2,
             poll_interval=poll_interval,

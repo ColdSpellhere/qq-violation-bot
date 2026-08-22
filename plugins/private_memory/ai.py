@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from plugins.violation_record.config import CONFIG
+
+from .models import PrivateFactCandidate, PrivateMessage, RelationshipState
+from .relationship import (
+    MAX_COMMUNICATION_STYLE_LENGTH,
+    MAX_OPEN_TOPICS,
+    MAX_OPEN_TOPIC_LENGTH,
+    MAX_PREFERRED_ADDRESS_LENGTH,
+    MAX_STATE_TEXT_LENGTH,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+class PrivateMemoryAIError(RuntimeError):
+    """Base error carrying a queue-safe category, never model content."""
+
+    def __init__(self, code: str, *, retryable: bool) -> None:
+        super().__init__(code)
+        self.code = code
+        self.retryable = retryable
+
+
+class ContractError(PrivateMemoryAIError):
+    def __init__(self, code: str = "contract_error") -> None:
+        super().__init__(code, retryable=False)
+
+
+class TransportError(PrivateMemoryAIError):
+    def __init__(self, code: str = "transport_error", *, retryable: bool = True) -> None:
+        super().__init__(code, retryable=retryable)
+
+
+def _classify_http_status(status: int) -> TransportError:
+    if status in {401, 403}:
+        return TransportError("auth_error", retryable=False)
+    if status == 408:
+        return TransportError("request_timeout", retryable=True)
+    if status == 429:
+        return TransportError("rate_limited", retryable=True)
+    if status >= 500:
+        return TransportError("server_error", retryable=True)
+    return TransportError("client_error", retryable=False)
+
+
+@dataclass(frozen=True)
+class RelationshipCandidate:
+    state_text: str
+    open_topics: tuple[str, ...]
+    preferred_address: str
+    communication_style: str
+
+
+def _strict_object(
+    content: str, *, fields: set[str], optional: set[str] | None = None
+) -> dict[str, Any]:
+    if not isinstance(content, str) or not content.strip():
+        raise ContractError()
+    try:
+        value = json.loads(content.strip())
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ContractError("invalid_json") from exc
+    if not isinstance(value, dict):
+        raise ContractError()
+    optional = optional or set()
+    keys = set(value)
+    if not fields.issubset(keys) or not keys.issubset(fields | optional):
+        raise ContractError("unknown_or_missing_field")
+    return value
+
+
+def _bounded_text(value: Any, *, maximum: int, allow_empty: bool = True) -> str:
+    if not isinstance(value, str):
+        raise ContractError()
+    compact = " ".join(value.split())
+    if not allow_empty and not compact:
+        raise ContractError()
+    return compact[:maximum]
+
+
+def _parse_summary(content: str) -> str:
+    parsed = _strict_object(content, fields={"summary"})
+    return _bounded_text(parsed["summary"], maximum=600, allow_empty=False)
+
+
+def _parse_facts(content: str, *, user_id: str) -> tuple[PrivateFactCandidate, ...]:
+    parsed = _strict_object(content, fields={"facts"})
+    raw_facts = parsed["facts"]
+    if not isinstance(raw_facts, list) or len(raw_facts) > 20:
+        raise ContractError()
+    candidates: list[PrivateFactCandidate] = []
+    required = {"fact_text", "source_message_id", "source_quote", "certainty"}
+    for raw in raw_facts:
+        if not isinstance(raw, dict) or set(raw) != required:
+            raise ContractError()
+        if raw["certainty"] != "explicit":
+            raise ContractError("unsupported_certainty")
+        candidates.append(
+            PrivateFactCandidate(
+                user_id=user_id,
+                fact_text=_bounded_text(
+                    raw["fact_text"], maximum=160, allow_empty=False
+                ),
+                source_message_id=_bounded_text(
+                    raw["source_message_id"], maximum=128, allow_empty=False
+                ),
+                source_quote=_bounded_text(
+                    raw["source_quote"], maximum=120, allow_empty=False
+                ),
+            )
+        )
+    return tuple(candidates)
+
+
+_UNCERTAIN_MARKERS = ("可能", "似乎", "也许", "或许", "看起来", "不确定")
+
+
+def _parse_relationship(content: str) -> RelationshipCandidate:
+    required = {
+        "state_text",
+        "open_topics",
+        "preferred_address",
+        "communication_style",
+        "certainty",
+    }
+    parsed = _strict_object(content, fields=required)
+    certainty = parsed["certainty"]
+    if certainty not in {"explicit", "uncertain"}:
+        raise ContractError("unsupported_certainty")
+    topics = parsed["open_topics"]
+    if not isinstance(topics, list) or len(topics) > MAX_OPEN_TOPICS:
+        raise ContractError()
+    bounded_topics = tuple(
+        _bounded_text(item, maximum=MAX_OPEN_TOPIC_LENGTH, allow_empty=False)
+        for item in topics
+    )
+    state_text = _bounded_text(
+        parsed["state_text"], maximum=MAX_STATE_TEXT_LENGTH, allow_empty=True
+    )
+    if certainty == "uncertain" and state_text and not any(
+        marker in state_text for marker in _UNCERTAIN_MARKERS
+    ):
+        state_text = ("可能" + state_text)[:MAX_STATE_TEXT_LENGTH]
+    return RelationshipCandidate(
+        state_text=state_text,
+        open_topics=bounded_topics,
+        preferred_address=_bounded_text(
+            parsed["preferred_address"], maximum=MAX_PREFERRED_ADDRESS_LENGTH
+        ),
+        communication_style=_bounded_text(
+            parsed["communication_style"], maximum=MAX_COMMUNICATION_STYLE_LENGTH
+        ),
+    )
+
+
+async def _complete(*, system: str, user: str) -> str:
+    if not CONFIG.ai_api_key:
+        raise TransportError("configuration_error", retryable=False)
+    payload = {
+        "model": CONFIG.ai_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=CONFIG.ai_timeout) as client:
+            response = await client.post(
+                f"{CONFIG.ai_base_url}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {CONFIG.ai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+    except httpx.HTTPStatusError as exc:
+        raise _classify_http_status(exc.response.status_code) from exc
+    except (httpx.TimeoutException, httpx.NetworkError, OSError) as exc:
+        raise TransportError() from exc
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ContractError("response_contract_error") from exc
+    if not isinstance(content, str):
+        raise ContractError("empty_response")
+    return content
+
+
+def _messages_payload(messages: Sequence[PrivateMessage]) -> str:
+    return json.dumps(
+        [
+            {
+                "id": item.id,
+                "message_id": item.message_id,
+                "direction": item.direction,
+                "text": item.text,
+            }
+            for item in messages
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+async def summarize_private_conversation(
+    previous: str, messages: Sequence[PrivateMessage]
+) -> str | None:
+    if not messages:
+        return None
+    try:
+        content = await _complete(
+            system=(
+                "合并私聊旧摘要和新消息，只保留明确内容，不推测、不记录口令、令牌或私密凭据。"
+                "只输出严格 JSON：{\"summary\":\"不超过600字的滚动摘要\"}。"
+            ),
+            user=json.dumps(
+                {
+                    "previous_summary": previous,
+                    "messages": json.loads(_messages_payload(messages)),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        return _parse_summary(content)
+    except PrivateMemoryAIError as exc:
+        logger.warning("private summary model failed error=%s", type(exc).__name__)
+        raise
+
+
+async def extract_private_facts(
+    messages: Sequence[PrivateMessage],
+) -> tuple[PrivateFactCandidate, ...]:
+    if not messages:
+        return ()
+    user_id = messages[0].user_id
+    try:
+        content = await _complete(
+            system=(
+                "保守提取说话者本人明确表达、未来仍有用的稳定非敏感事实。拒绝推测、情绪、评价、"
+                "密码、令牌、密钥和其他凭据。source_message_id 和 source_quote 必须来自输入。"
+                "只输出严格 JSON：{\"facts\":[{\"fact_text\":\"...\","
+                "\"source_message_id\":\"...\",\"source_quote\":\"...\","
+                "\"certainty\":\"explicit\"}]}。"
+            ),
+            user=_messages_payload(messages),
+        )
+        return _parse_facts(content, user_id=user_id)
+    except PrivateMemoryAIError as exc:
+        logger.warning("private facts model failed error=%s", type(exc).__name__)
+        raise
+
+
+async def generate_relationship_candidate(
+    current: RelationshipState | None, messages: Sequence[PrivateMessage]
+) -> RelationshipCandidate | None:
+    if not messages:
+        return None
+    current_payload: Mapping[str, Any] | None = None
+    if current is not None:
+        current_payload = {
+            "state_text": current.state_text,
+            "open_topics": current.open_topics,
+            "preferred_address": current.preferred_address,
+            "communication_style": current.communication_style,
+        }
+    try:
+        content = await _complete(
+            system=(
+                "更新聊天关系状态，只描述互动方式、熟悉程度和未完话题，不生成事实、心理诊断或"
+                "业务判断。推测必须标为 uncertain 并保留可能/似乎等不确定措辞。只输出严格 JSON："
+                "{\"state_text\":\"...\",\"open_topics\":[\"...\"],"
+                "\"preferred_address\":\"\",\"communication_style\":\"\","
+                "\"certainty\":\"explicit|uncertain\"}。"
+            ),
+            user=json.dumps(
+                {
+                    "current": current_payload,
+                    "messages": json.loads(_messages_payload(messages)),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        return _parse_relationship(content)
+    except PrivateMemoryAIError as exc:
+        logger.warning("relationship model failed error=%s", type(exc).__name__)
+        raise
+
+
+__all__ = [
+    "ContractError",
+    "PrivateMemoryAIError",
+    "RelationshipCandidate",
+    "TransportError",
+    "extract_private_facts",
+    "generate_relationship_candidate",
+    "summarize_private_conversation",
+]
