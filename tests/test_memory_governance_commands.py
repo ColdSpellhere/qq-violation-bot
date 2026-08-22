@@ -66,6 +66,54 @@ class MemoryGovernanceCommandTests(unittest.TestCase):
         with self.assertRaises(MemoryCommandError):
             self.parse("/记忆 添加 @伪目标 喜欢养花 @真实目标", malicious)
 
+    def test_all_multiple_and_invalid_real_at_segments_are_always_rejected(self):
+        invalid_messages = (
+            Message(
+                [
+                    MessageSegment.text("/记忆 添加 "),
+                    MessageSegment.at("all"),
+                    MessageSegment.at(300),
+                    MessageSegment.text(" 内容"),
+                ]
+            ),
+            Message(
+                [
+                    MessageSegment.text("/记忆 关系 "),
+                    MessageSegment.at(300),
+                    MessageSegment.at(301),
+                    MessageSegment.text(" 新状态"),
+                ]
+            ),
+            Message(
+                [
+                    MessageSegment.text("/记忆 添加 "),
+                    MessageSegment("at", {"qq": "invalid"}),
+                    MessageSegment.text(" 内容"),
+                ]
+            ),
+            Message(
+                [
+                    MessageSegment.text("/记忆 修改 G-1 内容 "),
+                    MessageSegment.at(300),
+                ]
+            ),
+            Message(
+                [
+                    MessageSegment.text("/记忆 状态"),
+                    MessageSegment.at(300),
+                ]
+            ),
+            Message(
+                [
+                    MessageSegment.text("/记忆 添加 200 内容 "),
+                    MessageSegment.at(300),
+                ]
+            ),
+        )
+        for message in invalid_messages:
+            with self.subTest(message=message), self.assertRaises(MemoryCommandError):
+                self.parse(message.extract_plain_text(), message)
+
     def test_group_relation_view_and_update_use_at_target(self):
         message = Message([MessageSegment.text("/记忆 关系 "), MessageSegment.at(300)])
         self.assertEqual("view_relation", self.parse("/记忆 关系 @群友", message).action)

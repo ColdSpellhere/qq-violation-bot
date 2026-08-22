@@ -140,6 +140,23 @@ class MemoryGovernanceHandlerTests(unittest.IsolatedAsyncioTestCase):
             (command.scope.kind, command.scope.user_id, command.scope.group_id),
         )
 
+    async def test_real_all_plus_member_at_is_rejected_before_service_access(self) -> None:
+        message = Message(
+            [
+                MessageSegment.text("/记忆 添加 "),
+                MessageSegment.at("all"),
+                MessageSegment.at(300),
+                MessageSegment.text(" 内容"),
+            ]
+        )
+        feature_patch, driver_patch, factory_patch, finish_patch = self._patches()
+        with feature_patch, driver_patch, factory_patch as factory, finish_patch as finish:
+            await matcher.handle_memory_governance(self.bot, _segment_event(message))
+
+        finish.assert_awaited_once_with("记忆治理命令格式错误。")
+        factory.assert_not_called()
+        self.bot.send_private_msg.assert_not_awaited()
+
     async def test_real_at_add_reaches_preview_with_exact_content(self) -> None:
         message = Message(
             [

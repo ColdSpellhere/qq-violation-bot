@@ -579,6 +579,73 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         queue.recover_expired_leases.assert_called_once()
         store.purge_expired.assert_called_once()
 
+    async def test_retention_runs_at_startup_then_every_day_and_shutdown_cancels_loop(self) -> None:
+        from plugins.private_memory import lifecycle
+
+        class FakeClock:
+            def __init__(self) -> None:
+                self.current = NOW
+                self.sleeps: list[float] = []
+                self.waiter: asyncio.Future[None] | None = None
+
+            def now(self) -> datetime:
+                return self.current
+
+            async def sleep(self, seconds: float) -> None:
+                self.sleeps.append(seconds)
+                self.waiter = asyncio.get_running_loop().create_future()
+                await self.waiter
+
+            def advance_one_day(self) -> None:
+                self.current += timedelta(days=1)
+                assert self.waiter is not None
+                self.waiter.set_result(None)
+
+        config = self.config()
+        migrate(config.chat_archive_path)
+        driver = FakeDriver()
+        clock = FakeClock()
+        queue = MagicMock()
+        store = MagicMock()
+        store.purge_expired.side_effect = (
+            SimpleNamespace(checkpoint_complete=False),
+            SimpleNamespace(checkpoint_complete=True),
+        )
+        worker = MagicMock()
+        worker.run = AsyncMock(return_value=None)
+        with (
+            patch.object(lifecycle, "get_driver", return_value=driver),
+            patch.object(lifecycle, "CONFIG", config),
+            patch.object(lifecycle, "MemoryJobQueue", return_value=queue),
+            patch.object(lifecycle, "PrivateMemoryStore", return_value=store),
+            patch.object(lifecycle, "MemoryJobWorker", return_value=worker),
+            patch.object(lifecycle, "_utc_now", new=clock.now, create=True),
+            patch.object(lifecycle, "_sleep", new=clock.sleep, create=True),
+            patch.object(lifecycle.logger, "warning") as warning,
+        ):
+            lifecycle.setup_lifecycle(processor=AsyncMock())
+            await driver.startup()
+            await asyncio.sleep(0)
+            self.assertEqual([86_400], clock.sleeps)
+            store.purge_expired.assert_called_once_with(
+                now=NOW,
+                retention_days=30,
+                max_messages=500,
+            )
+
+            clock.advance_one_day()
+            await asyncio.sleep(0)
+            self.assertEqual(2, store.purge_expired.call_count)
+            self.assertEqual(NOW + timedelta(days=1), store.purge_expired.call_args.kwargs["now"])
+            warning.assert_called_once()
+            self.assertIn("checkpoint", warning.call_args.args[0])
+
+            retention_task = lifecycle._retention_task
+            await driver.shutdown()
+
+        self.assertTrue(retention_task.done())
+        self.assertIsNone(lifecycle._retention_task)
+
     async def test_shutdown_waits_for_fast_inflight_callback(self) -> None:
         from plugins.private_memory import lifecycle
 

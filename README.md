@@ -85,6 +85,12 @@ GROUP_CHAT_ENABLED=false
 GROUP_CHAT_ALLOWED_GROUP_IDS=123456789
 PRIVATE_CHAT_ENABLED=false
 PRIVATE_CHAT_ALLOWED_USER_IDS=
+PRIVATE_MEMORY_ENABLED=false
+RELATIONSHIP_STATE_ENABLED=false
+MEMORY_GOVERNANCE_ENABLED=false
+PRIVATE_MEMORY_RETENTION_DAYS=30
+PRIVATE_MEMORY_MAX_MESSAGES=500
+PRIVATE_MEMORY_SHUTDOWN_TIMEOUT=10
 # 仅为旧版私聊白名单兼容保留；新部署使用上面的多值配置
 PRIVATE_CHAT_ALLOWED_USER_ID=
 ADMIN_SEED=123456:ColdSpell:冷|spell;654321:企鹅
@@ -317,7 +323,58 @@ systemctl is-active --quiet qq-violation-bot.service
 
 人物设定保存在项目根目录的 `character.md`。群聊和私聊在每次请求 AI 前都会重新读取该文件，保存后的修改会从下一条回复开始生效，无需重启；文件缺失、为空或无法按 UTF-8 读取时自动使用内置默认设定。业务隔离、对话方向、安全限制和输出规则仍由程序控制，不受角色文件影响。
 
-`PRIVATE_CHAT_ENABLED=true` 且聊天总开关开启时，机器人只回复 `PRIVATE_CHAT_ALLOWED_USER_IDS` 指定的 QQ 私聊白名单，多个 QQ号使用英文逗号分隔，其他账号完全静默。旧的 `PRIVATE_CHAT_ALLOWED_USER_ID` 仅作兼容输入。允许账号的每条非空普通文字都会由萝卜猫回复，不使用群聊概率；以 `/` 开头的命令和纯图片消息忽略。每个允许 QQ 分别保留最近 20 条双方文字和独立串行锁，彼此不会共享上下文；这些内容只在进程内存中保存，服务重启即清空，不写入群归档、成员记忆或业务数据库。私聊回复沿用 20% 表情包概率；紧急关闭请使用下文的 `/私聊 关`。
+`PRIVATE_CHAT_ENABLED=true` 且聊天总开关开启时，机器人只回复 `PRIVATE_CHAT_ALLOWED_USER_IDS` 指定的 QQ 私聊白名单，多个 QQ号使用英文逗号分隔，其他账号完全静默。旧的 `PRIVATE_CHAT_ALLOWED_USER_ID` 仅作兼容输入。允许账号的每条非空普通文字都会由萝卜猫回复，不使用群聊概率；以 `/` 开头的命令和纯图片消息忽略。每个允许 QQ 分别使用独立上下文和串行锁，彼此不会共享内容。`PRIVATE_MEMORY_ENABLED=false` 时仍只保留进程内最近 20 条双方文字，重启即清空；开启后才会写入下述私聊持久记忆。私聊回复沿用 20% 表情包概率；紧急关闭请使用下文的 `/私聊 关`。
+
+### 私聊持久记忆与治理
+
+私聊持久记忆只接收同时通过聊天总开关、私聊开关和 `PRIVATE_CHAT_ALLOWED_USER_IDS` 精确白名单的部署后新消息；不会回溯、导入或重新提炼历史私聊。数据按用户 QQ号隔离，读取、写入、任务和关系状态均限定在同一用户范围。三项新开关默认均为 `false`：`PRIVATE_MEMORY_ENABLED` 控制私聊原文、摘要与长期事实的读取和新增，`RELATIONSHIP_STATE_ENABLED` 控制关系状态与未完话题更新，`MEMORY_GOVERNANCE_ENABLED` 控制超级管理员治理入口。关闭 `PRIVATE_MEMORY_ENABLED` 后不持久化新私聊内容，已有记录不会被开关自动删除。
+
+持久层包含以下五类数据：双方原文、滚动摘要、长期事实、关系状态和未完话题。原文默认每用户最多保留 500 条且最多保留 30 天，分别由 `PRIVATE_MEMORY_MAX_MESSAGES` 和 `PRIVATE_MEMORY_RETENTION_DAYS` 调整；启动时立即清理一次，之后每 24 小时清理一次。清理事务启用 SQLite `secure_delete` 并尝试截断 WAL checkpoint；若 checkpoint 返回 busy，逻辑清理仍已提交，审计/日志会标记物理清理待完成，下一次每日清理会自然重试。系统不会在线自动执行 `VACUUM`。摘要、长期事实、关系状态和未完话题不使用原文的 500 条/30 天自动过期规则。
+
+这是敏感数据功能：原文、摘要和推断事实可能包含隐私，模型提取也可能不准确。生产数据库、WAL、备份和日志目录应仅允许服务账号访问；不要把真实 QQ号、私聊内容、数据库或备份提交到仓库。管理员应先查看和预览，再凭事实依据治理，不要把模型推断当作已核实事实。
+
+只有 NoneBot `SUPERUSERS` 可使用 `/记忆`。查看结果、写操作预览、操作码和最终结果都私聊发送给操作者，群内只显示不含内容的状态。所有写操作先生成预览；操作码绑定操作者和预览内容，10 分钟后过期且只能确认一次，确认时必须填写原因。
+
+```text
+/记忆 <QQ号|@群成员>
+/记忆 关系 <QQ号|@群成员> [新状态]
+/记忆 添加 <QQ号|@群成员> <内容>
+/记忆 修改 <G-编号|P-编号> <内容>
+/记忆 删除 <G-编号|P-编号>
+/记忆 清空 <白名单QQ号>
+/记忆 状态
+/记忆 确认 <操作码> <原因>
+/记忆 取消 <操作码>
+```
+
+`/记忆 清空` 只清理该用户的私聊原文、滚动摘要、未完话题和待处理摘要任务；长期事实需按 `P-编号` 分别删除，关系状态可通过关系命令修订。当前没有原文或全量记忆文件导出命令；授权管理员可用 `/记忆 <白名单QQ号>` 和 `/记忆 关系 <白名单QQ号>` 私下查看治理视图，灾备导出使用下述经过校验的 SQLite 在线备份。不要用未审计的临时 SQL 把私聊正文导出到公共目录。
+
+#### 迁移、启用与回滚
+
+迁移现有 `chat_archive.db` 前先保持 `/私聊记忆`、`/关系状态`、`/记忆治理` 为关闭，确认数据库路径，并创建权限为 `0700` 的备份目录。无 `--apply` 是只读预检；`--apply` 会先为现有数据库创建并校验在线备份，再做迁移和 `quick_check`。不要删除或复制正在使用的 `-wal`/`-shm` 文件代替在线备份。
+
+```bash
+cd /opt/qq-violation-bot
+install -d -m 0700 backups/private-memory-migration
+.venv/bin/python scripts/migrate_private_memory.py \
+  --database data/chat_archive.db \
+  --backup-dir backups/private-memory-migration
+.venv/bin/python scripts/migrate_private_memory.py \
+  --database data/chat_archive.db \
+  --backup-dir backups/private-memory-migration \
+  --apply
+.venv/bin/python scripts/migrate_private_memory.py \
+  --database data/chat_archive.db \
+  --backup-dir backups/private-memory-migration
+```
+
+在数据库副本或预发布环境再执行一次 `--apply`，验证重复迁移仍成功、schema version 不变、原有业务/聊天记录不变、每个备份文件权限为 `0600`，并用 `PRAGMA quick_check` 验证原库和备份均为 `ok`。全新空库由服务启动时创建 schema；迁移脚本要求目标数据库已存在，不会为了预检凭空创建数据库。
+
+迁移后先在所有新开关关闭时重启并验证既有业务、群聊、私聊和图片路径。然后逐项执行并在每一步检查 `/模块状态`：先 `/记忆治理 开`，再 `/私聊记忆 开`，最后 `/关系状态 开`；只有既有聊天总开关、私聊开关和白名单均已正确配置，白名单私聊才会进入持久路径。烟雾检查至少包括：数据库 `PRAGMA quick_check` 为 `ok`；schema version 为当前版本；非白名单私聊无读写；两个白名单测试用户互相看不到内容；一条部署后新私聊产生原文及任务；`/记忆 状态` 和查看结果只私发；预览 10 分钟有效且一次确认后不可重放；关闭 `/私聊记忆` 后新私聊不再新增持久记录。
+
+异常时优先止损，不要先恢复数据库：`/私聊记忆 关` 停止新的私聊持久内容与摘要/事实任务，`/关系状态 关` 停止关系更新，`/记忆治理 关` 关闭治理入口，必要时 `/私聊 关` 停止整个白名单私聊入口。代码回滚只切换程序版本，不会删除迁移后 schema 或新数据；数据库恢复会把数据库整体恢复到备份时点并丢失该时点之后的聊天及记忆写入。只有确认迁移数据损坏且明确接受数据丢失时，才停服、保留故障库副本、移走该数据库自己的 `-wal`/`-shm`，恢复精确在线备份并再次执行 `PRAGMA quick_check`。二者不要混为一步。
+
+如合规要求必须回收空闲页，应先完成在线备份，在维护窗口停服后人工执行 `VACUUM`，随后运行 `PRAGMA quick_check`；这不是每日 retention 的一部分。checkpoint busy 只表示物理 WAL 清理待重试，不表示已提交的逻辑删除失败，也不应因此重复确认同一个操作码。
 
 成员记忆独立于随机回复概率持续收集。原始特性和历史昵称以追加式账本永久保存在服务器 SQLite 中，不再按 8 条上限淘汰；本地 JSON 镜像包含完整历史。每累计 5 条新特性会生成一次不超过 300 字的滚动摘要，聊天 AI 只读取摘要、最多 5 个近期旧称和最多 8 条尚未摘要的特性。`MEMBER_MEMORY_SUMMARY_ENABLED=false` 只关闭摘要生成，永久账本仍继续写入。真实成员记忆与镜像不会提交到 GitHub。
 
@@ -338,6 +395,12 @@ GROUP_CHAT_ENABLED=false
 GROUP_CHAT_ALLOWED_GROUP_IDS=123456789
 PRIVATE_CHAT_ENABLED=false
 PRIVATE_CHAT_ALLOWED_USER_IDS=
+PRIVATE_MEMORY_ENABLED=false
+RELATIONSHIP_STATE_ENABLED=false
+MEMORY_GOVERNANCE_ENABLED=false
+PRIVATE_MEMORY_RETENTION_DAYS=30
+PRIVATE_MEMORY_MAX_MESSAGES=500
+PRIVATE_MEMORY_SHUTDOWN_TIMEOUT=10
 ```
 
 `BUSINESS_ENABLED` 控制当前 `TARGET_GROUP_ID` 的违规记录、查询、导出、减数策略和全部业务提醒，也覆盖旧版自动维护与周报生成、通知和群文件上传；关闭时数据库备份与证据存储清理仍可继续。`CHAT_ENABLED` 是聊天总开关；它关闭时，群聊和私聊子功能都不能处理消息。`GROUP_CHAT_ENABLED` 与 `GROUP_CHAT_ALLOWED_GROUP_IDS` 共同控制群聊回复、消息归档和成员记忆；`PRIVATE_CHAT_ENABLED` 与 `PRIVATE_CHAT_ALLOWED_USER_IDS` 共同控制私聊回复。两个白名单都使用英文逗号分隔的正整数 QQ号，群聊白名单填群号，私聊白名单填用户 QQ号。
@@ -365,12 +428,18 @@ PRIVATE_CHAT_ALLOWED_USER_IDS=
 /群聊群 列表
 /私聊 开
 /私聊 关
+/私聊记忆 开
+/私聊记忆 关
+/关系状态 开
+/关系状态 关
+/记忆治理 开
+/记忆治理 关
 /私聊用户 添加 <QQ号>
 /私聊用户 删除 <QQ号>
 /私聊用户 列表
 ```
 
-紧急止损时，优先使用对应的 QQ 命令，无需重启或回滚代码：`/业务 关` 停止新业务请求、v1.0.2beta 与旧版自动维护提醒，以及尚未开始的周报生成、通知和上传；每次实际外发前都会再次检查开关。`/聊天 关` 停止全部聊天入口；`/群聊 关` 只停群聊、归档和成员记忆；`/私聊 关` 只停私聊。开关修改失败会保留旧状态并返回失败信息，不能把失败当作已生效。
+紧急止损时，优先使用对应的 QQ 命令，无需重启或回滚代码：`/业务 关` 停止新业务请求、v1.0.2beta 与旧版自动维护提醒，以及尚未开始的周报生成、通知和上传；每次实际外发前都会再次检查开关。`/聊天 关` 停止全部聊天入口；`/群聊 关` 只停群聊、归档和成员记忆；`/私聊 关` 只停私聊；`/私聊记忆 关`、`/关系状态 关` 和 `/记忆治理 关` 分别停止新的持久记忆、关系更新和治理入口。开关修改失败会保留旧状态并返回失败信息，不能把失败当作已生效。
 
 启用 `DEDUCTION_POLICY_V102_ENABLED=true` 时，业务关闭、QQ/OneBot 离线或发送失败造成的策略提醒会保留在持久化队列中。业务开启期间生成的旧版维护通知会在逐条外发前持久化，周报任务会在生成文件前以日期幂等键持久化；离线、API 失败或中途关闭业务均会保留失败状态，服务重启也不会按普通消息重新发送。业务重新开启且发送通道恢复后，机器人只发送一次 QQ 合并转发的“未发送业务提醒概览”：首节点给出时间范围、提醒总数、涉及成员数、消息类型计数及各失败原因数量；策略提醒按成员归组，旧版/周报项目单独归组，不会逐条以普通群消息补发。只有该合并转发成功后，对应记录才标记为已处理；发送失败时记录保留，等待后续检查重试。
 

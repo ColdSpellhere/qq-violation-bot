@@ -86,9 +86,11 @@ def _positive_ascii_id(value: str, *, label: str) -> str:
     return str(int(value))
 
 
-def _message_tokens(message: object) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _message_tokens(
+    message: object,
+) -> tuple[tuple[str, ...], tuple[str | None, ...]]:
     tokens: list[str] = []
-    targets: list[str] = []
+    targets: list[str | None] = []
     try:
         segments: Sequence[object] = tuple(message)  # type: ignore[arg-type]
     except TypeError:
@@ -104,10 +106,11 @@ def _message_tokens(message: object) -> tuple[tuple[str, ...], tuple[str, ...]]:
             continue
         value = str(data.get("qq") or "") if hasattr(data, "get") else ""
         try:
-            targets.append(_positive_ascii_id(value, label="@目标 QQ号"))
-            tokens.append(f"\0at:{len(targets) - 1}")
+            target = _positive_ascii_id(value, label="@目标 QQ号")
         except MemoryCommandError:
-            continue
+            target = None
+        targets.append(target)
+        tokens.append(f"\0at:{len(targets) - 1}")
     return tuple(tokens), tuple(targets)
 
 
@@ -119,7 +122,10 @@ def _target_scope(
     group_id: int | None,
     private_allowed_user_ids: Iterable[str] | None,
 ) -> MemoryScope:
+    message_tokens, targets = _message_tokens(message)
     if token.isascii() and token.isdigit():
+        if targets:
+            raise MemoryCommandError("私聊 QQ号目标不能同时包含 @ 消息段。")
         user_id = _positive_ascii_id(token, label="私聊 QQ号")
         if private_allowed_user_ids is not None:
             allowed = {str(value) for value in private_allowed_user_ids}
@@ -127,9 +133,9 @@ def _target_scope(
                 raise MemoryCommandError("该私聊用户不在现有允许列表中。")
         return MemoryScope("private", user_id)
     if token and token[0] in {"@", "["}:
-        message_tokens, targets = _message_tokens(message)
         if (
             len(targets) != 1
+            or targets[0] is None
             or len(message_tokens) <= target_position
             or message_tokens[target_position] != "\0at:0"
         ):
@@ -169,6 +175,13 @@ def parse_memory_command(
     if not is_memory_command(source):
         return None
     parts = source.split(" ")
+    _, at_targets = _message_tokens(message)
+    accepts_at_target = (
+        (len(parts) == 2 and parts[1] not in {"帮助", "状态"})
+        or (len(parts) >= 2 and parts[1] in {"添加", "关系", "清空"})
+    )
+    if at_targets and not accepts_at_target:
+        raise MemoryCommandError("该命令不接受 @ 消息段。")
     if len(parts) == 1 or parts == ["/记忆", "帮助"]:
         return MemoryCommand("help")
     if parts[1] == "状态":

@@ -25,10 +25,39 @@ from .store import PrivateMemoryStore
 
 _registered_drivers: weakref.WeakSet[object] = weakref.WeakSet()
 _worker_task: asyncio.Task[None] | None = None
+_retention_task: asyncio.Task[None] | None = None
 _worker: MemoryJobWorker | None = None
 _queue: MemoryJobQueue | None = None
 _store: PrivateMemoryStore | None = None
 _processor: JobProcessor | None = None
+_sleep = asyncio.sleep
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _purge_retained_messages(store: PrivateMemoryStore) -> None:
+    report = store.purge_expired(
+        now=_utc_now(),
+        retention_days=CONFIG.private_memory_retention_days,
+        max_messages=CONFIG.private_memory_max_messages,
+    )
+    if not report.checkpoint_complete:
+        logger.warning(
+            "私聊记忆保留清理已提交，但 WAL checkpoint 尚未完成，将在后续周期重试"
+        )
+
+
+async def _run_daily_retention(store: PrivateMemoryStore) -> None:
+    while True:
+        await _sleep(86_400)
+        try:
+            _purge_retained_messages(store)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"私聊记忆定期清理失败，将在后续周期重试 error={type(exc).__name__}")
 
 
 def _allowed_job_types() -> frozenset[str]:
@@ -84,20 +113,20 @@ def setup_lifecycle(
 
     @driver.on_startup
     async def _startup() -> None:
-        global _queue, _store, _worker, _worker_task
+        global _queue, _store, _worker, _worker_task, _retention_task
         database = Path(CONFIG.chat_archive_path)
         _ensure_schema(database)
         _queue = MemoryJobQueue(database)
         _queue.start_intake()
-        _queue.recover_expired_leases(now=datetime.now(timezone.utc))
+        _queue.recover_expired_leases(now=_utc_now())
         _store = PrivateMemoryStore(
             database, retention_days=CONFIG.private_memory_retention_days
         )
-        _store.purge_expired(
-            now=datetime.now(timezone.utc),
-            retention_days=CONFIG.private_memory_retention_days,
-            max_messages=CONFIG.private_memory_max_messages,
-        )
+        _purge_retained_messages(_store)
+        if _retention_task is None or _retention_task.done():
+            _retention_task = asyncio.create_task(
+                _run_daily_retention(_store), name="private-memory-retention"
+            )
         processor = _processor
         if processor is None:
             from .processor import PrivateMemoryProcessor
@@ -120,7 +149,15 @@ def setup_lifecycle(
 
     @driver.on_shutdown
     async def _shutdown() -> None:
-        global _worker_task
+        global _worker_task, _retention_task
+        retention_task = _retention_task
+        _retention_task = None
+        if retention_task is not None and not retention_task.done():
+            retention_task.cancel()
+            try:
+                await retention_task
+            except asyncio.CancelledError:
+                pass
         task = _worker_task
         _worker_task = None
         if _queue is not None:
@@ -143,21 +180,24 @@ def setup_lifecycle(
 
 
 async def _cancel_for_tests() -> None:
-    global _worker_task
-    task = _worker_task
+    global _worker_task, _retention_task
+    tasks = (_worker_task, _retention_task)
     _worker_task = None
-    if task is None or task.done():
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    _retention_task = None
+    for task in tasks:
+        if task is None or task.done():
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def _reset_for_tests() -> None:
-    global _worker_task, _worker, _queue, _store, _processor, _registered_drivers
+    global _worker_task, _retention_task, _worker, _queue, _store, _processor, _registered_drivers
     _worker_task = None
+    _retention_task = None
     _worker = None
     _queue = None
     _store = None

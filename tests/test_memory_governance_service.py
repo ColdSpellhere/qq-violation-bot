@@ -269,6 +269,12 @@ class MemoryGovernanceServiceTests(unittest.TestCase):
         wal = Path(str(self.db) + "-wal")
         if wal.exists():
             self.assertNotIn(marker_bytes, wal.read_bytes())
+        with sqlite3.connect(self.db) as connection:
+            audit = connection.execute(
+                "SELECT result,error_code FROM memory_governance_audit WHERE operation_id=?",
+                (preview.operation_id,),
+            ).fetchone()
+        self.assertEqual(("success", ""), audit)
 
     def test_checkpoint_busy_reports_committed_physical_cleanup_pending(self):
         with sqlite3.connect(self.db) as connection:
@@ -284,6 +290,32 @@ class MemoryGovernanceServiceTests(unittest.TestCase):
         self.assertIn("物理清理未完成", result.message)
         with sqlite3.connect(self.db) as connection:
             self.assertEqual("", connection.execute("SELECT text FROM private_chat_messages").fetchone()[0])
+
+    def test_real_checkpoint_busy_is_persisted_as_searchable_audit_warning(self):
+        with sqlite3.connect(self.db) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                "INSERT INTO private_chat_messages(user_id,message_id,direction,text,content_hash,event_time,created_at,expires_at,source_kind) VALUES('200','real-busy','user','正文','hash',1,'old','future','text')"
+            )
+            connection.commit()
+        preview = self.preview(MemoryCommand("clear_private", scope=self.private_scope()))
+
+        reader = sqlite3.connect(self.db)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT text FROM private_chat_messages").fetchone()
+            result = self.confirm(preview.token)
+        finally:
+            reader.close()
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.physical_cleanup_complete)
+        with sqlite3.connect(self.db) as connection:
+            audit = connection.execute(
+                "SELECT result,error_code FROM memory_governance_audit WHERE operation_id=?",
+                (preview.operation_id,),
+            ).fetchone()
+        self.assertEqual(("success", "physical_cleanup_pending"), audit)
 
     def test_clear_without_summary_creates_tombstone_through_all_history(self):
         with sqlite3.connect(self.db) as connection:

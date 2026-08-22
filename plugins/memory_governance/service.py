@@ -288,6 +288,7 @@ class MemoryGovernanceService:
             physical_cleanup_complete = _checkpoint_truncate(self.path)
             if not physical_cleanup_complete:
                 message = "逻辑变更已提交，但物理清理未完成，需要重试 WAL checkpoint。"
+                self._mark_physical_cleanup_pending(operation_id)
         mirror_target = self._group_mirror_target(committed_payload)
         if mirror_target is not None and self.member_memory_root is not None:
             try:
@@ -304,6 +305,15 @@ class MemoryGovernanceService:
             physical_cleanup_complete=physical_cleanup_complete,
             mirror_refresh_complete=mirror_refresh_complete,
         )
+
+    def _mark_physical_cleanup_pending(self, operation_id: int) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute(
+                "UPDATE memory_governance_audit SET error_code='physical_cleanup_pending' "
+                "WHERE operation_id=? AND result='success'",
+                (operation_id,),
+            )
+            connection.commit()
 
     def cancel(self, token: str, *, actor: str, now: datetime) -> CancelResult:
         actor = _positive_actor(actor)
