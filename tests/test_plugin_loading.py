@@ -11,6 +11,47 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PluginLoadingTests(unittest.TestCase):
+    def test_governance_loads_after_feature_control_before_chat_plugins(self) -> None:
+        source = (ROOT / "bot.py").read_text(encoding="utf-8")
+        feature = source.index('nonebot.load_plugin("plugins.feature_control.matcher")')
+        governance_package = source.index(
+            'nonebot.load_plugin("plugins.memory_governance")'
+        )
+        governance_matcher = source.index(
+            'nonebot.load_plugin("plugins.memory_governance.matcher")'
+        )
+        first_chat_plugin = source.index('nonebot.load_plugin("plugins.chat_archive")')
+        self.assertLess(feature, governance_package)
+        self.assertLess(governance_package, governance_matcher)
+        self.assertLess(governance_matcher, first_chat_plugin)
+
+    def test_governance_package_import_has_no_matcher_side_effect(self) -> None:
+        env = os.environ.copy()
+        env.update({"TARGET_GROUP_ID": "123456789", "LOG_LEVEL": "WARNING"})
+        script = """
+import sys
+import nonebot
+
+nonebot.init()
+import plugins.memory_governance
+if "plugins.memory_governance.matcher" in sys.modules:
+    raise SystemExit("package import unexpectedly imported matcher")
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            0,
+            completed.returncode,
+            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+
     def test_bot_import_registers_control_router_and_background_plugins(self) -> None:
         env = os.environ.copy()
         env.update(
@@ -33,6 +74,7 @@ required = {
     "random_chat",
     "private_chat",
     "feature_control",
+    "memory_governance",
     "group_router",
 }
 missing = sorted(required - loaded)
@@ -46,6 +88,11 @@ if "plugins.member_memory.matcher" not in loaded_modules:
 if "plugins.feature_control.matcher" not in loaded_modules:
     raise SystemExit(
         "missing loaded plugin module: plugins.feature_control.matcher; "
+        f"loaded_modules={sorted(loaded_modules)}"
+    )
+if "plugins.memory_governance.matcher" not in loaded_modules:
+    raise SystemExit(
+        "missing loaded plugin module: plugins.memory_governance.matcher; "
         f"loaded_modules={sorted(loaded_modules)}"
     )
 if "plugins.chat_vision" not in loaded_modules:
@@ -64,6 +111,7 @@ registered = {
     for matcher in priority_matchers
 }
 expected_background = {
+    (0, "plugins.memory_governance.matcher"),
     (1, "plugins.chat_archive.matcher"),
     (2, "plugins.member_memory.matcher"),
     (2, "plugins.chat_vision.matcher"),

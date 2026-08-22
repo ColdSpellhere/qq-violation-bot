@@ -61,6 +61,25 @@ def is_memory_command(text: str) -> bool:
     return bool(parts) and parts[0] == "/记忆"
 
 
+def canonical_memory_command_text(message: object) -> str:
+    """Preserve real at-segment positions without trusting CQ/display text."""
+    try:
+        segments: Sequence[object] = tuple(message)  # type: ignore[arg-type]
+    except TypeError:
+        return ""
+    parts: list[str] = []
+    for segment in segments:
+        segment_type = getattr(segment, "type", None)
+        data = getattr(segment, "data", {})
+        if segment_type == "text":
+            parts.append(
+                str(data.get("text") or "") if hasattr(data, "get") else ""
+            )
+        elif segment_type == "at":
+            parts.append(" @ ")
+    return "".join(parts)
+
+
 def _positive_ascii_id(value: str, *, label: str) -> str:
     if not value.isascii() or not value.isdigit() or int(value) <= 0:
         raise MemoryCommandError(f"{label}必须为 ASCII 正整数。")
@@ -229,6 +248,7 @@ def parse_memory_command(
 
 
 __all__ = [
+    "canonical_memory_command_text",
     "MemoryCommand",
     "MemoryCommandError",
     "MEMORY_HELP_TEXT",
