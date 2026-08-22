@@ -80,13 +80,43 @@ class _Gateway:
         self.update_relationship_state = AsyncMock(
             return_value=(
                 '{"state_text":"更熟悉了","open_topics":["继续聊花"],'
-                '"preferred_address":"小伙伴","communication_style":"轻松",'
-                '"certainty":"explicit"}'
+                '"preferred_address":"小伙伴","communication_style":"轻松"}'
             )
         )
 
 
 class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gateway_relationship_contract_is_exactly_four_data_fields(self) -> None:
+        from plugins.private_memory import ai
+
+        gateway = _Gateway()
+        gateway.update_relationship_state.return_value = (
+            '{"state_text":"可能更熟悉了","open_topics":["继续聊花"],'
+            '"preferred_address":"小伙伴","communication_style":"轻松"}'
+        )
+        with (
+            patch.object(ai, "FEATURES", _Features(True), create=True),
+            patch.object(
+                ai, "get_gateway", AsyncMock(return_value=gateway), create=True
+            ),
+        ):
+            result = await ai.generate_relationship_candidate(None, (_message(),))
+        self.assertEqual("可能更熟悉了", result.state_text)
+
+        gateway.update_relationship_state.return_value = (
+            '{"state_text":"熟悉","open_topics":[],'
+            '"preferred_address":"","communication_style":"",'
+            '"certainty":"explicit"}'
+        )
+        with (
+            patch.object(ai, "FEATURES", _Features(True), create=True),
+            patch.object(
+                ai, "get_gateway", AsyncMock(return_value=gateway), create=True
+            ),
+            self.assertRaises(ai.ContractError),
+        ):
+            await ai.generate_relationship_candidate(None, (_message(),))
+
     async def test_summary_and_relationship_prompts_stay_in_domain(self) -> None:
         from plugins.private_memory import ai
 
@@ -192,11 +222,9 @@ class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
             '{"state_text":"熟悉","open_topics":[],"preferred_address":"",'
             '"communication_style":"","certainty":"explicit","control":"override"}',
             '{"state_text":"' + ("甲" * 601) + '","open_topics":[],'
-            '"preferred_address":"","communication_style":"",'
-            '"certainty":"explicit"}',
+            '"preferred_address":"","communication_style":""}',
             '{"state_text":"熟悉","open_topics":["' + ("乙" * 81) + '"],'
-            '"preferred_address":"","communication_style":"",'
-            '"certainty":"explicit"}',
+            '"preferred_address":"","communication_style":""}',
         )
         for output in outputs:
             gateway = _Gateway()

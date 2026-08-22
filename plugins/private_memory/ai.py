@@ -150,17 +150,19 @@ def _parse_facts(content: str, *, user_id: str) -> tuple[PrivateFactCandidate, .
 _UNCERTAIN_MARKERS = ("可能", "似乎", "也许", "或许", "看起来", "不确定")
 
 
-def _parse_relationship(content: str) -> RelationshipCandidate:
-    required = {
+def _parse_relationship(
+    content: str, *, gateway_contract: bool = False
+) -> RelationshipCandidate:
+    data_fields = {
         "state_text",
         "open_topics",
         "preferred_address",
         "communication_style",
-        "certainty",
     }
+    required = data_fields if gateway_contract else data_fields | {"certainty"}
     parsed = _strict_object(content, fields=required)
-    certainty = parsed["certainty"]
-    if certainty not in {"explicit", "uncertain"}:
+    certainty = parsed.get("certainty", "explicit")
+    if not gateway_contract and certainty not in {"explicit", "uncertain"}:
         raise ContractError("unsupported_certainty")
     topics = parsed["open_topics"]
     if not isinstance(topics, list) or len(topics) > MAX_OPEN_TOPICS:
@@ -260,9 +262,12 @@ def _map_gateway_error(error: GatewayError) -> PrivateMemoryAIError:
 
 
 async def _complete(
-    *, task: str, messages: tuple[dict[str, object], dict[str, object]]
+    *,
+    task: str,
+    messages: tuple[dict[str, object], dict[str, object]],
+    use_gateway: bool,
 ) -> str:
-    if not FEATURES.llm_gateway_allowed("private_memory"):
+    if not use_gateway:
         return await _legacy_complete(
             system=str(messages[0]["content"]), user=str(messages[1]["content"])
         )
@@ -303,7 +308,10 @@ def _summary_messages(
 
 
 def _relationship_messages(
-    current: RelationshipState | None, messages: Sequence[PrivateMessage]
+    current: RelationshipState | None,
+    messages: Sequence[PrivateMessage],
+    *,
+    gateway_contract: bool,
 ) -> tuple[dict[str, object], dict[str, object]]:
     current_payload: Mapping[str, Any] | None = None
     if current is not None:
@@ -313,15 +321,22 @@ def _relationship_messages(
             "preferred_address": current.preferred_address,
             "communication_style": current.communication_style,
         }
+    output_contract = (
+        '{"state_text":"...","open_topics":["..."],'
+        '"preferred_address":"","communication_style":""}'
+        if gateway_contract
+        else '{"state_text":"...","open_topics":["..."],'
+        '"preferred_address":"","communication_style":"",'
+        '"certainty":"explicit|uncertain"}'
+    )
     return (
         {
             "role": "system",
             "content": (
                 "更新聊天关系状态，只描述互动方式、熟悉程度和未完话题，不生成事实、心理诊断或"
-                "业务判断。推测必须标为 uncertain 并保留可能/似乎等不确定措辞。只输出严格 JSON："
-                "{\"state_text\":\"...\",\"open_topics\":[\"...\"],"
-                "\"preferred_address\":\"\",\"communication_style\":\"\","
-                "\"certainty\":\"explicit|uncertain\"}。"
+                "业务判断。推测内容必须在文字中保留可能/似乎等不确定措辞。只输出严格 JSON："
+                + output_contract
+                + "。"
             ),
         },
         {
@@ -360,9 +375,11 @@ async def summarize_private_conversation(
     if not messages:
         return None
     try:
+        use_gateway = FEATURES.llm_gateway_allowed("private_memory")
         content = await _complete(
             task="private_summary",
             messages=_summary_messages(previous, messages),
+            use_gateway=use_gateway,
         )
         return _parse_summary(content)
     except PrivateMemoryAIError as exc:
@@ -399,11 +416,15 @@ async def generate_relationship_candidate(
     if not messages:
         return None
     try:
+        use_gateway = FEATURES.llm_gateway_allowed("private_memory")
         content = await _complete(
             task="relationship",
-            messages=_relationship_messages(current, messages),
+            messages=_relationship_messages(
+                current, messages, gateway_contract=use_gateway
+            ),
+            use_gateway=use_gateway,
         )
-        return _parse_relationship(content)
+        return _parse_relationship(content, gateway_contract=use_gateway)
     except PrivateMemoryAIError as exc:
         logger.warning("relationship model failed error=%s", type(exc).__name__)
         raise
