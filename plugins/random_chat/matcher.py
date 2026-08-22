@@ -6,6 +6,7 @@ from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
 
 from plugins.chat_archive.db import ContextMessage, archived_message_author, recent_text_context
+from plugins.feature_control.runtime import FEATURES
 from plugins.member_memory.store import load_profiles
 from plugins.violation_record.config import CONFIG
 
@@ -165,6 +166,33 @@ async def send_random_reply(
         compact=True,
         include_summary=CONFIG.member_memory_summary_enabled,
     )
+    relationship = None
+    open_topics: tuple[str, ...] = ()
+    feature_state = FEATURES.snapshot()
+    relationship_prompt_enabled = (
+        feature_state.relationship_state_enabled
+        and feature_state.prompt_builder_enabled
+    )
+    if relationship_prompt_enabled:
+        try:
+            from plugins.private_memory.relationship import RelationshipStore
+
+            relationship = RelationshipStore(CONFIG.chat_archive_path).get_group(
+                group_id=int(event.group_id),
+                user_id=str(event.user_id),
+                persona_id="radish-cat",
+            )
+            if relationship is not None:
+                open_topics = relationship.open_topics
+        except Exception as exc:
+            logger.warning(
+                f"随机闲聊读取关系状态失败：{type(exc).__name__}"
+            )
+            relationship = None
+            open_topics = ()
+    if not relationship_prompt_enabled:
+        relationship = None
+        open_topics = ()
     try:
         reply = await generate_reply(
             current_text,
@@ -173,6 +201,8 @@ async def send_random_reply(
             profiles=profiles,
             addressed=addressed,
             images=images,
+            relationship=relationship,
+            open_topics=open_topics,
         )
     except RandomChatAIError as exc:
         logger.warning(f"随机闲聊 AI 回复失败：{exc}")

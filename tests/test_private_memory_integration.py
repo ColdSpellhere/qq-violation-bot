@@ -380,11 +380,22 @@ class PrivateMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         profile = generate.await_args.kwargs["profiles"][0]
         self.assertIn("摘" * 1_200, profile.summary)
         self.assertNotIn("摘" * 1_201, profile.summary)
-        self.assertIn("熟悉" * 300, profile.summary)
-        self.assertIn("话题4", profile.summary)
+        self.assertNotIn("熟悉" * 300, profile.summary)
+        self.assertNotIn("话题4", profile.summary)
         self.assertEqual(1_200, sum(len(item.text) for item in profile.traits))
         self.assertEqual("喜欢火锅", profile.traits[0].text)
         self.assertEqual("private", generate.await_args.kwargs["chat_mode"])
+        self.assertEqual(
+            "熟悉" * 300,
+            generate.await_args.kwargs["relationship"].state_text,
+        )
+        self.assertEqual(
+            tuple(f"话题{index}" for index in range(5)),
+            generate.await_args.kwargs["open_topics"],
+        )
+        legacy_profile = generate.await_args.kwargs["legacy_profiles"][0]
+        self.assertIn("熟悉" * 300, legacy_profile.summary)
+        self.assertIn("话题4", legacy_profile.summary)
 
         with closing(sqlite3.connect(self.database)) as connection:
             jobs = connection.execute(

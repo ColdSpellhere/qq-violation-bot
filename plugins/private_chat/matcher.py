@@ -12,6 +12,7 @@ from plugins.chat_archive.db import ContextMessage
 from plugins.feature_control.runtime import FEATURES
 from plugins.member_memory.store import MemberProfile, MemoryTrait
 from plugins.private_memory.jobs import MemoryJobQueue
+from plugins.private_memory.models import RelationshipState
 from plugins.private_memory.relationship import RelationshipStore
 from plugins.private_memory.store import PrivateMemoryStore
 from plugins.random_chat.ai import RandomChatAIError, generate_reply
@@ -55,32 +56,15 @@ def _persistent_allowed(user_id: str) -> bool:
 def _private_profile(
     *,
     store: PrivateMemoryStore,
-    relationship_store: RelationshipStore,
     user_id: str,
     nickname: str,
 ) -> tuple[MemberProfile, ...]:
     summary = store.get_summary(user_id=user_id)
     facts = store.active_facts(user_id=user_id, limit=100)
-    relationship = None
-    if FEATURES.snapshot().relationship_state_enabled:
-        relationship = relationship_store.get_private(
-            user_id=user_id, persona_id="radish-cat"
-        )
 
     summary_parts: list[str] = []
     if summary is not None:
         summary_parts.append("私聊摘要：" + summary.summary_text[:_SUMMARY_LIMIT])
-    if relationship is not None:
-        if relationship.state_text:
-            summary_parts.append(
-                "关系状态：" + relationship.state_text[:_RELATIONSHIP_LIMIT]
-            )
-        topics = tuple(
-            topic[:_TOPIC_LIMIT]
-            for topic in relationship.open_topics[:_TOPIC_COUNT]
-        )
-        if topics:
-            summary_parts.append("未完话题：" + "；".join(topics))
 
     fact_budget = _FACTS_LIMIT
     traits: list[MemoryTrait] = []
@@ -109,13 +93,42 @@ def _private_profile(
             nickname=nickname,
             aliases=(),
             traits=tuple(traits),
-            updated_at=(
-                relationship.updated_at
-                if relationship is not None
-                else summary.updated_at
-                if summary is not None
-                else ""
-            ),
+            updated_at=summary.updated_at if summary is not None else "",
+            summary="\n".join(summary_parts),
+        ),
+    )
+
+
+def _legacy_private_profiles(
+    profiles: tuple[MemberProfile, ...],
+    *,
+    relationship: RelationshipState | None,
+    user_id: str,
+    nickname: str,
+) -> tuple[MemberProfile, ...]:
+    if relationship is None:
+        return profiles
+    summary_parts: list[str] = []
+    if profiles and profiles[0].summary:
+        summary_parts.append(profiles[0].summary)
+    if relationship.state_text:
+        summary_parts.append(
+            "关系状态：" + relationship.state_text[:_RELATIONSHIP_LIMIT]
+        )
+    topics = tuple(
+        topic[:_TOPIC_LIMIT] for topic in relationship.open_topics[:_TOPIC_COUNT]
+    )
+    if topics:
+        summary_parts.append("未完话题：" + "；".join(topics))
+    base = profiles[0] if profiles else None
+    return (
+        MemberProfile(
+            group_id=0,
+            user_id=user_id,
+            nickname=nickname,
+            aliases=base.aliases if base else (),
+            traits=base.traits if base else (),
+            updated_at=relationship.updated_at,
             summary="\n".join(summary_parts),
         ),
     )
@@ -212,6 +225,9 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             return
 
         profiles: tuple[MemberProfile, ...] = ()
+        relationship = None
+        open_topics: tuple[str, ...] = ()
+        legacy_profiles: tuple[MemberProfile, ...] | None = None
         if persistent:
             if not _persistent_allowed(user_id):
                 return
@@ -244,7 +260,18 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                     )
                 profiles = _private_profile(
                     store=store,
-                    relationship_store=relationship_store,
+                    user_id=user_id,
+                    nickname=current.nickname,
+                )
+                if FEATURES.snapshot().relationship_state_enabled:
+                    relationship = relationship_store.get_private(
+                        user_id=user_id, persona_id="radish-cat"
+                    )
+                    if relationship is not None:
+                        open_topics = relationship.open_topics
+                legacy_profiles = _legacy_private_profiles(
+                    profiles,
+                    relationship=relationship,
                     user_id=user_id,
                     nickname=current.nickname,
                 )
@@ -252,6 +279,9 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                 logger.warning(f"私聊记忆任务准备失败：{type(exc).__name__}")
             if not _persistent_allowed(user_id):
                 return
+            if not FEATURES.snapshot().relationship_state_enabled:
+                relationship = None
+                open_topics = ()
         try:
             reply = await generate_reply(
                 text,
@@ -260,6 +290,9 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                 profiles=profiles,
                 addressed=True,
                 chat_mode="private",
+                relationship=relationship,
+                open_topics=open_topics,
+                legacy_profiles=legacy_profiles,
             )
         except RandomChatAIError as exc:
             logger.warning(f"私聊 AI 回复失败：{type(exc).__name__}")

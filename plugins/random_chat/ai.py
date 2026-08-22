@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-import httpx
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal
+from datetime import datetime
+import logging
+from typing import TYPE_CHECKING, Literal, Protocol
+
+import httpx
 
 from plugins.chat_archive.db import ContextMessage
+from plugins.chat_prompt import ChatPromptInput, build_chat_prompt
+from plugins.feature_control.runtime import FEATURES
+from plugins.llm_gateway import get_gateway
+from plugins.llm_gateway.errors import GatewayError
 from plugins.member_memory.store import MemberProfile
 from plugins.random_chat.persona import load_character_prompt
 from plugins.violation_record.config import CONFIG
@@ -13,8 +20,18 @@ if TYPE_CHECKING:
     from plugins.chat_vision.client import VisionImage
 
 
+logger = logging.getLogger(__name__)
+
+
 class RandomChatAIError(RuntimeError):
     pass
+
+
+class RelationshipStateLike(Protocol):
+    state_text: str
+    open_topics: tuple[str, ...]
+    preferred_address: str
+    communication_style: str
 
 
 def _clean_reply(content: object) -> str | None:
@@ -35,9 +52,106 @@ async def generate_reply(
     addressed: bool = False,
     chat_mode: Literal["group", "private"] = "group",
     images: Sequence[VisionImage] = (),
+    relationship: RelationshipStateLike | None = None,
+    open_topics: tuple[str, ...] = (),
+    legacy_profiles: Sequence[MemberProfile] | None = None,
 ) -> str | None:
     if not CONFIG.ai_api_key:
         return None
+    feature_state = FEATURES.snapshot()
+    if not feature_state.relationship_state_enabled:
+        relationship = None
+        open_topics = ()
+    effective_profiles = tuple(profiles)
+    if chat_mode == "private" and current is not None and current.user_id:
+        effective_profiles = tuple(
+            profile
+            for profile in effective_profiles
+            if str(profile.user_id) == str(current.user_id)
+        )
+        scope = getattr(relationship, "scope", None)
+        if scope is not None and str(getattr(scope, "user_id", "")) != str(
+            current.user_id
+        ):
+            relationship = None
+            open_topics = ()
+    effective_legacy_profiles = (
+        tuple(legacy_profiles) if legacy_profiles is not None else effective_profiles
+    )
+    if chat_mode == "private" and current is not None and current.user_id:
+        effective_legacy_profiles = tuple(
+            profile
+            for profile in effective_legacy_profiles
+            if str(profile.user_id) == str(current.user_id)
+        )
+    if not feature_state.relationship_state_enabled:
+        effective_legacy_profiles = effective_profiles
+    persona = load_character_prompt()
+    legacy_messages = _legacy_messages(
+        message,
+        context=context,
+        current=current,
+        profiles=effective_legacy_profiles,
+        addressed=addressed,
+        chat_mode=chat_mode,
+        persona=persona,
+    )
+    messages = legacy_messages
+    if feature_state.prompt_builder_enabled:
+        try:
+            current_message = current or ContextMessage(
+                "当前用户", message, message_id="current", user_id=""
+            )
+            descriptions = tuple(
+                description
+                for item in (*context, current_message)
+                for description in item.image_descriptions
+                if description.strip()
+            )
+            messages = build_chat_prompt(
+                ChatPromptInput(
+                    mode=chat_mode,
+                    now_text=datetime.now().astimezone().isoformat(timespec="minutes"),
+                    persona=persona,
+                    context=tuple(context),
+                    profiles=effective_profiles,
+                    relationship=relationship,
+                    open_topics=tuple(open_topics),
+                    image_descriptions=descriptions,
+                    current=current_message,
+                    addressed=addressed,
+                )
+            ).messages
+        except Exception as exc:
+            logger.warning(
+                "chat prompt builder failed error_class=%s", type(exc).__name__
+            )
+            messages = legacy_messages
+
+    messages = _attach_images(messages, images)
+    try:
+        if FEATURES.llm_gateway_allowed("chat"):
+            gateway = await get_gateway()
+            content = await gateway.generate_chat_reply(messages, images=bool(images))
+        else:
+            content = await _legacy_complete(messages, images=bool(images))
+    except GatewayError as exc:
+        raise RandomChatAIError(type(exc).__name__) from None
+    except Exception as exc:
+        raise RandomChatAIError(str(exc)) from exc
+    return _clean_reply(content)
+
+
+def _legacy_messages(
+    message: str,
+    *,
+    context: Sequence[ContextMessage],
+    current: ContextMessage | None,
+    profiles: Sequence[MemberProfile],
+    addressed: bool,
+    chat_mode: Literal["group", "private"],
+    persona: str,
+) -> tuple[dict[str, object], ...]:
     private_mode = chat_mode == "private"
     reply_policy = (
         "这条消息明确在对你说。请直接、自然地回答，不要输出 SKIP。"
@@ -90,75 +204,82 @@ async def generate_reply(
         + "\n\n当前消息："
         + (_format_turn(current) if current else message)
     )
-    user_content: str | list[dict[str, object]] = user_prompt
-    if images:
-        from plugins.chat_vision.client import image_data_url
-
-        user_content = [
-            {"type": "text", "text": user_prompt},
-            *(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_data_url(image.content, image.mime_type)
-                    },
-                }
-                for image in images
+    return (
+        {
+            "role": "system",
+            "content": (
+                scene_policy
+                + "\n"
+                + persona
+                + "\n"
+                + reply_policy
+                + "\n"
+                + style_policy
+                + (
+                    "不像客服、助手或主持人。通常只写一句，允许短句、省略和口语，不强求完整语法。\n"
+                    "可以有态度、疑问或轻微调侃，但不要强行搞笑。直接说内容，不寒暄、不总结、"
+                    "不解释为何回复。不固定使用“哈哈”“确实”“听起来”“感觉”“原来如此”等开场，"
+                    "也不要为了像人而刻意添加语气词。不要复述上一条消息或换个说法重复。\n"
+                )
+                + direction_policy
+                + "\n"
+                + safety_policy
+                + output_policy
             ),
-        ]
-    payload = {
+        },
+        {
+            "role": "user",
+            "content": user_prompt,
+        },
+    )
+
+
+def _attach_images(
+    messages: Sequence[dict[str, object]], images: Sequence[VisionImage]
+) -> tuple[dict[str, object], ...]:
+    copied = tuple(dict(item) for item in messages)
+    if not images:
+        return copied
+    from plugins.chat_vision.client import image_data_url
+
+    user = dict(copied[-1])
+    text = user.get("content", "")
+    user["content"] = [
+        {"type": "text", "text": str(text)},
+        *(
+            {
+                "type": "image_url",
+                "image_url": {"url": image_data_url(image.content, image.mime_type)},
+            }
+            for image in images
+        ),
+    ]
+    return (*copied[:-1], user)
+
+
+async def _legacy_complete(
+    messages: Sequence[dict[str, object]], *, images: bool
+) -> object:
+    payload: dict[str, object] = {
         "model": CONFIG.chat_vision_model if images else CONFIG.ai_model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    scene_policy
-                    + "\n"
-                    + load_character_prompt()
-                    + "\n"
-                    + reply_policy
-                    + "\n"
-                    + style_policy
-                    + (
-                        "不像客服、助手或主持人。通常只写一句，允许短句、省略和口语，不强求完整语法。\n"
-                        "可以有态度、疑问或轻微调侃，但不要强行搞笑。直接说内容，不寒暄、不总结、"
-                        "不解释为何回复。不固定使用“哈哈”“确实”“听起来”“感觉”“原来如此”等开场，"
-                        "也不要为了像人而刻意添加语气词。不要复述上一条消息或换个说法重复。\n"
-                    )
-                    + direction_policy
-                    + "\n"
-                    + safety_policy
-                    + output_policy
-                ),
-            },
-            {
-                "role": "user",
-                "content": user_content,
-            },
-        ],
+        "messages": list(messages),
     }
     if images:
         payload["thinking"] = {"type": "disabled"}
     else:
         payload["temperature"] = 0.8
-    try:
-        request_timeout = (
-            CONFIG.chat_vision_timeout if images else CONFIG.ai_timeout
+    request_timeout = CONFIG.chat_vision_timeout if images else CONFIG.ai_timeout
+    async with httpx.AsyncClient(timeout=request_timeout) as client:
+        response = await client.post(
+            f"{CONFIG.ai_base_url}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {CONFIG.ai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
         )
-        async with httpx.AsyncClient(timeout=request_timeout) as client:
-            response = await client.post(
-                f"{CONFIG.ai_base_url}/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {CONFIG.ai_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-    except Exception as exc:
-        raise RandomChatAIError(str(exc)) from exc
-    return _clean_reply(content)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
 
 
 def _format_turn(item: ContextMessage) -> str:

@@ -517,6 +517,84 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         extract.assert_not_awaited()
         apply.assert_not_called()
 
+    async def test_group_chat_passes_only_current_members_relationship_state(self):
+        relationship = SimpleNamespace(
+            state_text="最近聊得很熟",
+            open_topics=("继续聊月季",),
+            preferred_address="小园丁",
+            communication_style="自然简短",
+        )
+        features = SimpleNamespace(
+            snapshot=lambda: SimpleNamespace(
+                relationship_state_enabled=True,
+                prompt_builder_enabled=True,
+            )
+        )
+        relationship_calls: list[dict[str, object]] = []
+
+        def get_group(**kwargs):
+            relationship_calls.append(kwargs)
+            return relationship
+
+        relationship_store = SimpleNamespace(get_group=get_group)
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.FEATURES", features, create=True
+        ), patch(
+            "plugins.private_memory.relationship.RelationshipStore",
+            return_value=relationship_store,
+        ) as store_type, patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ) as generate, patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(AsyncMock(), _event(), "当前消息")
+
+        self.assertTrue(sent)
+        store_type.assert_called_once()
+        self.assertEqual(
+            [{"group_id": 789, "user_id": "123", "persona_id": "radish-cat"}],
+            relationship_calls,
+        )
+        self.assertIs(relationship, generate.await_args.kwargs["relationship"])
+        self.assertEqual(
+            ("继续聊月季",), generate.await_args.kwargs["open_topics"]
+        )
+
+    async def test_group_legacy_prompt_does_not_read_new_relationship_state(self):
+        features = SimpleNamespace(
+            snapshot=lambda: SimpleNamespace(
+                relationship_state_enabled=True,
+                prompt_builder_enabled=False,
+            )
+        )
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.FEATURES", features
+        ), patch(
+            "plugins.private_memory.relationship.RelationshipStore",
+        ) as store_type, patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ), patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(AsyncMock(), _event(), "当前消息")
+
+        self.assertTrue(sent)
+        store_type.assert_not_called()
+
     async def test_appends_one_selected_sticker_to_the_same_message(self):
         bot = AsyncMock()
         sticker = Path("/tmp/radish-cat.gif")
