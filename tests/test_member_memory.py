@@ -23,9 +23,11 @@ from plugins.member_memory.store import (
     apply_candidates,
     commit_summary,
     load_profiles,
+    pending_summary_batch,
     remember_identity,
     _write_mirror,
 )
+from plugins.private_memory.schema import migrate
 
 try:
     nonebot.get_driver()
@@ -259,6 +261,62 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MemberMemoryStoreTests(unittest.TestCase):
+    def test_deleted_and_superseded_facts_are_hidden_from_reads_batches_and_mirrors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "member_memory"
+            db = Path(directory) / "chat.db"
+            context = [
+                ContextMessage("小明", f"证据{index}", message_id=f"m{index}", user_id="7")
+                for index in range(3)
+            ]
+            candidates = [
+                {"user_id": "7", "trait": f"事实{index}", "evidence_message_id": f"m{index}", "quote": f"证据{index}"}
+                for index in range(3)
+            ]
+            self.assertEqual(3, apply_candidates(db, root, group_id=123, context=context, candidates=candidates))
+            migrate(db)
+            with sqlite3.connect(db) as connection:
+                connection.execute("UPDATE member_memory_facts SET status='superseded' WHERE id=1")
+                connection.execute("UPDATE member_memory_facts SET status='deleted',deleted_at='now' WHERE id=2")
+
+            profile = load_profiles(db, group_id=123, user_ids=["7"])[0]
+            compact = load_profiles(db, group_id=123, user_ids=["7"], compact=True)[0]
+            batch = pending_summary_batch(db, group_id=123, user_id="7", threshold=1)
+            _write_mirror(db, root, 123, "7")
+            mirror = json.loads((root / "123" / "7.json").read_text())
+
+            self.assertEqual(["事实2"], [fact.text for fact in profile.traits])
+            self.assertEqual(["事实2"], [fact.text for fact in compact.traits])
+            self.assertEqual(["事实2"], [fact.text for fact in batch.facts])
+            self.assertEqual(["事实2"], [fact["text"] for fact in mirror["traits"]])
+
+    def test_summary_commit_rejects_batch_containing_newly_inactive_fact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "member_memory"
+            db = Path(directory) / "chat.db"
+            context = [
+                ContextMessage("小明", f"证据{index}", message_id=f"m{index}", user_id="7")
+                for index in range(2)
+            ]
+            candidates = [
+                {"user_id": "7", "trait": f"事实{index}", "evidence_message_id": f"m{index}", "quote": f"证据{index}"}
+                for index in range(2)
+            ]
+            self.assertEqual(2, apply_candidates(db, root, group_id=123, context=context, candidates=candidates))
+            migrate(db)
+            batch = pending_summary_batch(db, group_id=123, user_id="7", threshold=1)
+            with sqlite3.connect(db) as connection:
+                connection.execute("UPDATE member_memory_facts SET status='deleted' WHERE id=1")
+            self.assertFalse(commit_summary(
+                db,
+                root,
+                group_id=123,
+                user_id="7",
+                previous_through_id=batch.previous_through_id,
+                through_fact_id=batch.facts[-1].fact_id,
+                summary="不应提交的旧摘要",
+            ))
+
     def test_compact_profile_contains_summary_and_only_bounded_pending_facts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "member_memory"

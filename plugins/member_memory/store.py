@@ -32,6 +32,14 @@ CREATE TABLE IF NOT EXISTS member_memory_facts (
     trait TEXT NOT NULL,
     evidence_message_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    trust_level TEXT NOT NULL DEFAULT 'ai_extracted'
+        CHECK(trust_level IN ('ai_extracted','admin_confirmed')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active','superseded','deleted')),
+    supersedes_id INTEGER,
+    updated_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+    deleted_at TEXT,
     UNIQUE(group_id,user_id,trait,evidence_message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_member_memory_facts_member
@@ -152,7 +160,7 @@ def _profile_row(conn: sqlite3.Connection, group_id: int, user_id: str) -> Membe
         MemoryTrait(text, evidence, created, int(fact_id))
         for fact_id, text, evidence, created in conn.execute(
             "SELECT id,trait,evidence_message_id,created_at FROM member_memory_facts "
-            "WHERE group_id=? AND user_id=? ORDER BY id",
+            "WHERE group_id=? AND user_id=? AND status='active' ORDER BY id",
             (group_id, user_id),
         ).fetchall()
     )
@@ -196,14 +204,24 @@ def _profile_with_legacy_fallback(
     conn: sqlite3.Connection, group_id: int, user_id: str
 ) -> MemberProfile | None:
     profile = _profile_row(conn, group_id, user_id)
-    if profile is None or (profile.aliases and profile.traits):
+    if profile is None:
+        return profile
+    has_ledger_aliases = conn.execute(
+        "SELECT 1 FROM member_memory_aliases WHERE group_id=? AND user_id=? LIMIT 1",
+        (group_id, user_id),
+    ).fetchone() is not None
+    has_ledger_facts = conn.execute(
+        "SELECT 1 FROM member_memory_facts WHERE group_id=? AND user_id=? LIMIT 1",
+        (group_id, user_id),
+    ).fetchone() is not None
+    if has_ledger_aliases and has_ledger_facts:
         return profile
     legacy = _legacy_profile_row(
         conn,
         group_id,
         user_id,
-        include_aliases=not profile.aliases,
-        include_traits=not profile.traits,
+        include_aliases=not has_ledger_aliases,
+        include_traits=not has_ledger_facts,
     )
     if legacy is None:
         return profile
@@ -275,12 +293,15 @@ def _append_fact(
 ) -> bool:
     try:
         cursor = conn.execute(
-            "INSERT INTO member_memory_facts(group_id,user_id,trait,evidence_message_id,created_at) "
-            "SELECT ?,?,?,?,? WHERE NOT EXISTS ("
+            "INSERT INTO member_memory_facts(group_id,user_id,trait,evidence_message_id,created_at,updated_at) "
+            "SELECT ?,?,?,?,?,? WHERE NOT EXISTS ("
             "SELECT 1 FROM member_memory_facts "
             "WHERE group_id=? AND user_id=? AND trait=? AND evidence_message_id=?"
             ")",
-            (group_id, user_id, trait, evidence_id, created_at, group_id, user_id, trait, evidence_id),
+            (
+                group_id, user_id, trait, evidence_id, created_at, created_at,
+                group_id, user_id, trait, evidence_id,
+            ),
         )
     except sqlite3.IntegrityError:
         return False
@@ -338,18 +359,18 @@ def migrate_legacy_memory(path: Path, root: Path, *, apply: bool) -> MemoryMigra
     )
 
 
-def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> None:
+def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> bool:
     with sqlite3.connect(path) as conn:
         _ensure_schema(conn)
         profile = _profile_with_legacy_fallback(conn, group_id, str(user_id))
     if profile is None:
-        return
+        return False
     directory = root / str(profile.group_id)
     try:
         directory.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        logger.exception("member memory mirror directory creation failed for group=%s user=%s", group_id, user_id)
-        return
+    except OSError as exc:
+        logger.error("member memory mirror directory creation failed error=%s", type(exc).__name__)
+        return False
     target = directory / f"{profile.user_id}.json"
     temporary = directory / f".{profile.user_id}.json.tmp"
     payload = {
@@ -367,8 +388,10 @@ def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> None:
         temporary.chmod(0o600)
         os.replace(temporary, target)
         target.chmod(0o600)
-    except OSError:
-        logger.exception("member memory mirror write failed for group=%s user=%s", group_id, user_id)
+        return True
+    except OSError as exc:
+        logger.error("member memory mirror write failed error=%s", type(exc).__name__)
+        return False
 
 
 def remember_identity(path: Path, root: Path, *, group_id: int, user_id: str, nickname: str) -> MemberProfile:
@@ -448,7 +471,8 @@ def _compact_profile_row(
         aliases = _decode_json_aliases(row[3])[-PROMPT_ALIAS_LIMIT:]
     fact_rows = conn.execute(
         "SELECT id,trait,evidence_message_id,created_at FROM member_memory_facts "
-        "WHERE group_id=? AND user_id=? AND id>? ORDER BY id DESC LIMIT ?",
+        "WHERE group_id=? AND user_id=? AND id>? AND status='active' "
+        "ORDER BY id DESC LIMIT ?",
         (group_id, user_id, through, PROMPT_UNSUMMARIZED_LIMIT),
     ).fetchall()
     traits = tuple(
@@ -506,14 +530,15 @@ def pending_summary_batch(
         summary = str(state["summary_text"]) if state else ""
         through = int(state["through_fact_id"]) if state else 0
         pending_count = conn.execute(
-            "SELECT count(*) FROM member_memory_facts WHERE group_id=? AND user_id=? AND id>?",
+            "SELECT count(*) FROM member_memory_facts "
+            "WHERE group_id=? AND user_id=? AND id>? AND status='active'",
             (group_id, user_id, through),
         ).fetchone()[0]
         if pending_count < threshold:
             return None
         rows = conn.execute(
             "SELECT id,trait,evidence_message_id,created_at FROM member_memory_facts "
-            "WHERE group_id=? AND user_id=? AND id>? ORDER BY id LIMIT ?",
+            "WHERE group_id=? AND user_id=? AND id>? AND status='active' ORDER BY id LIMIT ?",
             (group_id, user_id, through, limit),
         ).fetchall()
     facts = tuple(
@@ -542,6 +567,17 @@ def commit_summary(
         ).fetchone()
         current = int(row[0]) if row else 0
         if current != previous_through_id:
+            conn.rollback()
+            return False
+        newly_inactive = conn.execute(
+            """
+            SELECT 1 FROM member_memory_facts
+            WHERE group_id=? AND user_id=? AND id>? AND id<=? AND status<>'active'
+            LIMIT 1
+            """,
+            (group_id, user_id, previous_through_id, through_fact_id),
+        ).fetchone()
+        if newly_inactive is not None:
             conn.rollback()
             return False
         conn.execute(
@@ -586,7 +622,8 @@ def apply_candidates(
                 MemoryTrait(text, evidence, created, int(fact_id))
                 for fact_id, text, evidence, created in conn.execute(
                     "SELECT id,trait,evidence_message_id,created_at FROM member_memory_facts "
-                    "WHERE group_id=? AND user_id=? ORDER BY id DESC LIMIT ?",
+                    "WHERE group_id=? AND user_id=? AND status='active' "
+                    "ORDER BY id DESC LIMIT ?",
                     (group_id, user_id, LEGACY_VIEW_LIMIT),
                 ).fetchall()
             ][::-1]
