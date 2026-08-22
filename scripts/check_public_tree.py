@@ -18,12 +18,18 @@ SENSITIVE_KEYS = (
     "NAPCAT_ACCESS_TOKEN",
     "AI_API_KEY",
     "ADMIN_SEED",
+    "SUPERUSERS",
+    "GROUP_CHAT_ALLOWED_GROUP_IDS",
+    "PRIVATE_CHAT_ALLOWED_USER_IDS",
+    "PRIVATE_CHAT_ALLOWED_USER_ID",
 )
 TOKEN_RE = re.compile(r"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})")
 PRIVATE_KEY_RE = re.compile(r"BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY")
 TOKEN_BYTES_RE = re.compile(rb"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})")
 PRIVATE_KEY_BYTES_RE = re.compile(rb"BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY")
 MAX_SCAN_BYTES = 20 * 1024 * 1024
+_DATABASE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 
 
 @dataclass(frozen=True)
@@ -63,6 +69,27 @@ def generic_findings(path: str, text: str) -> list[str]:
     if PRIVATE_KEY_RE.search(text):
         findings.append(f"{path}: private key material")
     return findings
+
+
+def path_findings(path: str) -> list[str]:
+    normalized = path.replace("\\", "/").lstrip("./")
+    lower = normalized.lower()
+    if lower.endswith(_DATABASE_SUFFIXES) or any(
+        marker in lower for marker in (".db-", ".sqlite-")
+    ):
+        return [f"{path}: SQLite database"]
+    if lower in {
+        "data/runtime_features.json",
+        "data/runtime_features.json.bak",
+    }:
+        return [f"{path}: runtime feature state"]
+    if lower.startswith("exports/"):
+        return [f"{path}: export artifact"]
+    if lower.endswith(_IMAGE_SUFFIXES):
+        return [f"{path}: image artifact"]
+    if lower.endswith(".log") or lower.startswith("logs/"):
+        return [f"{path}: log artifact"]
+    return []
 
 
 def runtime_findings(path: str, text: str, values: dict[str, str]) -> list[str]:
@@ -188,6 +215,12 @@ def scan_ref(
             if identity in seen_history:
                 continue
             seen_history.add(identity)
+        item_path_findings = path_findings(path)
+        if ref is not None:
+            item_path_findings = [
+                f"{ref}:{finding}" for finding in item_path_findings
+            ]
+        findings.extend(item_path_findings)
         raw = _bytes_at(path, ref) if ref is None else _git(
             "cat-file", "blob", blob_oid, text=False
         ).stdout

@@ -11,6 +11,22 @@ from scripts.check_public_tree import generic_findings, runtime_findings
 
 
 class PublicScannerTests(unittest.TestCase):
+    def test_runtime_artifact_paths_are_rejected_in_current_and_history_scans(self) -> None:
+        path_findings = getattr(scanner, "path_findings", lambda path: [])
+        cases = {
+            "data/chat_archive.db": "SQLite database",
+            "data/runtime_features.json": "runtime feature state",
+            "exports/private.csv": "export artifact",
+            "data/chat_vision/images/private.jpg": "image artifact",
+        }
+        for path, finding_class in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(
+                    [f"{path}: {finding_class}"], path_findings(path)
+                )
+        self.assertEqual([], path_findings("docs/architecture.md"))
+        self.assertEqual([], path_findings("tests/test_image_contract.py"))
+
     def test_generic_token_and_private_key_are_detected(self) -> None:
         text = "API_KEY=" + "sk-" + ("a" * 26) + "\nBEGIN " + "OPENSSH PRIVATE KEY"
         findings = generic_findings("fixture.txt", text)

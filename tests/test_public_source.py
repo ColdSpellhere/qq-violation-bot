@@ -23,6 +23,10 @@ SENSITIVE_KEYS = (
     "NAPCAT_ACCESS_TOKEN",
     "AI_API_KEY",
     "ADMIN_SEED",
+    "SUPERUSERS",
+    "GROUP_CHAT_ALLOWED_GROUP_IDS",
+    "PRIVATE_CHAT_ALLOWED_USER_IDS",
+    "PRIVATE_CHAT_ALLOWED_USER_ID",
 )
 CHAT_VISION_EXAMPLE_DEFAULTS = {
     "CHAT_VISION_ENABLED": "false",
@@ -137,6 +141,37 @@ class PublicSourceBoundaryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIsNone(re.search(r"TARGET_GROUP_ID=\d{5,}", plan))
         self.assertIn("${TARGET_GROUP_ID:?", plan)
+
+    def test_llm_gateway_rollout_docs_are_complete_and_safe_by_default(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        section = readme[
+            readme.index("## 统一模型网关与提示构建") :
+            readme.index("## 模块化运行时功能控制")
+        ]
+        for required in (
+            "共享一套异步连接池",
+            "总并发",
+            "错误只按类别",
+            "llm_usage_events",
+            "不可信数据",
+            "最终请求 12000",
+            "/模型网关 业务 关",
+            "业务意图",
+            "不能进入业务判断",
+        ):
+            self.assertIn(required, section)
+
+        values = dotenv_values(ROOT / ".env.example")
+        for key in (
+            "LLM_GATEWAY_ENABLED",
+            "PROMPT_BUILDER_ENABLED",
+            "LLM_GATEWAY_VISION_ENABLED",
+            "LLM_GATEWAY_PRIVATE_MEMORY_ENABLED",
+            "LLM_GATEWAY_MEMBER_MEMORY_ENABLED",
+            "LLM_GATEWAY_CHAT_ENABLED",
+            "LLM_GATEWAY_BUSINESS_ENABLED",
+        ):
+            self.assertEqual("false", values.get(key), key)
 
 
 if __name__ == "__main__":

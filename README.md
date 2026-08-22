@@ -70,6 +70,21 @@ DATABASE_URL=sqlite:////opt/qq-violation-bot/data/violation_records.db
 AI_BASE_URL=https://api.deepseek.com
 AI_API_KEY=你的 DeepSeek Key
 AI_MODEL=deepseek-chat
+AI_TIMEOUT=30
+LLM_GATEWAY_ENABLED=false
+PROMPT_BUILDER_ENABLED=false
+LLM_GATEWAY_VISION_ENABLED=false
+LLM_GATEWAY_PRIVATE_MEMORY_ENABLED=false
+LLM_GATEWAY_MEMBER_MEMORY_ENABLED=false
+LLM_GATEWAY_CHAT_ENABLED=false
+LLM_GATEWAY_BUSINESS_ENABLED=false
+LLM_GATEWAY_MAX_CONNECTIONS=8
+LLM_GATEWAY_MAX_RETRIES=2
+LLM_GATEWAY_TOTAL_CONCURRENCY=8
+LLM_GATEWAY_BUSINESS_CONCURRENCY=2
+LLM_GATEWAY_CHAT_CONCURRENCY=3
+LLM_GATEWAY_VISION_CONCURRENCY=3
+LLM_GATEWAY_MEMORY_CONCURRENCY=2
 CHAT_VISION_ENABLED=false
 CHAT_VISION_MODEL=deepseek-v4-flash-vision-exp
 CHAT_VISION_IMAGE_ROOT=data/chat_vision/images
@@ -382,6 +397,34 @@ install -d -m 0700 "$PROJECT_ROOT/backups/private_memory"
 
 成员记忆独立于随机回复概率持续收集。原始特性和历史昵称以追加式账本永久保存在服务器 SQLite 中，不再按 8 条上限淘汰；本地 JSON 镜像包含完整历史。每累计 5 条新特性会生成一次不超过 300 字的滚动摘要，聊天 AI 只读取摘要、最多 5 个近期旧称和最多 8 条尚未摘要的特性。`MEMBER_MEMORY_SUMMARY_ENABLED=false` 只关闭摘要生成，永久账本仍继续写入。真实成员记忆与镜像不会提交到 GitHub。
 
+## 统一模型网关与提示构建
+
+统一模型网关（LLM Gateway）只负责模型传输，不拥有业务或聊天提示词。业务意图、聊天、成员记忆、私聊摘要/关系和图片描述仍由各自模块构造独立请求；聊天模型不能直接执行违规记录、禁言、状态或减数操作。网关在进程内共享一套异步连接池，统一管理 Base URL、API Key、模型、超时、重试和连接关闭，不复制密钥或为每次调用新建长期客户端。
+
+网关错误只按类别记录和返回，例如配置、鉴权、超时、网络、限流、服务端、客户端、空内容和契约错误；日志不写请求正文、模型响应、Authorization、图片字节或 API Key。取消信号直接传播。只对网络失败、超时、HTTP 429 和可恢复的 5xx 做有限退避重试；鉴权、普通 4xx 和响应契约错误不盲目重试。
+
+总并发和各调用域并发分别由 `LLM_GATEWAY_TOTAL_CONCURRENCY` 与 `LLM_GATEWAY_*_CONCURRENCY` 限制。任务先取得自身通道，再进入总并发，避免排队中的聊天请求占住图片或业务容量。关闭服务时先停止接收新请求并有界等待在途调用；超时后取消剩余任务并关闭共享连接。每次调用把任务类型、模型、输入/输出/总 token、延迟、状态、重试次数和脱敏错误类别写入 `llm_usage_events`；供应商未返回 token 时保持空值，当前不估算费用，`cost_microunits` 和 `cost_currency` 保持空值。统计写入失败不会改变业务或聊天结果。
+
+Prompt Builder 只用于聊天，不用于业务意图。固定安全、方向和输出规则位于高权限 system 消息；`character.md`、近期上下文、成员事实、关系状态、未完话题、图片描述和当前消息均作为带标签的不可信数据放入 user 消息，即使其中含“忽略规则”等文本也不能覆盖权限和业务边界。默认字符预算如下：人设 2000、最近上下文最多 20 条/6000、成员事实 1200、关系状态 600、未完话题最多 5 条/400、图片描述 2000、当前消息 2000、最终请求 12000。超限时按确定顺序裁剪最旧上下文等可裁剪数据，固定规则和当前消息不会被静默丢弃；预算按最终转义后的实际内容计算。
+
+所有第二阶段功能默认关闭。`.env` 只提供首次启动默认值，QQ 运行时状态仍优先。模型网关总开关和对应调用域子开关必须同时开启；`/提示构建` 可独立切换。关闭某个调用域会立即让后续请求回到该模块原有传输路径；关闭 Prompt Builder 会让聊天回到原有提示组装。关系、记忆和图片描述无论使用哪条模型路径都只影响聊天表达，不能进入业务判断。
+
+现有 `chat_archive.db` 从 schema v1 升级到 v2 时新增 `llm_usage_events`。继续使用“私聊持久记忆与治理”章节的同一迁移脚本、在线备份、`PRAGMA quick_check` 和重复迁移验证流程；不要另建第二个数据库。生产发布时先让全部网关与 Prompt Builder 开关保持关闭，验证旧业务、群聊、私聊、成员记忆和图片路径，再按以下顺序灰度：
+
+```text
+/模型网关 开
+/模型网关 视觉 开
+/模型网关 私聊记忆 开
+/模型网关 成员记忆 开
+/模型网关 聊天 开
+/提示构建 开
+/模型网关 业务 开
+```
+
+每一步都用 `/模块状态` 确认，并至少验证一次成功调用、一次脱敏故障分类与关闭子开关后的旧路径恢复，同时确认 `llm_usage_events` 新增一条不含正文的记录。聊天阶段检查明确 @ 必回、普通消息概率不变、表情包与图片理解正常、两个私聊白名单用户不串线；业务阶段最后执行固定语料烟雾检查，覆盖新增记录、模糊成员查询、分区查询、禁言及否定禁言、确认、取消和非法 JSON，确认预览与后端校验结果不变。
+
+异常时先关闭最窄子开关。例如视觉异常用 `/模型网关 视觉 关`，聊天异常先 `/提示构建 关`，仍异常再 `/模型网关 聊天 关`；业务异常立即 `/模型网关 业务 关`，不要关闭整个业务模块。需要停止全部新网关调用时使用 `/模型网关 关`。这些止损只切回旧代码路径，不删除使用统计、记忆或关系数据，也不需要数据库回滚。只有 schema 迁移损坏时才按前述停服、保留故障库、恢复在线备份和再次 `quick_check` 的流程处理。
+
 `EVIDENCE_REQUIRED=false` 表示新增违规记录未引用证据图片时只提醒、不阻止现有记录流程；改为 `true` 后才要求提供证据。只有新增违规命令所引用消息中的图片会被下载并持久化，每张图片最大允许 `EVIDENCE_MAX_BYTES` 字节。查询时，每条违规记录的文字和该记录映射的全部图片会尽量通过同一条 OneBot 混合消息发送；混合消息发送失败时会回退为文字和图片分别发送。旧记录没有证据图片时仍可正常查询。
 
 `MUTE_ENABLED=false` 默认关闭群禁言执行；启用后才会调用 OneBot/Napcat 的群管理接口。该开关不改变现有违规记录、查询和确认流程。
@@ -438,6 +481,11 @@ PRIVATE_MEMORY_SHUTDOWN_TIMEOUT=10
 /关系状态 关
 /记忆治理 开
 /记忆治理 关
+/模型网关 开
+/模型网关 关
+/模型网关 视觉|私聊记忆|成员记忆|聊天|业务 开|关
+/提示构建 开
+/提示构建 关
 /私聊用户 添加 <QQ号>
 /私聊用户 删除 <QQ号>
 /私聊用户 列表
