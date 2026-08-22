@@ -83,7 +83,7 @@ class RelationshipState:
     id: int
     scope: ConversationScope
     state_text: str
-    open_topics_json: str
+    open_topics: tuple[str, ...]
     preferred_address: str
     communication_style: str
     source_message_id: str
