@@ -3,14 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-from plugins.chat_archive.db import ContextMessage
-from plugins.member_memory.store import MemberProfile
-from plugins.private_memory.models import RelationshipState
-
 from .models import (
     BudgetedPromptData,
     ChatPromptInput,
+    ContextMessageLike,
+    MemberProfileLike,
     PromptBudget,
+    RelationshipStateLike,
     TruncationCounters,
 )
 
@@ -21,7 +20,7 @@ def _clip(value: str, limit: int) -> tuple[str, int]:
     return value[:limit], len(value) - limit
 
 
-def _context_text(item: ContextMessage) -> str:
+def _context_text(item: ContextMessageLike) -> str:
     return json.dumps(
         {
             "message_id": item.message_id,
@@ -38,7 +37,7 @@ def _context_text(item: ContextMessage) -> str:
     )
 
 
-def _profile_text(profile: MemberProfile) -> str:
+def _profile_text(profile: MemberProfileLike) -> str:
     details: list[str] = []
     if profile.summary.strip():
         details.append(profile.summary.strip())
@@ -48,7 +47,7 @@ def _profile_text(profile: MemberProfile) -> str:
     return f"{profile.nickname}[QQ:{profile.user_id}]：" + "；".join(details)
 
 
-def _relationship_text(value: RelationshipState | None) -> str:
+def _relationship_text(value: RelationshipStateLike | None) -> str:
     if value is None:
         return ""
     return json.dumps(

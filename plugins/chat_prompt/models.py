@@ -1,11 +1,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
-from plugins.chat_archive.db import ContextMessage
-from plugins.member_memory.store import MemberProfile
-from plugins.private_memory.models import RelationshipState
+
+class ContextMessageLike(Protocol):
+    nickname: str
+    text: str
+    message_id: str
+    user_id: str
+    at_user_ids: tuple[str, ...]
+    reply_message_id: str | None
+    replied_to_user_id: str | None
+    image_descriptions: tuple[str, ...]
+
+
+class MemberProfileLike(Protocol):
+    user_id: str
+    nickname: str
+    summary: str
+    traits: tuple[object, ...]
+
+
+class RelationshipStateLike(Protocol):
+    state_text: str
+    preferred_address: str
+    communication_style: str
+
+
+def _has_fields(value: object, fields: tuple[str, ...]) -> bool:
+    return all(hasattr(value, field) for field in fields)
 
 
 @dataclass(frozen=True)
@@ -13,12 +37,12 @@ class ChatPromptInput:
     mode: Literal["group", "private"]
     now_text: str
     persona: str
-    context: tuple[ContextMessage, ...]
-    profiles: tuple[MemberProfile, ...]
-    relationship: RelationshipState | None
+    context: tuple[ContextMessageLike, ...]
+    profiles: tuple[MemberProfileLike, ...]
+    relationship: RelationshipStateLike | None
     open_topics: tuple[str, ...]
     image_descriptions: tuple[str, ...]
-    current: ContextMessage
+    current: ContextMessageLike
     addressed: bool
 
     def __post_init__(self) -> None:
@@ -28,24 +52,36 @@ class ChatPromptInput:
             raise ValueError("now_text must be non-empty text")
         if type(self.persona) is not str:
             raise ValueError("persona must be text")
-        if not isinstance(self.current, ContextMessage):
+        context_fields = (
+            "nickname",
+            "text",
+            "message_id",
+            "user_id",
+            "at_user_ids",
+            "reply_message_id",
+            "replied_to_user_id",
+            "image_descriptions",
+        )
+        if not _has_fields(self.current, context_fields):
             raise ValueError("current must be ContextMessage")
-        for value, item_type, name in (
-            (self.context, ContextMessage, "context"),
-            (self.profiles, MemberProfile, "profiles"),
+        if type(self.context) is not tuple or not all(
+            _has_fields(item, context_fields) for item in self.context
         ):
-            if type(value) is not tuple or not all(
-                isinstance(item, item_type) for item in value
-            ):
-                raise ValueError(f"{name} must be a typed tuple")
+            raise ValueError("context must be a typed tuple")
+        profile_fields = ("user_id", "nickname", "summary", "traits")
+        if type(self.profiles) is not tuple or not all(
+            _has_fields(item, profile_fields) for item in self.profiles
+        ):
+            raise ValueError("profiles must be a typed tuple")
         for value, name in (
             (self.open_topics, "open_topics"),
             (self.image_descriptions, "image_descriptions"),
         ):
             if type(value) is not tuple or not all(type(item) is str for item in value):
                 raise ValueError(f"{name} must be a text tuple")
-        if self.relationship is not None and not isinstance(
-            self.relationship, RelationshipState
+        if self.relationship is not None and not _has_fields(
+            self.relationship,
+            ("state_text", "preferred_address", "communication_style"),
         ):
             raise ValueError("relationship must be RelationshipState or None")
         if type(self.addressed) is not bool:
@@ -110,9 +146,20 @@ class BudgetedPromptData:
     output_contract_required: bool = True
 
 
+@dataclass(frozen=True)
+class RenderedPrompt:
+    messages: tuple[dict[str, object], ...]
+    total_chars: int
+    truncation: TruncationCounters
+
+
 __all__ = [
     "BudgetedPromptData",
     "ChatPromptInput",
+    "ContextMessageLike",
+    "MemberProfileLike",
     "PromptBudget",
+    "RelationshipStateLike",
+    "RenderedPrompt",
     "TruncationCounters",
 ]
