@@ -11,6 +11,15 @@ _SWITCH_COMMANDS = {
     "/私聊记忆": ("private_memory_enabled", "私聊持久记忆"),
     "/关系状态": ("relationship_state_enabled", "关系状态"),
     "/记忆治理": ("memory_governance_enabled", "记忆治理"),
+    "/模型网关": ("llm_gateway_enabled", "模型网关"),
+    "/提示构建": ("prompt_builder_enabled", "提示构建"),
+}
+_GATEWAY_DOMAIN_COMMANDS = {
+    "视觉": ("llm_gateway_vision_enabled", "模型网关视觉调用"),
+    "私聊记忆": ("llm_gateway_private_memory_enabled", "模型网关私聊记忆调用"),
+    "成员记忆": ("llm_gateway_member_memory_enabled", "模型网关成员记忆调用"),
+    "聊天": ("llm_gateway_chat_enabled", "模型网关聊天调用"),
+    "业务": ("llm_gateway_business_enabled", "模型网关业务调用"),
 }
 _ALLOWLIST_COMMANDS = {
     "/群聊群": ("group_chat", "群聊群", "群号"),
@@ -34,6 +43,8 @@ def execute_control_command(
         return "不支持的模块管理命令。"
     if parts[0] == "/模块状态":
         return _status(controller) if len(parts) == 1 else "用法：/模块状态。"
+    if parts[0] == "/模型网关":
+        return _set_gateway_switch(parts, controller, actor)
     if parts[0] in _SWITCH_COMMANDS:
         return _set_switch(parts, controller, actor)
     if parts[0] in _ALLOWLIST_COMMANDS:
@@ -56,7 +67,36 @@ def _status(controller: FeatureController) -> str:
             f"私聊持久记忆：{_switch_text(state.private_memory_enabled)}",
             f"关系状态：{_switch_text(state.relationship_state_enabled)}",
             f"记忆治理：{_switch_text(state.memory_governance_enabled)}",
+            f"模型网关：{_switch_text(state.llm_gateway_enabled)}",
+            f"模型网关视觉调用：{_switch_text(state.llm_gateway_vision_enabled)}",
+            "模型网关私聊记忆调用："
+            f"{_switch_text(state.llm_gateway_private_memory_enabled)}",
+            "模型网关成员记忆调用："
+            f"{_switch_text(state.llm_gateway_member_memory_enabled)}",
+            f"模型网关聊天调用：{_switch_text(state.llm_gateway_chat_enabled)}",
+            f"模型网关业务调用：{_switch_text(state.llm_gateway_business_enabled)}",
+            f"提示构建：{_switch_text(state.prompt_builder_enabled)}",
         )
+    )
+
+
+def _set_gateway_switch(
+    parts: list[str], controller: FeatureController, actor: str
+) -> str:
+    if len(parts) == 2 and parts[1] in {"开", "关"}:
+        return _set_switch(parts, controller, actor)
+    if (
+        len(parts) == 3
+        and parts[1] in _GATEWAY_DOMAIN_COMMANDS
+        and parts[2] in {"开", "关"}
+    ):
+        field_name, label = _GATEWAY_DOMAIN_COMMANDS[parts[1]]
+        enabled = parts[2] == "开"
+        controller.set_switch(field_name, enabled, actor)
+        return f"{label}已{'开启' if enabled else '关闭'}。"
+    return (
+        "用法：/模型网关 开|关，或 /模型网关 "
+        "视觉|私聊记忆|成员记忆|聊天|业务 开|关。"
     )
 
 

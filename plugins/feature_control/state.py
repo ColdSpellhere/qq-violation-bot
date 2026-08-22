@@ -16,8 +16,22 @@ SWITCH_NAMES = {
     "private_memory_enabled",
     "relationship_state_enabled",
     "memory_governance_enabled",
+    "llm_gateway_enabled",
+    "prompt_builder_enabled",
+    "llm_gateway_vision_enabled",
+    "llm_gateway_private_memory_enabled",
+    "llm_gateway_member_memory_enabled",
+    "llm_gateway_chat_enabled",
+    "llm_gateway_business_enabled",
 }
 ALLOWLIST_KINDS = {"group_chat", "private_chat"}
+GATEWAY_DOMAIN_SWITCHES = {
+    "vision": "llm_gateway_vision_enabled",
+    "private_memory": "llm_gateway_private_memory_enabled",
+    "member_memory": "llm_gateway_member_memory_enabled",
+    "chat": "llm_gateway_chat_enabled",
+    "business": "llm_gateway_business_enabled",
+}
 
 
 @dataclass(frozen=True)
@@ -31,6 +45,13 @@ class FeatureState:
     private_memory_enabled: bool = False
     relationship_state_enabled: bool = False
     memory_governance_enabled: bool = False
+    llm_gateway_enabled: bool = False
+    prompt_builder_enabled: bool = False
+    llm_gateway_vision_enabled: bool = False
+    llm_gateway_private_memory_enabled: bool = False
+    llm_gateway_member_memory_enabled: bool = False
+    llm_gateway_chat_enabled: bool = False
+    llm_gateway_business_enabled: bool = False
     updated_at: str = ""
     updated_by: str = ""
 
@@ -107,6 +128,14 @@ class FeatureController:
             and normalized in state.private_chat_allowed_user_ids
         )
 
+    def llm_gateway_allowed(self, domain: str) -> bool:
+        try:
+            field_name = GATEWAY_DOMAIN_SWITCHES[domain]
+        except KeyError as exc:
+            raise ValueError(f"unknown llm gateway domain: {domain}") from exc
+        state = self.snapshot()
+        return state.llm_gateway_enabled and getattr(state, field_name)
+
     def _replace_state(self, **changes: Any) -> FeatureState:
         candidate = replace(
             self._state,
@@ -176,6 +205,27 @@ class FeatureController:
                         "memory_governance_enabled",
                         defaults.memory_governance_enabled if defaults else False,
                     )
+                ),
+                llm_gateway_enabled=cls._strict_bool(
+                    raw.get("llm_gateway_enabled", False)
+                ),
+                prompt_builder_enabled=cls._strict_bool(
+                    raw.get("prompt_builder_enabled", False)
+                ),
+                llm_gateway_vision_enabled=cls._strict_bool(
+                    raw.get("llm_gateway_vision_enabled", False)
+                ),
+                llm_gateway_private_memory_enabled=cls._strict_bool(
+                    raw.get("llm_gateway_private_memory_enabled", False)
+                ),
+                llm_gateway_member_memory_enabled=cls._strict_bool(
+                    raw.get("llm_gateway_member_memory_enabled", False)
+                ),
+                llm_gateway_chat_enabled=cls._strict_bool(
+                    raw.get("llm_gateway_chat_enabled", False)
+                ),
+                llm_gateway_business_enabled=cls._strict_bool(
+                    raw.get("llm_gateway_business_enabled", False)
                 ),
                 group_chat_allowed_group_ids=cls._load_allowlist(
                     "group_chat", raw["group_chat_allowed_group_ids"]

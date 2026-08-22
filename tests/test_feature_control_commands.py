@@ -59,6 +59,13 @@ class FeatureControlCommandTests(unittest.TestCase):
                 private_memory_enabled=False,
                 relationship_state_enabled=False,
                 memory_governance_enabled=False,
+                llm_gateway_enabled=False,
+                prompt_builder_enabled=False,
+                llm_gateway_vision_enabled=False,
+                llm_gateway_private_memory_enabled=False,
+                llm_gateway_member_memory_enabled=False,
+                llm_gateway_chat_enabled=False,
+                llm_gateway_business_enabled=False,
             ),
         )
 
@@ -77,6 +84,13 @@ class FeatureControlCommandTests(unittest.TestCase):
             "/私聊记忆 开",
             "/关系状态 关",
             "/记忆治理 开",
+            "/模型网关 开",
+            "/模型网关 视觉 开",
+            "/模型网关 私聊记忆 关",
+            "/模型网关 成员记忆 开",
+            "/模型网关 聊天 关",
+            "/模型网关 业务 开",
+            "/提示构建 开",
         ):
             self.assertTrue(is_control_command(text), text)
         for text in ("业务 开", "/未知 开", "/聊天会 开", "普通聊天"):
@@ -111,6 +125,27 @@ class FeatureControlCommandTests(unittest.TestCase):
             "记忆治理已开启。",
             execute_control_command("/记忆治理 开", self.controller, "1"),
         )
+        self.assertEqual(
+            "模型网关已开启。",
+            execute_control_command("/模型网关 开", self.controller, "1"),
+        )
+        for domain, label in (
+            ("视觉", "模型网关视觉调用"),
+            ("私聊记忆", "模型网关私聊记忆调用"),
+            ("成员记忆", "模型网关成员记忆调用"),
+            ("聊天", "模型网关聊天调用"),
+            ("业务", "模型网关业务调用"),
+        ):
+            self.assertEqual(
+                f"{label}已开启。",
+                execute_control_command(
+                    f"/模型网关 {domain} 开", self.controller, "1"
+                ),
+            )
+        self.assertEqual(
+            "提示构建已开启。",
+            execute_control_command("/提示构建 开", self.controller, "1"),
+        )
         self.assertFalse(self.controller.snapshot().business_enabled)
         self.assertFalse(self.controller.snapshot().chat_enabled)
         self.assertFalse(self.controller.snapshot().group_chat_enabled)
@@ -118,6 +153,13 @@ class FeatureControlCommandTests(unittest.TestCase):
         self.assertTrue(self.controller.snapshot().private_memory_enabled)
         self.assertTrue(self.controller.snapshot().relationship_state_enabled)
         self.assertTrue(self.controller.snapshot().memory_governance_enabled)
+        self.assertTrue(self.controller.snapshot().llm_gateway_enabled)
+        self.assertTrue(self.controller.snapshot().prompt_builder_enabled)
+        self.assertTrue(self.controller.snapshot().llm_gateway_vision_enabled)
+        self.assertTrue(self.controller.snapshot().llm_gateway_private_memory_enabled)
+        self.assertTrue(self.controller.snapshot().llm_gateway_member_memory_enabled)
+        self.assertTrue(self.controller.snapshot().llm_gateway_chat_enabled)
+        self.assertTrue(self.controller.snapshot().llm_gateway_business_enabled)
 
     def test_executes_all_allowlist_commands(self) -> None:
         self.assertEqual(
@@ -155,6 +197,13 @@ class FeatureControlCommandTests(unittest.TestCase):
         self.assertIn("私聊持久记忆：关", status)
         self.assertIn("关系状态：关", status)
         self.assertIn("记忆治理：关", status)
+        self.assertIn("模型网关：关", status)
+        self.assertIn("模型网关视觉调用：关", status)
+        self.assertIn("模型网关私聊记忆调用：关", status)
+        self.assertIn("模型网关成员记忆调用：关", status)
+        self.assertIn("模型网关聊天调用：关", status)
+        self.assertIn("模型网关业务调用：关", status)
+        self.assertIn("提示构建：关", status)
         self.assertNotIn("100", status)
         self.assertNotIn("200", status)
 
@@ -174,6 +223,10 @@ class FeatureControlCommandTests(unittest.TestCase):
         self.assertEqual(
             "用法：/业务 开|关。",
             execute_control_command("/业务", self.controller, "1"),
+        )
+        self.assertEqual(
+            "用法：/模型网关 开|关，或 /模型网关 视觉|私聊记忆|成员记忆|聊天|业务 开|关。",
+            execute_control_command("/模型网关 视觉", self.controller, "1"),
         )
         self.assertEqual(
             "不支持的模块管理命令。",

@@ -31,6 +31,10 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    return min(maximum, max(minimum, _int_env(name, default)))
+
+
 def _bool_env(name: str, default: bool = False) -> bool:
     raw = str(os.getenv(name) or "").strip().lower()
     if not raw:
@@ -180,6 +184,42 @@ class AppConfig:
         "RELATIONSHIP_STATE_ENABLED", False
     )
     memory_governance_enabled: bool = _bool_env("MEMORY_GOVERNANCE_ENABLED", False)
+    llm_gateway_enabled: bool = _bool_env("LLM_GATEWAY_ENABLED", False)
+    prompt_builder_enabled: bool = _bool_env("PROMPT_BUILDER_ENABLED", False)
+    llm_gateway_vision_enabled: bool = _bool_env(
+        "LLM_GATEWAY_VISION_ENABLED", False
+    )
+    llm_gateway_private_memory_enabled: bool = _bool_env(
+        "LLM_GATEWAY_PRIVATE_MEMORY_ENABLED", False
+    )
+    llm_gateway_member_memory_enabled: bool = _bool_env(
+        "LLM_GATEWAY_MEMBER_MEMORY_ENABLED", False
+    )
+    llm_gateway_chat_enabled: bool = _bool_env("LLM_GATEWAY_CHAT_ENABLED", False)
+    llm_gateway_business_enabled: bool = _bool_env(
+        "LLM_GATEWAY_BUSINESS_ENABLED", False
+    )
+    llm_gateway_max_connections: int = _bounded_int_env(
+        "LLM_GATEWAY_MAX_CONNECTIONS", 8, 1, 64
+    )
+    llm_gateway_max_retries: int = _bounded_int_env(
+        "LLM_GATEWAY_MAX_RETRIES", 2, 0, 10
+    )
+    llm_gateway_total_concurrency: int = _bounded_int_env(
+        "LLM_GATEWAY_TOTAL_CONCURRENCY", 8, 1, 64
+    )
+    llm_gateway_business_concurrency: int = _bounded_int_env(
+        "LLM_GATEWAY_BUSINESS_CONCURRENCY", 2, 1, 16
+    )
+    llm_gateway_chat_concurrency: int = _bounded_int_env(
+        "LLM_GATEWAY_CHAT_CONCURRENCY", 3, 1, 16
+    )
+    llm_gateway_vision_concurrency: int = _bounded_int_env(
+        "LLM_GATEWAY_VISION_CONCURRENCY", 3, 1, 16
+    )
+    llm_gateway_memory_concurrency: int = _bounded_int_env(
+        "LLM_GATEWAY_MEMORY_CONCURRENCY", 2, 1, 16
+    )
     private_memory_retention_days: int = max(
         1, _int_env("PRIVATE_MEMORY_RETENTION_DAYS", 30)
     )

@@ -25,6 +25,13 @@ class FeatureControllerTests(unittest.TestCase):
             private_memory_enabled=False,
             relationship_state_enabled=False,
             memory_governance_enabled=False,
+            llm_gateway_enabled=False,
+            prompt_builder_enabled=False,
+            llm_gateway_vision_enabled=False,
+            llm_gateway_private_memory_enabled=False,
+            llm_gateway_member_memory_enabled=False,
+            llm_gateway_chat_enabled=False,
+            llm_gateway_business_enabled=False,
         )
 
     def tearDown(self):
@@ -47,6 +54,63 @@ class FeatureControllerTests(unittest.TestCase):
         self.assertFalse(state.private_memory_enabled)
         self.assertFalse(state.relationship_state_enabled)
         self.assertFalse(state.memory_governance_enabled)
+
+    def test_gateway_and_rollout_switches_default_to_disabled(self):
+        state = FeatureController(self.path, self.defaults).snapshot()
+
+        self.assertFalse(state.llm_gateway_enabled)
+        self.assertFalse(state.prompt_builder_enabled)
+        self.assertFalse(state.llm_gateway_vision_enabled)
+        self.assertFalse(state.llm_gateway_private_memory_enabled)
+        self.assertFalse(state.llm_gateway_member_memory_enabled)
+        self.assertFalse(state.llm_gateway_chat_enabled)
+        self.assertFalse(state.llm_gateway_business_enabled)
+
+    def test_gateway_requires_master_and_domain_rollout_switch(self):
+        controller = FeatureController(self.path, self.defaults)
+
+        controller.set_switch("llm_gateway_vision_enabled", True, actor="1")
+        self.assertFalse(controller.llm_gateway_allowed("vision"))
+        controller.set_switch("llm_gateway_enabled", True, actor="1")
+        self.assertTrue(controller.llm_gateway_allowed("vision"))
+        self.assertFalse(controller.llm_gateway_allowed("chat"))
+
+    def test_legacy_runtime_state_safely_disables_missing_gateway_switches(self):
+        configured_defaults = replace(
+            self.defaults,
+            llm_gateway_enabled=True,
+            prompt_builder_enabled=True,
+            llm_gateway_vision_enabled=True,
+        )
+        self.path.write_text(json.dumps(asdict(self.defaults)), encoding="utf-8")
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        for key in tuple(raw):
+            if key.startswith("llm_gateway_") or key in {
+                "llm_gateway_enabled",
+                "prompt_builder_enabled",
+            }:
+                raw.pop(key)
+        self.path.write_text(json.dumps(raw), encoding="utf-8")
+
+        state = FeatureController(self.path, configured_defaults).snapshot()
+
+        self.assertFalse(state.llm_gateway_enabled)
+        self.assertFalse(state.prompt_builder_enabled)
+        self.assertFalse(state.llm_gateway_vision_enabled)
+
+    def test_present_gateway_switches_require_strict_booleans(self):
+        backup = replace(self.defaults, llm_gateway_enabled=True)
+        self.path.write_text(
+            json.dumps({**asdict(self.defaults), "llm_gateway_enabled": "false"}),
+            encoding="utf-8",
+        )
+        self.path.with_suffix(self.path.suffix + ".bak").write_text(
+            json.dumps(asdict(backup)), encoding="utf-8"
+        )
+
+        state = FeatureController(self.path, self.defaults).snapshot()
+
+        self.assertTrue(state.llm_gateway_enabled)
 
     def test_v104_runtime_state_uses_configured_defaults_for_new_switches(self):
         self.path.write_text(
@@ -325,6 +389,47 @@ class FeatureControllerTests(unittest.TestCase):
                     "assert CONFIG.private_memory_retention_days == 30; "
                     "assert CONFIG.private_memory_max_messages == 500; "
                     "assert CONFIG.private_memory_shutdown_timeout == 10.0"
+                ),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_llm_gateway_configuration_has_safe_bounded_defaults(self):
+        environment = os.environ.copy()
+        environment["TARGET_GROUP_ID"] = "999000111"
+        for key in (
+            "LLM_GATEWAY_ENABLED",
+            "PROMPT_BUILDER_ENABLED",
+            "LLM_GATEWAY_MAX_CONNECTIONS",
+            "LLM_GATEWAY_MAX_RETRIES",
+            "LLM_GATEWAY_TOTAL_CONCURRENCY",
+            "LLM_GATEWAY_BUSINESS_CONCURRENCY",
+            "LLM_GATEWAY_CHAT_CONCURRENCY",
+            "LLM_GATEWAY_VISION_CONCURRENCY",
+            "LLM_GATEWAY_MEMORY_CONCURRENCY",
+        ):
+            environment.pop(key, None)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from plugins.violation_record.config import CONFIG; "
+                    "assert CONFIG.llm_gateway_enabled is False; "
+                    "assert CONFIG.prompt_builder_enabled is False; "
+                    "assert CONFIG.llm_gateway_max_connections == 8; "
+                    "assert CONFIG.llm_gateway_max_retries == 2; "
+                    "assert CONFIG.llm_gateway_total_concurrency == 8; "
+                    "assert CONFIG.llm_gateway_business_concurrency == 2; "
+                    "assert CONFIG.llm_gateway_chat_concurrency == 3; "
+                    "assert CONFIG.llm_gateway_vision_concurrency == 3; "
+                    "assert CONFIG.llm_gateway_memory_concurrency == 2"
                 ),
             ],
             env=environment,
