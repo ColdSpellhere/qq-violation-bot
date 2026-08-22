@@ -56,6 +56,29 @@ class PrivateFact:
 
 
 @dataclass(frozen=True)
+class PrivateFactCandidate:
+    user_id: str
+    fact_text: str
+    source_message_id: str
+    source_quote: str
+
+
+@dataclass(frozen=True)
+class PurgeReport:
+    purged_messages: int
+    checkpoint_complete: bool = True
+
+
+@dataclass(frozen=True)
+class ClearReport:
+    purged_messages: int
+    summaries_deleted: int
+    topics_cleared: int
+    jobs_cancelled: int
+    checkpoint_complete: bool = True
+
+
+@dataclass(frozen=True)
 class RelationshipState:
     id: int
     scope: ConversationScope
