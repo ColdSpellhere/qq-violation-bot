@@ -90,11 +90,48 @@ class LLMTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Bearer secret-value", seen[0].headers["Authorization"])
         self.assertEqual(gateway_request().to_payload(), json.loads(seen[0].content))
 
+    async def test_base_url_canonicalizes_root_and_existing_v1_without_duplication(self) -> None:
+        for base_url in (
+            "https://api.deepseek.com",
+            "https://api.deepseek.com/v1",
+            "https://api.deepseek.com/v1/",
+        ):
+            seen = []
+
+            def handler(http_request: httpx.Request) -> httpx.Response:
+                seen.append(str(http_request.url))
+                return httpx.Response(200, json={
+                    "model": "m", "choices": [{"message": {"content": "ok"}}]
+                })
+
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            self.clients.append(client)
+            transport = LLMTransport(
+                base_url=base_url,
+                api_key="key",
+                client=client,
+                total_limit=1,
+                lane_limits={task.value: 1 for task in LLMTask},
+                max_attempts=1,
+            )
+            with self.subTest(base_url=base_url):
+                await transport.complete(gateway_request())
+                self.assertEqual(
+                    ["https://api.deepseek.com/v1/chat/completions"], seen
+                )
+
     async def test_configuration_requires_http_url_key_and_complete_lane_limits(self) -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
         self.clients.append(client)
         base = dict(client=client, total_limit=1, lane_limits={task.value: 1 for task in LLMTask})
-        for base_url in ("", "provider.example", "ftp://provider.example", "https://u:p@provider.example"):
+        for base_url in (
+            "",
+            "provider.example",
+            "ftp://provider.example",
+            "https://u:p@provider.example",
+            "https://provider.example/api",
+            "https://provider.example/v1/chat/completions",
+        ):
             with self.subTest(base_url=base_url), self.assertRaises(GatewayConfigurationError):
                 LLMTransport(base_url=base_url, api_key="key", **base)
         for api_key in ("", "   "):
@@ -143,9 +180,10 @@ class LLMTransportTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(status, headers={"Retry-After": "99"})
 
             sleep = AsyncMock()
-            with self.subTest(status=status), self.assertRaises(expected):
+            with self.subTest(status=status), self.assertRaises(expected) as raised:
                 await self.make_transport(handler, sleep=sleep).complete(gateway_request())
             self.assertEqual(3, attempts)
+            self.assertEqual(2, raised.exception.retries)
             self.assertEqual([call(0.5), call(1.0)], sleep.await_args_list)
 
     async def test_valid_retry_after_is_used(self) -> None:
@@ -418,6 +456,97 @@ class LLMTransportTests(unittest.IsolatedAsyncioTestCase):
         await transport.aclose()
         await transport.aclose()
         self.assertTrue(client.is_closed)
+
+    async def test_close_stops_intake_and_drains_an_active_call_before_client_close(self) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            entered.set()
+            await release.wait()
+            return httpx.Response(200, json={
+                "model": "m", "choices": [{"message": {"content": "ok"}}]
+            })
+
+        transport = self.make_transport(handler, max_attempts=1)
+        active = asyncio.create_task(transport.complete(gateway_request()))
+        await entered.wait()
+        closing = asyncio.create_task(transport.aclose(drain_timeout=1.0))
+        await asyncio.sleep(0)
+
+        self.assertFalse(transport.client.is_closed)
+        self.assertFalse(closing.done())
+        with self.assertRaises(GatewayConfigurationError):
+            await transport.complete(gateway_request())
+
+        release.set()
+        self.assertEqual("ok", (await active).content)
+        await closing
+        self.assertTrue(transport.client.is_closed)
+
+    async def test_close_timeout_cancels_active_call_then_releases_permits(self) -> None:
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        transport = self.make_transport(handler, max_attempts=1)
+        active = asyncio.create_task(transport.complete(gateway_request()))
+        await entered.wait()
+        await transport.aclose(drain_timeout=0.01)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await active
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(transport.client.is_closed)
+        self.assertEqual(2, transport._total._value)
+        self.assertEqual(1, transport._lanes[LLMTask.CHAT_REPLY.value]._value)
+
+    async def test_admission_lock_serializes_close_before_a_competing_complete(self) -> None:
+        transport = self.make_transport(lambda _: httpx.Response(200))
+        await transport._admission_lock.acquire()
+        closing = asyncio.create_task(transport.aclose(drain_timeout=1.0))
+        await asyncio.sleep(0)
+        competing = asyncio.create_task(transport.complete(gateway_request()))
+        await asyncio.sleep(0)
+        transport._admission_lock.release()
+
+        await closing
+        with self.assertRaises(GatewayConfigurationError):
+            await competing
+        self.assertTrue(transport.client.is_closed)
+
+    async def test_cancelling_close_cleans_active_call_and_client_before_propagating(self) -> None:
+        entered = asyncio.Event()
+        active_cancelled = asyncio.Event()
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                active_cancelled.set()
+                raise
+
+        transport = self.make_transport(handler, max_attempts=1)
+        active = asyncio.create_task(transport.complete(gateway_request()))
+        await entered.wait()
+        closing = asyncio.create_task(transport.aclose(drain_timeout=10.0))
+        await asyncio.sleep(0)
+        closing.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await closing
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(active, timeout=0.1)
+        self.assertTrue(active_cancelled.is_set())
+        self.assertTrue(transport.client.is_closed)
 
 
 if __name__ == "__main__":

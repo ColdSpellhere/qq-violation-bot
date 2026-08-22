@@ -5,6 +5,7 @@ import os
 import weakref
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from nonebot import get_driver, logger
 
@@ -12,7 +13,6 @@ from plugins.feature_control.runtime import FEATURES
 from plugins.violation_record.config import BACKUP_DIR, CONFIG
 
 from .jobs import JobProcessor, MemoryJobQueue, MemoryJobWorker
-from .relationship import RelationshipStore
 from .schema import (
     PRIVATE_MEMORY_SCHEMA_VERSION,
     migrate,
@@ -21,7 +21,9 @@ from .schema import (
     quick_check,
     schema_version,
 )
-from .store import PrivateMemoryStore
+
+if TYPE_CHECKING:
+    from .store import PrivateMemoryStore
 
 
 _registered_drivers: weakref.WeakSet[object] = weakref.WeakSet()
@@ -121,6 +123,9 @@ def setup_lifecycle(
     @driver.on_startup
     async def _startup() -> None:
         global _queue, _store, _worker, _worker_task, _retention_task
+        from .relationship import RelationshipStore
+        from .store import PrivateMemoryStore
+
         database = Path(CONFIG.chat_archive_path)
         _ensure_schema(database)
         _queue = MemoryJobQueue(database)

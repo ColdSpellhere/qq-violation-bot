@@ -16,6 +16,7 @@ class GatewayError(Exception):
             self.task = None
         else:
             self.task = LLMTask(task).value
+        self.retries = 0
         if status_code is not None and (
             not isinstance(status_code, int) or isinstance(status_code, bool)
         ):

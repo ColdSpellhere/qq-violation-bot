@@ -11,6 +11,39 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PluginLoadingTests(unittest.TestCase):
+    def test_gateway_entrypoint_loads_after_private_schema_lifecycle_before_handlers(self) -> None:
+        source = (ROOT / "bot.py").read_text(encoding="utf-8")
+        private_schema = source.index('nonebot.load_plugin("plugins.private_memory")')
+        gateway = source.index('nonebot.load_plugin("plugins.llm_gateway.runtime")')
+        feature_handler = source.index(
+            'nonebot.load_plugin("plugins.feature_control.matcher")'
+        )
+        private_handler = source.index('nonebot.load_plugin("plugins.private_chat")')
+        self.assertLess(private_schema, gateway)
+        self.assertLess(gateway, feature_handler)
+        self.assertLess(gateway, private_handler)
+
+    def test_gateway_package_import_has_no_runtime_registration_side_effect(self) -> None:
+        env = os.environ.copy()
+        env.update({"TARGET_GROUP_ID": "123456789", "LOG_LEVEL": "WARNING"})
+        script = """
+import sys
+import nonebot
+
+nonebot.init()
+import plugins.llm_gateway
+if "plugins.llm_gateway.runtime" in sys.modules:
+    raise SystemExit("package import unexpectedly imported runtime entrypoint")
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script], cwd=ROOT, env=env,
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(
+            0, completed.returncode,
+            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+
     def test_governance_loads_after_feature_control_before_chat_plugins(self) -> None:
         source = (ROOT / "bot.py").read_text(encoding="utf-8")
         feature = source.index('nonebot.load_plugin("plugins.feature_control.matcher")')
@@ -76,6 +109,7 @@ required = {
     "feature_control",
     "memory_governance",
     "group_router",
+    "runtime",
 }
 missing = sorted(required - loaded)
 if missing:
@@ -105,6 +139,16 @@ if "plugins.private_memory" not in loaded_modules:
         "missing loaded plugin module: plugins.private_memory; "
         f"loaded_modules={sorted(loaded_modules)}"
     )
+if "plugins.llm_gateway.runtime" not in loaded_modules:
+    raise SystemExit(
+        "missing loaded plugin module: plugins.llm_gateway.runtime; "
+        f"loaded_modules={sorted(loaded_modules)}"
+    )
+startup_modules = [func.__module__ for func in nonebot.get_driver()._lifespan._startup_funcs]
+private_index = startup_modules.index("plugins.private_memory.lifecycle")
+gateway_index = startup_modules.index("plugins.llm_gateway.runtime")
+if private_index >= gateway_index:
+    raise SystemExit(f"schema migration must register before gateway: {startup_modules}")
 registered = {
     (priority, matcher.module.__name__)
     for priority, priority_matchers in matchers.items()

@@ -80,8 +80,13 @@ class LLMTransport:
         self._sleep = sleep
         self._random_uniform = random_uniform
         self._clock = clock
+        self._accepting = True
         self._closed = False
+        self._admission_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
+        self._active_tasks: set[asyncio.Task[object]] = set()
+        self._drained = asyncio.Event()
+        self._drained.set()
 
     @staticmethod
     def _validate_base_url(value: str) -> str:
@@ -96,9 +101,10 @@ class LLMTransport:
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
+            or parsed.path not in {"", "/v1"}
         ):
             raise GatewayConfigurationError()
-        return candidate
+        return candidate if parsed.path == "/v1" else f"{candidate}/v1"
 
     @staticmethod
     def _validate_positive_int(value: object) -> None:
@@ -112,12 +118,23 @@ class LLMTransport:
     async def complete(self, request: GatewayRequest) -> GatewayCompletion:
         if not isinstance(request, GatewayRequest):
             raise GatewayContractError()
-        if self._closed:
-            raise GatewayConfigurationError(task=request.task)
-        started = self._clock()
-        async with self._lanes[request.task.value]:
-            async with self._total:
-                return await self._complete_with_retries(request, started)
+        async with self._admission_lock:
+            if not self._accepting or self._closed:
+                raise GatewayConfigurationError(task=request.task)
+            task = asyncio.current_task()
+            if task is None:
+                raise GatewayConfigurationError(task=request.task)
+            self._active_tasks.add(task)
+            self._drained.clear()
+        try:
+            started = self._clock()
+            async with self._lanes[request.task.value]:
+                async with self._total:
+                    return await self._complete_with_retries(request, started)
+        finally:
+            self._active_tasks.discard(task)
+            if not self._active_tasks:
+                self._drained.set()
 
     async def _complete_with_retries(
         self, request: GatewayRequest, started: float
@@ -153,6 +170,7 @@ class LLMTransport:
                 error = caught
 
             if attempt >= self._max_attempts or not self._should_retry(error):
+                error.retries = attempt - 1
                 raise error
             await self._sleep(self._retry_delay(attempt, response))
         raise AssertionError("unreachable")
@@ -268,9 +286,39 @@ class LLMTransport:
             return None
         return delay
 
-    async def aclose(self) -> None:
+    async def _cancel_active_calls(self) -> None:
+        active = tuple(self._active_tasks)
+        for task in active:
+            task.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
+
+    async def aclose(self, *, drain_timeout: float = 10.0) -> None:
+        if (
+            type(drain_timeout) not in (int, float)
+            or not math.isfinite(drain_timeout)
+            or drain_timeout < 0
+        ):
+            raise GatewayConfigurationError()
         async with self._close_lock:
             if self._closed:
                 return
-            self._closed = True
-            await self.client.aclose()
+            try:
+                async with self._admission_lock:
+                    self._accepting = False
+                if self._active_tasks:
+                    try:
+                        await asyncio.wait_for(
+                            self._drained.wait(), timeout=float(drain_timeout)
+                        )
+                    except asyncio.TimeoutError:
+                        await self._cancel_active_calls()
+                await self.client.aclose()
+                self._closed = True
+            except asyncio.CancelledError:
+                async with self._admission_lock:
+                    self._accepting = False
+                await self._cancel_active_calls()
+                await self.client.aclose()
+                self._closed = True
+                raise
