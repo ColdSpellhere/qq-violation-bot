@@ -28,6 +28,56 @@ from plugins.llm_gateway.errors import (
 
 
 class GatewayContractTests(unittest.TestCase):
+    def test_request_requires_at_least_one_message(self) -> None:
+        with self.assertRaisesRegex(ValueError, "messages must not be empty"):
+            GatewayRequest(
+                task=LLMTask.CHAT_REPLY,
+                messages=(),
+                model="chat-model",
+                timeout=30,
+            )
+
+    def test_multimodal_parts_require_supported_complete_shapes(self) -> None:
+        base = {
+            "task": LLMTask.IMAGE_DESCRIPTION,
+            "model": "vision-model",
+            "timeout": 30,
+        }
+        valid = GatewayRequest(
+            **base,
+            messages=(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+                        },
+                    ],
+                },
+            ),
+        )
+        self.assertEqual(
+            "image_url", valid.to_payload()["messages"][0]["content"][1]["type"]
+        )
+
+        invalid_contents = (
+            [],
+            ["text"],
+            [{"type": "audio", "audio": "x"}],
+            [{"type": "text", "text": ""}],
+            [{"type": "image_url", "image_url": {}}],
+            [{"type": "image_url", "image_url": {"url": 123}}],
+            [{"type": "image_url", "image_url": "https://example.invalid/a.jpg"}],
+        )
+        for content in invalid_contents:
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                GatewayRequest(
+                    **base,
+                    messages=({"role": "user", "content": content},),
+                )
+
     def test_task_values_are_stable_and_complete(self) -> None:
         self.assertEqual(
             {

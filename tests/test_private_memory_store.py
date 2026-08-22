@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from plugins.private_memory.models import PrivateFactCandidate
-from plugins.private_memory.schema import migrate
+from plugins.private_memory.schema import PRIVATE_MEMORY_SCHEMA_VERSION, migrate
 from plugins.private_memory.store import PrivateMemoryStore
 
 
@@ -98,7 +98,9 @@ class PrivateMemoryStoreTests(unittest.TestCase):
                 "UPDATE private_memory_schema_meta SET schema_version=99 WHERE singleton=1"
             )
             connection.commit()
-        with self.assertRaisesRegex(RuntimeError, "expected 1, got 99"):
+        with self.assertRaisesRegex(
+            RuntimeError, f"expected {PRIVATE_MEMORY_SCHEMA_VERSION}, got 99"
+        ):
             PrivateMemoryStore(self.database)
 
     def test_configured_retention_sets_message_expiry(self) -> None:

@@ -58,6 +58,26 @@ def _validate_message(message: Mapping[str, object]) -> None:
     content = message["content"]
     if type(content) not in (str, list, tuple):
         raise ValueError("message content must be text or a multimodal array")
+    if type(content) in (list, tuple):
+        if not content:
+            raise ValueError("multimodal content must not be empty")
+        for part in content:
+            if not isinstance(part, Mapping):
+                raise ValueError("each multimodal part must be a mapping")
+            part_type = part.get("type")
+            if part_type == "text":
+                text = part.get("text")
+                if type(text) is not str or not text.strip():
+                    raise ValueError("text parts require non-empty text")
+            elif part_type == "image_url":
+                image_url = part.get("image_url")
+                if not isinstance(image_url, Mapping):
+                    raise ValueError("image_url parts require an image_url mapping")
+                url = image_url.get("url")
+                if type(url) is not str or not url.strip():
+                    raise ValueError("image_url parts require a non-empty string URL")
+            else:
+                raise ValueError("unsupported multimodal part type")
     _freeze_json(message)
 
 
@@ -126,6 +146,8 @@ class GatewayRequest:
             raise ValueError("task must be an LLMTask")
         if not isinstance(self.messages, tuple):
             raise ValueError("messages must be a tuple")
+        if not self.messages:
+            raise ValueError("messages must not be empty")
         if not all(isinstance(message, Mapping) for message in self.messages):
             raise ValueError("each message must be a mapping")
         for message in self.messages:

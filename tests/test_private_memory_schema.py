@@ -32,6 +32,7 @@ EXPECTED_TABLES = {
     "memory_jobs",
     "memory_pending_operations",
     "memory_governance_audit",
+    "llm_usage_events",
     "private_memory_schema_meta",
 }
 

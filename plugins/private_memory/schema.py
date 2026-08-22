@@ -11,7 +11,7 @@ from pathlib import Path
 from .models import MigrationReport
 
 
-PRIVATE_MEMORY_SCHEMA_VERSION = 1
+PRIVATE_MEMORY_SCHEMA_VERSION = 2
 _MANAGED_PRIVATE_MEMORY_BACKUP_RE = re.compile(
     r"(?:chat_archive_before_private_memory_\d{8}T\d{12}Z"
     r"|[^/]+-pre-private-memory-\d{8}T\d{12}Z-\d+)\.sqlite3\Z"
@@ -158,6 +158,23 @@ _TABLE_STATEMENTS = (
         reason TEXT NOT NULL,
         result TEXT NOT NULL CHECK(result IN ('success','failed','cancelled')),
         error_code TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS llm_usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task TEXT NOT NULL,
+        model TEXT NOT NULL,
+        input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens >= 0),
+        output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0),
+        total_tokens INTEGER CHECK(total_tokens IS NULL OR total_tokens >= 0),
+        cost_microunits INTEGER CHECK(cost_microunits IS NULL OR cost_microunits >= 0),
+        cost_currency TEXT,
+        latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
+        status TEXT NOT NULL CHECK(status IN ('success','failure')),
+        retry_count INTEGER NOT NULL CHECK(retry_count >= 0),
+        error_class TEXT,
         created_at TEXT NOT NULL
     )
     """,
@@ -370,6 +387,7 @@ def migrate(path: Path) -> MigrationReport:
                 "memory_jobs",
                 "memory_pending_operations",
                 "memory_governance_audit",
+                "llm_usage_events",
                 "private_memory_schema_meta",
             })
         path.chmod(0o600)
