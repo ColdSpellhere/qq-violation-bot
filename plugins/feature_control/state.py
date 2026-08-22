@@ -13,6 +13,9 @@ SWITCH_NAMES = {
     "chat_enabled",
     "group_chat_enabled",
     "private_chat_enabled",
+    "private_memory_enabled",
+    "relationship_state_enabled",
+    "memory_governance_enabled",
 }
 ALLOWLIST_KINDS = {"group_chat", "private_chat"}
 
@@ -25,6 +28,9 @@ class FeatureState:
     private_chat_enabled: bool
     group_chat_allowed_group_ids: tuple[int, ...]
     private_chat_allowed_user_ids: tuple[str, ...]
+    private_memory_enabled: bool = False
+    relationship_state_enabled: bool = False
+    memory_governance_enabled: bool = False
     updated_at: str = ""
     updated_by: str = ""
 
@@ -33,8 +39,8 @@ class FeatureController:
     def __init__(self, path: Path, defaults: FeatureState):
         self._path = Path(path)
         self._lock = RLock()
-        self._state = self._load_state(self._path) or self._load_state(
-            self._backup_path
+        self._state = self._load_state(self._path, defaults) or self._load_state(
+            self._backup_path, defaults
         ) or defaults
 
     @property
@@ -138,7 +144,9 @@ class FeatureController:
             raise
 
     @classmethod
-    def _load_state(cls, path: Path) -> FeatureState | None:
+    def _load_state(
+        cls, path: Path, defaults: FeatureState | None = None
+    ) -> FeatureState | None:
         try:
             with path.open(encoding="utf-8") as handle:
                 raw = json.load(handle)
@@ -151,6 +159,24 @@ class FeatureController:
                 chat_enabled=cls._strict_bool(raw["chat_enabled"]),
                 group_chat_enabled=cls._strict_bool(raw["group_chat_enabled"]),
                 private_chat_enabled=cls._strict_bool(raw["private_chat_enabled"]),
+                private_memory_enabled=cls._strict_bool(
+                    raw.get(
+                        "private_memory_enabled",
+                        defaults.private_memory_enabled if defaults else False,
+                    )
+                ),
+                relationship_state_enabled=cls._strict_bool(
+                    raw.get(
+                        "relationship_state_enabled",
+                        defaults.relationship_state_enabled if defaults else False,
+                    )
+                ),
+                memory_governance_enabled=cls._strict_bool(
+                    raw.get(
+                        "memory_governance_enabled",
+                        defaults.memory_governance_enabled if defaults else False,
+                    )
+                ),
                 group_chat_allowed_group_ids=cls._load_allowlist(
                     "group_chat", raw["group_chat_allowed_group_ids"]
                 ),

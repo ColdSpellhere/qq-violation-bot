@@ -22,6 +22,9 @@ class FeatureControllerTests(unittest.TestCase):
             private_chat_enabled=True,
             group_chat_allowed_group_ids=(100,),
             private_chat_allowed_user_ids=("200",),
+            private_memory_enabled=False,
+            relationship_state_enabled=False,
+            memory_governance_enabled=False,
         )
 
     def tearDown(self):
@@ -37,6 +40,53 @@ class FeatureControllerTests(unittest.TestCase):
         self.assertFalse(controller.group_chat_allowed(100))
         self.assertFalse(controller.private_chat_allowed("200"))
         self.assertTrue(controller.business_allowed(999, 999))
+
+    def test_new_memory_switches_default_to_disabled(self):
+        state = FeatureController(self.path, self.defaults).snapshot()
+
+        self.assertFalse(state.private_memory_enabled)
+        self.assertFalse(state.relationship_state_enabled)
+        self.assertFalse(state.memory_governance_enabled)
+
+    def test_v104_runtime_state_uses_configured_defaults_for_new_switches(self):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "business_enabled": True,
+                    "chat_enabled": True,
+                    "group_chat_enabled": True,
+                    "private_chat_enabled": True,
+                    "group_chat_allowed_group_ids": [100],
+                    "private_chat_allowed_user_ids": ["200"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = FeatureController(self.path, self.defaults).snapshot()
+
+        self.assertFalse(loaded.private_memory_enabled)
+        self.assertFalse(loaded.relationship_state_enabled)
+        self.assertFalse(loaded.memory_governance_enabled)
+
+    def test_present_new_switches_still_require_strict_booleans(self):
+        backup = replace(self.defaults, private_memory_enabled=True)
+        self.path.write_text(
+            json.dumps(
+                {
+                    **asdict(self.defaults),
+                    "private_memory_enabled": "false",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.path.with_suffix(self.path.suffix + ".bak").write_text(
+            json.dumps(asdict(backup)), encoding="utf-8"
+        )
+
+        loaded = FeatureController(self.path, self.defaults).snapshot()
+
+        self.assertTrue(loaded.private_memory_enabled)
 
     def test_state_survives_restart_and_keeps_backup(self):
         first = FeatureController(self.path, self.defaults)
@@ -240,6 +290,122 @@ class FeatureControllerTests(unittest.TestCase):
                     "assert CONFIG.chat_vision_root.name == 'images'; "
                     "assert CONFIG.chat_vision_root.parent.name == 'chat_vision'; "
                     "assert CONFIG.chat_vision_root != CONFIG.evidence_root"
+                ),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_private_memory_configuration_has_safe_bounded_defaults(self):
+        environment = os.environ.copy()
+        environment["TARGET_GROUP_ID"] = "999000111"
+        for key in (
+            "PRIVATE_MEMORY_ENABLED",
+            "RELATIONSHIP_STATE_ENABLED",
+            "MEMORY_GOVERNANCE_ENABLED",
+            "PRIVATE_MEMORY_RETENTION_DAYS",
+            "PRIVATE_MEMORY_MAX_MESSAGES",
+            "PRIVATE_MEMORY_SHUTDOWN_TIMEOUT",
+        ):
+            environment.pop(key, None)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from plugins.violation_record.config import CONFIG; "
+                    "assert CONFIG.private_memory_enabled is False; "
+                    "assert CONFIG.relationship_state_enabled is False; "
+                    "assert CONFIG.memory_governance_enabled is False; "
+                    "assert CONFIG.private_memory_retention_days == 30; "
+                    "assert CONFIG.private_memory_max_messages == 500; "
+                    "assert CONFIG.private_memory_shutdown_timeout == 10.0"
+                ),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_runtime_uses_private_memory_environment_defaults(self):
+        runtime_path = Path(self.temporary_directory.name) / "fresh-runtime.json"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "TARGET_GROUP_ID": "999000111",
+                "PRIVATE_MEMORY_ENABLED": "true",
+                "RELATIONSHIP_STATE_ENABLED": "true",
+                "MEMORY_GOVERNANCE_ENABLED": "true",
+            }
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from dataclasses import replace; "
+                    "from pathlib import Path; "
+                    "import plugins.violation_record.config as config_module; "
+                    f"config_module.CONFIG = replace(config_module.CONFIG, runtime_features_path=Path({str(runtime_path)!r})); "
+                    "from plugins.feature_control.runtime import FEATURES; "
+                    "state = FEATURES.snapshot(); "
+                    "assert state.private_memory_enabled is True; "
+                    "assert state.relationship_state_enabled is True; "
+                    "assert state.memory_governance_enabled is True"
+                ),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_persisted_runtime_memory_switches_override_environment_defaults(self):
+        runtime_path = Path(self.temporary_directory.name) / "persisted-runtime.json"
+        runtime_path.write_text(
+            json.dumps(
+                {
+                    **asdict(self.defaults),
+                    "private_memory_enabled": False,
+                    "relationship_state_enabled": False,
+                    "memory_governance_enabled": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "TARGET_GROUP_ID": "999000111",
+                "PRIVATE_MEMORY_ENABLED": "true",
+                "RELATIONSHIP_STATE_ENABLED": "true",
+                "MEMORY_GOVERNANCE_ENABLED": "true",
+            }
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from dataclasses import replace; "
+                    "from pathlib import Path; "
+                    "import plugins.violation_record.config as config_module; "
+                    f"config_module.CONFIG = replace(config_module.CONFIG, runtime_features_path=Path({str(runtime_path)!r})); "
+                    "from plugins.feature_control.runtime import FEATURES; "
+                    "state = FEATURES.snapshot(); "
+                    "assert state.private_memory_enabled is False; "
+                    "assert state.relationship_state_enabled is False; "
+                    "assert state.memory_governance_enabled is False"
                 ),
             ],
             env=environment,

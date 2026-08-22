@@ -175,6 +175,20 @@ class AppConfig:
     private_chat_allowed_user_ids: tuple[str, ...] = _string_id_tuple_env(
         "PRIVATE_CHAT_ALLOWED_USER_IDS", legacy_private_ids
     )
+    private_memory_enabled: bool = _bool_env("PRIVATE_MEMORY_ENABLED", False)
+    relationship_state_enabled: bool = _bool_env(
+        "RELATIONSHIP_STATE_ENABLED", False
+    )
+    memory_governance_enabled: bool = _bool_env("MEMORY_GOVERNANCE_ENABLED", False)
+    private_memory_retention_days: int = max(
+        1, _int_env("PRIVATE_MEMORY_RETENTION_DAYS", 30)
+    )
+    private_memory_max_messages: int = max(
+        1, _int_env("PRIVATE_MEMORY_MAX_MESSAGES", 500)
+    )
+    private_memory_shutdown_timeout: float = max(
+        0.1, _float_env("PRIVATE_MEMORY_SHUTDOWN_TIMEOUT", 10.0)
+    )
     runtime_features_path: Path = DATA_DIR / "runtime_features.json"
     admin_seed: str = os.getenv("ADMIN_SEED", "")
 

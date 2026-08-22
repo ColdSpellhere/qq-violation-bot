@@ -8,6 +8,9 @@ _SWITCH_COMMANDS = {
     "/聊天": ("chat_enabled", "聊天总开关"),
     "/群聊": ("group_chat_enabled", "群聊功能"),
     "/私聊": ("private_chat_enabled", "私聊功能"),
+    "/私聊记忆": ("private_memory_enabled", "私聊持久记忆"),
+    "/关系状态": ("relationship_state_enabled", "关系状态"),
+    "/记忆治理": ("memory_governance_enabled", "记忆治理"),
 }
 _ALLOWLIST_COMMANDS = {
     "/群聊群": ("group_chat", "群聊群", "群号"),
@@ -50,6 +53,9 @@ def _status(controller: FeatureController) -> str:
             "私聊功能："
             f"{_switch_text(state.private_chat_enabled)}"
             f"（允许用户数：{len(state.private_chat_allowed_user_ids)}）",
+            f"私聊持久记忆：{_switch_text(state.private_memory_enabled)}",
+            f"关系状态：{_switch_text(state.relationship_state_enabled)}",
+            f"记忆治理：{_switch_text(state.memory_governance_enabled)}",
         )
     )
 

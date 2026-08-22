@@ -56,6 +56,9 @@ class FeatureControlCommandTests(unittest.TestCase):
                 private_chat_enabled=True,
                 group_chat_allowed_group_ids=(100,),
                 private_chat_allowed_user_ids=("200",),
+                private_memory_enabled=False,
+                relationship_state_enabled=False,
+                memory_governance_enabled=False,
             ),
         )
 
@@ -71,6 +74,9 @@ class FeatureControlCommandTests(unittest.TestCase):
             "/群聊群 添加 123",
             "/私聊 关",
             "/私聊用户 列表",
+            "/私聊记忆 开",
+            "/关系状态 关",
+            "/记忆治理 开",
         ):
             self.assertTrue(is_control_command(text), text)
         for text in ("业务 开", "/未知 开", "/聊天会 开", "普通聊天"):
@@ -93,10 +99,25 @@ class FeatureControlCommandTests(unittest.TestCase):
             "私聊功能已关闭。",
             execute_control_command("/私聊 关", self.controller, "1"),
         )
+        self.assertEqual(
+            "私聊持久记忆已开启。",
+            execute_control_command("/私聊记忆 开", self.controller, "1"),
+        )
+        self.assertEqual(
+            "关系状态已开启。",
+            execute_control_command("/关系状态 开", self.controller, "1"),
+        )
+        self.assertEqual(
+            "记忆治理已开启。",
+            execute_control_command("/记忆治理 开", self.controller, "1"),
+        )
         self.assertFalse(self.controller.snapshot().business_enabled)
         self.assertFalse(self.controller.snapshot().chat_enabled)
         self.assertFalse(self.controller.snapshot().group_chat_enabled)
         self.assertFalse(self.controller.snapshot().private_chat_enabled)
+        self.assertTrue(self.controller.snapshot().private_memory_enabled)
+        self.assertTrue(self.controller.snapshot().relationship_state_enabled)
+        self.assertTrue(self.controller.snapshot().memory_governance_enabled)
 
     def test_executes_all_allowlist_commands(self) -> None:
         self.assertEqual(
@@ -131,6 +152,9 @@ class FeatureControlCommandTests(unittest.TestCase):
         self.assertIn("聊天总开关：开", status)
         self.assertIn("群聊功能：开（允许群数：1）", status)
         self.assertIn("私聊功能：开（允许用户数：1）", status)
+        self.assertIn("私聊持久记忆：关", status)
+        self.assertIn("关系状态：关", status)
+        self.assertIn("记忆治理：关", status)
         self.assertNotIn("100", status)
         self.assertNotIn("200", status)
 
