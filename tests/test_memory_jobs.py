@@ -571,7 +571,7 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch.object(lifecycle, "CONFIG", config),
             patch.object(lifecycle, "BACKUP_DIR", self.root / "backups"),
             patch.object(lifecycle, "MemoryJobQueue", return_value=queue),
-            patch.object(lifecycle, "PrivateMemoryStore", return_value=store),
+            patch("plugins.private_memory.store.PrivateMemoryStore", return_value=store),
             patch.object(lifecycle, "MemoryJobWorker", return_value=worker),
         ):
             lifecycle.setup_lifecycle(processor=None)
@@ -619,7 +619,7 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch.object(lifecycle, "CONFIG", config),
             patch.object(lifecycle, "BACKUP_DIR", self.root / "backups"),
             patch.object(lifecycle, "MemoryJobQueue", return_value=queue),
-            patch.object(lifecycle, "PrivateMemoryStore", return_value=store),
+            patch("plugins.private_memory.store.PrivateMemoryStore", return_value=store),
             patch.object(lifecycle, "MemoryJobWorker", return_value=worker),
             patch.object(lifecycle, "_utc_now", new=clock.now, create=True),
             patch.object(lifecycle, "_sleep", new=clock.sleep, create=True),
