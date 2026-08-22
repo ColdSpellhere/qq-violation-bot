@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
@@ -24,6 +25,8 @@ from plugins.private_memory.models import (
 from plugins.private_memory.relationship import RelationshipStore
 from plugins.private_memory.schema import migrate
 from plugins.private_memory.store import PrivateMemoryStore
+from plugins.chat_archive.db import ContextMessage
+from plugins.member_memory.store import MemoryTrait
 
 
 def _message(
@@ -85,6 +88,151 @@ class _Gateway:
         )
 
 
+class _MemberFeatures:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def llm_gateway_allowed(self, domain: str) -> bool:
+        if domain != "member_memory":
+            raise AssertionError(domain)
+        return self.enabled
+
+
+class _MemberGateway:
+    def __init__(self) -> None:
+        self.extract_member_memories = AsyncMock(
+            return_value=(
+                '{"memories":[{"user_id":"200","trait":"喜欢月季",'
+                '"evidence_message_id":"g1","quote":"我喜欢月季"}]}'
+            )
+        )
+        self.summarize_member_memory = AsyncMock(return_value="喜欢月季，也常聊植物。")
+
+
+class MemberMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def context(self):
+        return (
+            ContextMessage(
+                "小园丁", "我喜欢月季", message_id="g1", user_id="200"
+            ),
+        )
+
+    async def test_member_prompts_remain_domain_owned_and_gateway_only_transports(self) -> None:
+        from plugins.member_memory import ai
+
+        gateway = _MemberGateway()
+        with (
+            patch.object(
+                ai, "CONFIG", replace(ai.CONFIG, ai_api_key="synthetic-test-key")
+            ),
+            patch.object(ai, "FEATURES", _MemberFeatures(True), create=True),
+            patch.object(
+                ai, "get_gateway", AsyncMock(return_value=gateway), create=True
+            ),
+            patch.object(
+                ai,
+                "_legacy_complete",
+                AsyncMock(side_effect=AssertionError("legacy path used")),
+                create=True,
+            ),
+        ):
+            candidates = await ai.extract_memory_candidates(self.context())
+            summary = await ai.generate_memory_summary(
+                "旧摘要", (MemoryTrait("喜欢花", "g1", "now"),)
+            )
+
+        self.assertEqual("喜欢月季", candidates[0]["trait"])
+        self.assertEqual("喜欢月季，也常聊植物。", summary)
+        extraction_messages = gateway.extract_member_memories.await_args.args[0]
+        summary_messages = gateway.summarize_member_memory.await_args.args[0]
+        self.assertIn("保守地提取", extraction_messages[0]["content"])
+        self.assertIn("quote必须逐字", extraction_messages[0]["content"])
+        self.assertIn("我喜欢月季", extraction_messages[1]["content"])
+        self.assertIn("不超过300字", summary_messages[0]["content"])
+        self.assertIn("旧摘要", summary_messages[1]["content"])
+        self.assertNotIn("旧摘要", extraction_messages[1]["content"])
+
+    async def test_member_gateway_switch_hot_falls_back_to_legacy(self) -> None:
+        from plugins.member_memory import ai
+
+        features = _MemberFeatures(False)
+        gateway = _MemberGateway()
+        legacy = AsyncMock(
+            side_effect=(
+                '{"memories":[]}',
+                '{"memories":[{"user_id":"200","trait":"喜欢月季",'
+                '"evidence_message_id":"g1","quote":"我喜欢月季"}]}',
+            )
+        )
+        getter = AsyncMock(return_value=gateway)
+        with (
+            patch.object(
+                ai, "CONFIG", replace(ai.CONFIG, ai_api_key="synthetic-test-key")
+            ),
+            patch.object(ai, "FEATURES", features, create=True),
+            patch.object(ai, "get_gateway", getter, create=True),
+            patch.object(ai, "_legacy_complete", legacy, create=True),
+        ):
+            self.assertEqual([], await ai.extract_memory_candidates(self.context()))
+            features.enabled = True
+            self.assertEqual(
+                "喜欢月季",
+                (await ai.extract_memory_candidates(self.context()))[0]["trait"],
+            )
+            features.enabled = False
+            self.assertEqual(
+                "喜欢月季",
+                (await ai.extract_memory_candidates(self.context()))[0]["trait"],
+            )
+        self.assertEqual(2, legacy.await_count)
+        getter.assert_awaited_once()
+
+    async def test_member_gateway_errors_and_malformed_output_keep_safe_returns(self) -> None:
+        from plugins.member_memory import ai
+
+        for error in (
+            GatewayConfigurationError(),
+            GatewayAuthenticationError(),
+            GatewayContractError(),
+        ):
+            gateway = _MemberGateway()
+            gateway.extract_member_memories.side_effect = error
+            gateway.summarize_member_memory.side_effect = error
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.object(
+                    ai, "CONFIG", replace(ai.CONFIG, ai_api_key="synthetic-test-key")
+                ),
+                patch.object(ai, "FEATURES", _MemberFeatures(True), create=True),
+                patch.object(
+                    ai, "get_gateway", AsyncMock(return_value=gateway), create=True
+                ),
+            ):
+                self.assertEqual([], await ai.extract_memory_candidates(self.context()))
+                self.assertIsNone(
+                    await ai.generate_memory_summary(
+                        "", (MemoryTrait("喜欢花", "g1", "now"),)
+                    )
+                )
+
+        gateway = _MemberGateway()
+        gateway.extract_member_memories.return_value = "not-json"
+        gateway.summarize_member_memory.return_value = "x" * 301
+        with (
+            patch.object(
+                ai, "CONFIG", replace(ai.CONFIG, ai_api_key="synthetic-test-key")
+            ),
+            patch.object(ai, "FEATURES", _MemberFeatures(True), create=True),
+            patch.object(
+                ai, "get_gateway", AsyncMock(return_value=gateway), create=True
+            ),
+        ):
+            self.assertEqual([], await ai.extract_memory_candidates(self.context()))
+            self.assertIsNone(
+                await ai.generate_memory_summary(
+                    "", (MemoryTrait("喜欢花", "g1", "now"),)
+                )
+            )
 class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_gateway_relationship_contract_is_exactly_four_data_fields(self) -> None:
         from plugins.private_memory import ai
