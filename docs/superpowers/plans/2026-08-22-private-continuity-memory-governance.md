@@ -434,6 +434,11 @@ git commit -m "feat: add recoverable private memory jobs"
 
 ### Task 6: Process summaries, stable facts, and relationship updates
 
+Processor handlers must commit through the summary/relationship watermark and
+version compare-and-swap APIs before marking a job finished. Queue ownership and a
+false `finish()` result protect only the job row; they are not a substitute for CAS
+and cannot undo a stale domain write after a governance clear.
+
 **Files:**
 
 - Create: `plugins/private_memory/ai.py`

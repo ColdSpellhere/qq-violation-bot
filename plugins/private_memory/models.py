@@ -1,6 +1,20 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+
+_PERSONA_ID_RE = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?", re.ASCII
+)
+
+
+def validate_persona_id(persona_id: str) -> str:
+    if not isinstance(persona_id, str) or _PERSONA_ID_RE.fullmatch(persona_id) is None:
+        raise ValueError(
+            "persona_id must be a lowercase ASCII slug of at most 64 characters"
+        )
+    return persona_id
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,8 @@
-"""Persistent private-memory building blocks.
+"""Register private-memory lifecycle hooks; database work starts at app startup."""
 
-Runtime lifecycle registration is added in a later implementation stage.
-"""
+from .lifecycle import set_processor, setup_lifecycle
+
+
+setup_lifecycle()
+
+__all__ = ["set_processor", "setup_lifecycle"]

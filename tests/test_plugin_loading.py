@@ -53,6 +53,11 @@ if "plugins.chat_vision" not in loaded_modules:
         "missing loaded plugin module: plugins.chat_vision; "
         f"loaded_modules={sorted(loaded_modules)}"
     )
+if "plugins.private_memory" not in loaded_modules:
+    raise SystemExit(
+        "missing loaded plugin module: plugins.private_memory; "
+        f"loaded_modules={sorted(loaded_modules)}"
+    )
 registered = {
     (priority, matcher.module.__name__)
     for priority, priority_matchers in matchers.items()

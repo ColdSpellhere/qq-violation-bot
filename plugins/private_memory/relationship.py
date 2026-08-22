@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import ConversationScope, RelationshipState
+from .models import ConversationScope, RelationshipState, validate_persona_id
 from .schema import PRIVATE_MEMORY_SCHEMA_VERSION, schema_version
 
 
@@ -20,9 +20,6 @@ MAX_PREFERRED_ADDRESS_LENGTH = 40
 MAX_COMMUNICATION_STYLE_LENGTH = 200
 
 _USER_ID_RE = re.compile(r"[1-9][0-9]*", re.ASCII)
-_PERSONA_ID_RE = re.compile(
-    r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?", re.ASCII
-)
 _GOVERNANCE_SOURCE_RE = re.compile(r"governance:([1-9][0-9]*)", re.ASCII)
 
 
@@ -36,12 +33,6 @@ def _validate_group_id(group_id: int) -> int:
     if isinstance(group_id, bool) or not isinstance(group_id, int) or group_id <= 0:
         raise ValueError("group_id must be a positive integer")
     return group_id
-
-
-def _validate_persona_id(persona_id: str) -> str:
-    if not isinstance(persona_id, str) or _PERSONA_ID_RE.fullmatch(persona_id) is None:
-        raise ValueError("persona_id must be a lowercase ASCII slug of at most 64 characters")
-    return persona_id
 
 
 def _validate_source_message_id(source_message_id: str) -> str:
@@ -132,7 +123,7 @@ class RelationshipStore:
     ) -> RelationshipState | None:
         group_id = _validate_group_id(group_id)
         user_id = _validate_user_id(user_id)
-        persona_id = _validate_persona_id(persona_id)
+        persona_id = validate_persona_id(persona_id)
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
@@ -151,7 +142,7 @@ class RelationshipStore:
         self, *, user_id: str, persona_id: str
     ) -> RelationshipState | None:
         user_id = _validate_user_id(user_id)
-        persona_id = _validate_persona_id(persona_id)
+        persona_id = validate_persona_id(persona_id)
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
@@ -301,7 +292,7 @@ class RelationshipStore:
         if not isinstance(scope, ConversationScope):
             raise TypeError("scope must be a ConversationScope")
         user_id = _validate_user_id(scope.user_id)
-        persona_id = _validate_persona_id(scope.persona_id)
+        persona_id = validate_persona_id(scope.persona_id)
         if scope.conversation_kind == "group":
             group_id: int | None = _validate_group_id(scope.group_id)  # type: ignore[arg-type]
         elif scope.conversation_kind == "private":
