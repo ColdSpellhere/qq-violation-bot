@@ -657,6 +657,63 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(retention_task.done())
         self.assertIsNone(lifecycle._retention_task)
 
+    async def test_daily_retention_prunes_both_managed_backup_names_only(self) -> None:
+        from plugins.private_memory import lifecycle
+
+        backup_dir = self.root / "backups" / "private_memory"
+        backup_dir.mkdir(parents=True, mode=0o700)
+        migration = backup_dir / (
+            "chat_archive_before_private_memory_20260701T000000000000Z.sqlite3"
+        )
+        service = backup_dir / (
+            "chat_archive-pre-private-memory-20260701T000000000000Z-42.sqlite3"
+        )
+        unrelated = backup_dir / "manual.sqlite3"
+        symlink_target = self.root / "symlink-target.sqlite3"
+        symlink = backup_dir / (
+            "chat_archive_before_private_memory_20260702T000000000000Z.sqlite3"
+        )
+        hardlink_target = self.root / "hardlink-target.sqlite3"
+        hardlink = backup_dir / (
+            "chat_archive_before_private_memory_20260703T000000000000Z.sqlite3"
+        )
+        for path in (migration, service, unrelated, symlink_target, hardlink_target):
+            path.write_bytes(b"fixture")
+        symlink.symlink_to(symlink_target)
+        os.link(hardlink_target, hardlink)
+        old_time = (NOW - timedelta(days=30, seconds=1)).timestamp()
+        for path in (migration, service, unrelated, hardlink_target):
+            os.utime(path, (old_time, old_time))
+
+        store = MagicMock()
+        store.purge_expired.return_value = SimpleNamespace(checkpoint_complete=True)
+        sleep_count = 0
+
+        async def one_daily_tick(seconds: float) -> None:
+            nonlocal sleep_count
+            self.assertEqual(86_400, seconds)
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch.object(lifecycle, "CONFIG", self.config()),
+            patch.object(lifecycle, "BACKUP_DIR", self.root / "backups"),
+            patch.object(lifecycle, "_utc_now", return_value=NOW),
+            patch.object(lifecycle, "_sleep", new=one_daily_tick),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await lifecycle._run_daily_retention(store)
+
+        store.purge_expired.assert_called_once()
+        self.assertFalse(migration.exists())
+        self.assertFalse(service.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(symlink.is_symlink())
+        self.assertTrue(symlink_target.exists())
+        self.assertTrue(hardlink.exists())
+        self.assertTrue(hardlink_target.exists())
+
     async def test_shutdown_waits_for_fast_inflight_callback(self) -> None:
         from plugins.private_memory import lifecycle
 

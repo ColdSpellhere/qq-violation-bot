@@ -115,6 +115,11 @@ class PublicSourceBoundaryTests(unittest.TestCase):
         migration = text[text.index("#### 迁移、启用与回滚"):]
         self.assertIn("必须从项目根目录执行", migration)
         self.assertIn("set -a\n. ./.env\nset +a", migration)
+        self.assertIn('PROJECT_ROOT="$(pwd -P)"', migration)
+        self.assertIn('"$PROJECT_ROOT/backups/private_memory"', migration)
+        self.assertIn('"$PROJECT_ROOT/data/chat_archive.db"', migration)
+        self.assertNotIn("backups/private-memory-migration", migration)
+        self.assertIn("任一祖先符号链接", migration)
         self.assertIn("TARGET_GROUP_ID", migration)
 
     def test_private_memory_changelog_distinguishes_checkpoint_outcomes(self) -> None:
@@ -124,6 +129,7 @@ class PublicSourceBoundaryTests(unittest.TestCase):
         self.assertIn("持久审计", section)
         self.assertIn("每日保留清理", section)
         self.assertIn("仅记录脱敏日志", section)
+        self.assertIn("backups/private_memory", section)
 
     def test_private_memory_plan_requires_external_synthetic_group_id(self) -> None:
         plan = (

@@ -72,7 +72,8 @@ class PrivateMemorySchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name).resolve()
+        self.alias_root = Path(temporary.name)
+        self.root = self.alias_root.resolve()
         self.database = self.root / "chat_archive.db"
 
     def test_empty_database_gets_exact_schema_constraints_and_indexes(self) -> None:
@@ -121,6 +122,13 @@ class PrivateMemorySchemaTests(unittest.TestCase):
             self.database, "table", "memory_governance_audit"
         ))
         self.assertEqual("ok", quick_check(self.database))
+
+    def test_migration_default_backup_directory_matches_daily_retention(self) -> None:
+        args = migrate_private_memory.parse_args([])
+        self.assertEqual(
+            PROJECT_ROOT / "backups" / "private_memory",
+            args.backup_dir,
+        )
 
     def test_confirmation_token_hash_requires_lowercase_sha256_hex(self) -> None:
         migrate(self.database)
@@ -507,27 +515,29 @@ class PrivateMemorySchemaTests(unittest.TestCase):
         env_file = self.root / ".env"
         synthetic_id = "".join(("246", "813", "579"))
         env_file.write_text(f"TARGET_GROUP_ID={synthetic_id}\n", encoding="utf-8")
-        with closing(sqlite3.connect(self.database)) as connection:
+        database = self.root / "data" / "chat_archive.db"
+        database.parent.mkdir()
+        with closing(sqlite3.connect(database)) as connection:
             connection.execute("CREATE TABLE marker(value TEXT)")
             connection.commit()
-        backup_dir = self.root / "backups"
-        backup_dir.mkdir(mode=0o700)
+        backup_dir = self.root / "backups" / "private_memory"
+        backup_dir.mkdir(parents=True, mode=0o700)
         environment = os.environ.copy()
         environment.pop("TARGET_GROUP_ID", None)
         environment.update(
             {
                 "PYTHON_BIN": sys.executable,
                 "MIGRATION_SCRIPT": str(PROJECT_ROOT / "scripts/migrate_private_memory.py"),
-                "DATABASE_PATH": str(self.database),
-                "BACKUP_PATH": str(backup_dir),
             }
         )
         result = subprocess.run(
             [
                 "/bin/sh",
                 "-c",
-                'set -a\n. ./.env\nset +a\nexec "$PYTHON_BIN" "$MIGRATION_SCRIPT" '
-                '--database "$DATABASE_PATH" --backup-dir "$BACKUP_PATH"',
+                'PROJECT_ROOT="$(pwd -P)"\nset -a\n. ./.env\nset +a\n'
+                'exec "$PYTHON_BIN" "$MIGRATION_SCRIPT" '
+                '--database "$PROJECT_ROOT/data/chat_archive.db" '
+                '--backup-dir "$PROJECT_ROOT/backups/private_memory"',
             ],
             cwd=self.root,
             env=environment,
@@ -536,6 +546,67 @@ class PrivateMemorySchemaTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("preflight=ok", result.stdout)
+
+    @unittest.skipUnless(Path("/var").is_symlink(), "requires the macOS /var alias")
+    def test_cli_rejects_noncanonical_system_alias_before_preflight_or_apply(self) -> None:
+        self.assertNotEqual(self.alias_root, self.root)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("CREATE TABLE marker(value TEXT NOT NULL)")
+            connection.execute("INSERT INTO marker VALUES ('unchanged')")
+            connection.commit()
+        backup_dir = self.root / "backups" / "private_memory"
+        backup_dir.mkdir(parents=True, mode=0o700)
+        alias_database = self.alias_root / self.database.name
+        alias_backup_dir = self.alias_root / "backups" / "private_memory"
+        before = self.database.read_bytes()
+        base_command = [
+            sys.executable,
+            "scripts/migrate_private_memory.py",
+            "--database",
+            str(alias_database),
+            "--backup-dir",
+            str(alias_backup_dir),
+        ]
+
+        for apply_args in ((), ("--apply",)):
+            with self.subTest(mode=apply_args or ("preflight",)):
+                result = subprocess.run(
+                    [*base_command, *apply_args],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("symlink", result.stderr)
+                self.assertEqual(before, self.database.read_bytes())
+                self.assertEqual([], list(backup_dir.iterdir()))
+
+        canonical_command = [
+            sys.executable,
+            "scripts/migrate_private_memory.py",
+            "--database",
+            str(self.database),
+            "--backup-dir",
+            str(backup_dir),
+        ]
+        preflight = subprocess.run(
+            canonical_command,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        applied = subprocess.run(
+            [*canonical_command, "--apply"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, preflight.returncode, preflight.stderr)
+        self.assertEqual(0, applied.returncode, applied.stderr)
+        self.assertEqual(1, len(list(backup_dir.glob("*.sqlite3"))))
 
     def test_online_backup_rejects_existing_insecure_directory_without_chmod(self) -> None:
         with closing(sqlite3.connect(self.database)) as connection:

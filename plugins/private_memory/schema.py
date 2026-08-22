@@ -216,8 +216,18 @@ def quick_check(path: Path) -> str:
     return result
 
 
+def _reject_symlink_path(path: Path) -> Path:
+    absolute = Path(path).absolute()
+    for candidate in (absolute, *absolute.parents):
+        if candidate.is_symlink():
+            raise ValueError(f"path must not contain symlinks: {path}")
+    if absolute != absolute.resolve(strict=False):
+        raise ValueError(f"path must be canonical: {path}")
+    return absolute
+
+
 def require_regular_database(path: Path) -> Path:
-    path = Path(path)
+    path = _reject_symlink_path(Path(path))
     if not path.exists():
         raise FileNotFoundError(f"database does not exist: {path}")
     if not path.is_file():
@@ -226,7 +236,7 @@ def require_regular_database(path: Path) -> Path:
 
 
 def validate_backup_directory(path: Path) -> Path:
-    path = Path(path)
+    path = _reject_symlink_path(Path(path))
     if not path.exists():
         return path
     if not path.is_dir():
@@ -237,14 +247,6 @@ def validate_backup_directory(path: Path) -> Path:
             f"existing backup directory must have mode 0700, got {mode:04o}: {path}"
         )
     return path
-
-
-def _reject_symlink_path(path: Path) -> Path:
-    absolute = Path(path).absolute()
-    for candidate in (absolute, *absolute.parents):
-        if candidate.is_symlink():
-            raise ValueError(f"backup directory path must not contain symlinks: {path}")
-    return absolute
 
 
 def prune_private_memory_backups(

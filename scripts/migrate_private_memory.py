@@ -27,16 +27,18 @@ from plugins.violation_record.config import CONFIG
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Migrate the private-memory chat archive schema.")
     parser.add_argument("--database", type=Path, default=PROJECT_ROOT / "data" / "chat_archive.db")
-    parser.add_argument("--backup-dir", type=Path, default=PROJECT_ROOT / "backups")
+    parser.add_argument(
+        "--backup-dir",
+        type=Path,
+        default=PROJECT_ROOT / "backups" / "private_memory",
+    )
     parser.add_argument("--apply", action="store_true")
     return parser.parse_args(argv)
 
 
 def apply_migration(database: Path, backup_dir: Path) -> tuple[MigrationReport, Path]:
-    database = Path(database)
-    backup_dir = Path(backup_dir)
-    require_regular_database(database)
-    validate_backup_directory(backup_dir)
+    database = require_regular_database(Path(database))
+    backup_dir = validate_backup_directory(Path(backup_dir))
     quick_check(database)
     now = datetime.now(timezone.utc)
     prune_private_memory_backups(
