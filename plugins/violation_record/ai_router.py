@@ -5,6 +5,9 @@ from typing import Any
 
 import httpx
 
+from plugins.llm_gateway import get_gateway
+from plugins.llm_gateway.errors import GatewayError
+
 from .config import CONFIG
 from .schemas import DEFAULT_INTENT, merge_default
 
@@ -46,6 +49,12 @@ query.time_range 可写：today | yesterday | current_week | current_month | rec
 
 class AIRouterError(Exception):
     pass
+
+
+def _gateway_enabled() -> bool:
+    from plugins.feature_control.runtime import FEATURES
+
+    return FEATURES.llm_gateway_allowed("business")
 
 
 _MEMBER_QUERY_RE = re.compile(
@@ -162,32 +171,68 @@ def _looks_like_area_only_query(text: str, area: str) -> bool:
     return cleaned == ""
 
 
+def _intent_messages(
+    message: str, *, referenced_time: str | None
+) -> tuple[dict[str, object], dict[str, object]]:
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    reference_hint = ""
+    if referenced_time:
+        reference_hint = (
+            "\n本条管理员消息引用/回复了一条 QQ 消息，被引用消息时间："
+            f"{referenced_time}。如果管理员没有另外说明时间，可将该时间作为 "
+            "violation.time 或 status_update.time。"
+        )
+    return (
+        {
+            "role": "system",
+            "content": (
+                f"{SYSTEM_PROMPT}\n当前服务器时间：{now_text}（Asia/Shanghai）。"
+                "输出时间尽量使用 YYYY-MM-DD HH:MM:SS。"
+                f"{reference_hint}"
+            ),
+        },
+        {"role": "user", "content": message},
+    )
+
+
+async def _legacy_complete(
+    messages: tuple[dict[str, object], dict[str, object]],
+) -> str:
+    payload = {
+        "model": CONFIG.ai_model,
+        "messages": list(messages),
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    url = f"{CONFIG.ai_base_url}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {CONFIG.ai_api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=CONFIG.ai_timeout) as client:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+    if not isinstance(content, str):
+        raise TypeError("AI response content must be text")
+    return content
+
+
 async def parse_intent(message: str, referenced_time: str | None = None) -> dict[str, Any]:
     shortcut = _keyword_shortcut(message)
     if shortcut:
         return shortcut
     if not CONFIG.ai_api_key:
         raise AIRouterError("AI 未启用或缺少 AI_API_KEY，无法进行自然语言解析。")
-    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    reference_hint = ""
-    if referenced_time:
-        reference_hint = f"\n本条管理员消息引用/回复了一条 QQ 消息，被引用消息时间：{referenced_time}。如果管理员没有另外说明时间，可将该时间作为 violation.time 或 status_update.time。"
-    payload = {
-        "model": CONFIG.ai_model,
-        "messages": [
-            {"role": "system", "content": f"{SYSTEM_PROMPT}\n当前服务器时间：{now_text}（Asia/Shanghai）。输出时间尽量使用 YYYY-MM-DD HH:MM:SS。{reference_hint}"},
-            {"role": "user", "content": message},
-        ],
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-    }
-    url = f"{CONFIG.ai_base_url}/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {CONFIG.ai_api_key}", "Content-Type": "application/json"}
+    messages = _intent_messages(message, referenced_time=referenced_time)
     try:
-        async with httpx.AsyncClient(timeout=CONFIG.ai_timeout) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
+        if _gateway_enabled():
+            gateway = await get_gateway()
+            content = await gateway.parse_business_intent(messages)
+        else:
+            content = await _legacy_complete(messages)
+    except GatewayError as exc:
+        raise AIRouterError(f"AI 解析失败：{type(exc).__name__}") from exc
     except Exception as exc:
         raise AIRouterError(f"AI 解析失败：{exc}") from exc
     parsed = _extract_json(content)
