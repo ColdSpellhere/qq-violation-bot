@@ -111,10 +111,13 @@ def _bounded_text(
     return compact[:maximum]
 
 
-def _parse_summary(content: str) -> str:
+def _parse_summary(content: str, *, gateway_contract: bool = False) -> str:
     parsed = _strict_object(content, fields={"summary"})
     return _bounded_text(
-        parsed["summary"], maximum=600, allow_empty=False, reject_overflow=True
+        parsed["summary"],
+        maximum=600,
+        allow_empty=False,
+        reject_overflow=gateway_contract,
     )
 
 
@@ -161,7 +164,7 @@ def _parse_relationship(
     }
     required = data_fields if gateway_contract else data_fields | {"certainty"}
     parsed = _strict_object(content, fields=required)
-    certainty = parsed.get("certainty", "explicit")
+    certainty = "uncertain" if gateway_contract else parsed["certainty"]
     if not gateway_contract and certainty not in {"explicit", "uncertain"}:
         raise ContractError("unsupported_certainty")
     topics = parsed["open_topics"]
@@ -172,7 +175,7 @@ def _parse_relationship(
             item,
             maximum=MAX_OPEN_TOPIC_LENGTH,
             allow_empty=False,
-            reject_overflow=True,
+            reject_overflow=gateway_contract,
         )
         for item in topics
     )
@@ -180,7 +183,7 @@ def _parse_relationship(
         parsed["state_text"],
         maximum=MAX_STATE_TEXT_LENGTH,
         allow_empty=True,
-        reject_overflow=True,
+        reject_overflow=gateway_contract,
     )
     if certainty == "uncertain" and state_text and not any(
         marker in state_text for marker in _UNCERTAIN_MARKERS
@@ -192,12 +195,12 @@ def _parse_relationship(
         preferred_address=_bounded_text(
             parsed["preferred_address"],
             maximum=MAX_PREFERRED_ADDRESS_LENGTH,
-            reject_overflow=True,
+            reject_overflow=gateway_contract,
         ),
         communication_style=_bounded_text(
             parsed["communication_style"],
             maximum=MAX_COMMUNICATION_STYLE_LENGTH,
-            reject_overflow=True,
+            reject_overflow=gateway_contract,
         ),
     )
 
@@ -329,12 +332,19 @@ def _relationship_messages(
         '"preferred_address":"","communication_style":"",'
         '"certainty":"explicit|uncertain"}'
     )
+    certainty_rule = (
+        "推测内容必须在文字中保留可能/似乎等不确定措辞。"
+        if gateway_contract
+        else "推测必须标为 uncertain 并保留可能/似乎等不确定措辞。"
+    )
     return (
         {
             "role": "system",
             "content": (
                 "更新聊天关系状态，只描述互动方式、熟悉程度和未完话题，不生成事实、心理诊断或"
-                "业务判断。推测内容必须在文字中保留可能/似乎等不确定措辞。只输出严格 JSON："
+                "业务判断。"
+                + certainty_rule
+                + "只输出严格 JSON："
                 + output_contract
                 + "。"
             ),
@@ -381,7 +391,7 @@ async def summarize_private_conversation(
             messages=_summary_messages(previous, messages),
             use_gateway=use_gateway,
         )
-        return _parse_summary(content)
+        return _parse_summary(content, gateway_contract=use_gateway)
     except PrivateMemoryAIError as exc:
         logger.warning("private summary model failed error=%s", type(exc).__name__)
         raise

@@ -286,7 +286,7 @@ class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
             relationship = await ai.generate_relationship_candidate(None, (_message(),))
 
         self.assertEqual("新的滚动摘要", summary)
-        self.assertEqual("更熟悉了", relationship.state_text)
+        self.assertEqual("可能更熟悉了", relationship.state_text)
         summary_messages = gateway.summarize_private_conversation.await_args.args[0]
         relationship_messages = gateway.update_relationship_state.await_args.args[0]
         for messages in (summary_messages, relationship_messages):
@@ -386,6 +386,57 @@ class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
             ):
                 with self.assertRaises(ai.ContractError):
                     await ai.generate_relationship_candidate(None, (_message(),))
+
+    async def test_gateway_relationship_marks_unverifiable_state_as_uncertain(self) -> None:
+        from plugins.private_memory import ai
+
+        gateway = _Gateway()
+        gateway.update_relationship_state.return_value = (
+            '{"state_text":"他讨厌萝卜猫","open_topics":[],'
+            '"preferred_address":"","communication_style":""}'
+        )
+        with (
+            patch.object(ai, "FEATURES", _Features(True), create=True),
+            patch.object(
+                ai, "get_gateway", AsyncMock(return_value=gateway), create=True
+            ),
+        ):
+            result = await ai.generate_relationship_candidate(None, (_message(),))
+
+        self.assertEqual("可能他讨厌萝卜猫", result.state_text)
+
+    async def test_disabled_gateway_preserves_legacy_truncation_and_certainty_contract(self) -> None:
+        from plugins.private_memory import ai
+
+        features = _Features(False)
+        legacy = AsyncMock(
+            side_effect=(
+                '{"summary":"' + ("甲" * 601) + '"}',
+                '{"state_text":"' + ("乙" * 601) + '","open_topics":["'
+                + ("丙" * 81)
+                + '"],"preferred_address":"'
+                + ("丁" * 41)
+                + '","communication_style":"'
+                + ("戊" * 201)
+                + '","certainty":"explicit"}',
+            )
+        )
+        with (
+            patch.object(ai, "FEATURES", features, create=True),
+            patch.object(ai, "_legacy_complete", legacy, create=True),
+        ):
+            summary = await ai.summarize_private_conversation("", (_message(),))
+            relationship = await ai.generate_relationship_candidate(
+                None, (_message(),)
+            )
+
+        self.assertEqual(600, len(summary))
+        self.assertEqual(600, len(relationship.state_text))
+        self.assertEqual(80, len(relationship.open_topics[0]))
+        self.assertEqual(40, len(relationship.preferred_address))
+        self.assertEqual(200, len(relationship.communication_style))
+        relationship_system = legacy.await_args_list[1].kwargs["system"]
+        self.assertIn("标为 uncertain", relationship_system)
 
 
 class PrivateMemoryGatewayCommitBoundaryTests(unittest.IsolatedAsyncioTestCase):
