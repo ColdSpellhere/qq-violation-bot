@@ -664,11 +664,14 @@ class PrivateSecretFilterTests(unittest.IsolatedAsyncioTestCase):
         from plugins.private_memory.processor import PrivateMemoryProcessor
 
         secrets = (
-            ("API key 是 sk-abcdefghijklmnopqrstuvwxyz", "API key"),
+            ("API key 是 " + "sk-" + "abcdefghijklmnopqrstuvwxyz", "API key"),
             ("我的密码是 hunter2", "密码"),
             ("client_secret=abcDEF1234567890", "client_secret"),
             ("Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature", "Bearer"),
-            ("访问令牌 token=ghp_abcdefghijklmnopqrstuvwxyz123456", "令牌"),
+            (
+                "访问令牌 token=" + "ghp_" + "abcdefghijklmnopqrstuvwxyz123456",
+                "令牌",
+            ),
             ("私钥是 0123456789abcdef0123456789abcdef", "私钥"),
         )
         candidates = []

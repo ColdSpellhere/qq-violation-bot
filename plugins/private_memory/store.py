@@ -6,6 +6,7 @@ import re
 import sqlite3
 import unicodedata
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +24,14 @@ from .schema import PRIVATE_MEMORY_SCHEMA_VERSION, schema_version
 
 _USER_ID_RE = re.compile(r"[1-9][0-9]*", re.ASCII)
 _SOURCE_QUOTE_LIMIT = 120
+
+
+@dataclass(frozen=True)
+class PrivateUserEventState:
+    row_id: int
+    created: bool
+    live: bool
+    assistant_exists: bool
 
 
 def _validate_user_id(user_id: str) -> str:
@@ -104,15 +113,80 @@ class PrivateMemoryStore:
         event_time: int,
         source_kind: str,
     ) -> int:
-        return self._append_message(
+        message_row_id, _ = self.append_user_message_with_status(
+            user_id=user_id,
+            message_id=message_id,
+            text=text,
+            event_time=event_time,
+            source_kind=source_kind,
+        )
+        return message_row_id
+
+    def append_user_message_with_status(
+        self,
+        *,
+        user_id: str,
+        message_id: str,
+        text: str,
+        event_time: int,
+        source_kind: str,
+    ) -> tuple[int, bool]:
+        """Return the row id and whether this call inserted the user event."""
+        state = self.append_user_message_state(
+            user_id=user_id,
+            message_id=message_id,
+            text=text,
+            event_time=event_time,
+            source_kind=source_kind,
+        )
+        return (state.row_id, state.created)
+
+    def append_user_message_state(
+        self,
+        *,
+        user_id: str,
+        message_id: str,
+        text: str,
+        event_time: int,
+        source_kind: str,
+    ) -> PrivateUserEventState:
+        user_id = _validate_user_id(user_id)
+        message_id = _validate_nonempty(message_id, "message_id")
+        row_id, created = self._append_message(
             user_id=_validate_user_id(user_id),
-            message_id=_validate_nonempty(message_id, "message_id"),
+            message_id=message_id,
             direction="user",
             text=text,
             event_time=event_time,
             source_kind=_validate_nonempty(source_kind, "source_kind"),
             source_message_id=None,
             require_live_user_source=False,
+        )
+        if created:
+            return PrivateUserEventState(row_id, True, True, False)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT user_message.id,user_message.purged_at,
+                       EXISTS(
+                           SELECT 1 FROM private_chat_messages assistant
+                           WHERE assistant.user_id=user_message.user_id
+                             AND assistant.direction='assistant'
+                             AND assistant.source_message_id=user_message.message_id
+                       ) AS assistant_exists
+                FROM private_chat_messages user_message
+                WHERE user_message.user_id=? AND user_message.direction='user'
+                  AND user_message.message_id=?
+                """,
+                (user_id, message_id),
+            ).fetchone()
+        if row is None:
+            raise sqlite3.DatabaseError("user event disappeared after idempotent append")
+        return PrivateUserEventState(
+            row_id=int(row["id"]),
+            created=False,
+            live=row["purged_at"] is None,
+            assistant_exists=bool(row["assistant_exists"]),
         )
 
     def append_assistant_message(
@@ -127,7 +201,7 @@ class PrivateMemoryStore:
         user_id = _validate_user_id(user_id)
         source_message_id = _validate_nonempty(source_message_id, "source_message_id")
         bot_user_id = _validate_user_id(bot_user_id)
-        return self._append_message(
+        message_row_id, _ = self._append_message(
             user_id=user_id,
             message_id=f"assistant:{source_message_id}",
             direction="assistant",
@@ -137,6 +211,7 @@ class PrivateMemoryStore:
             source_message_id=source_message_id,
             require_live_user_source=True,
         )
+        return message_row_id
 
     def _append_message(
         self,
@@ -149,7 +224,7 @@ class PrivateMemoryStore:
         source_kind: str,
         source_message_id: str | None,
         require_live_user_source: bool,
-    ) -> int:
+    ) -> tuple[int, bool]:
         if isinstance(event_time, bool) or not isinstance(event_time, int) or event_time < 0:
             raise ValueError("event_time must be a non-negative integer")
         normalized = _normalize_text(text)
@@ -168,7 +243,7 @@ class PrivateMemoryStore:
                 ).fetchone()
                 if existing is not None:
                     connection.commit()
-                    return int(existing["id"])
+                    return (int(existing["id"]), False)
                 if require_live_user_source:
                     source = connection.execute(
                         """
@@ -183,7 +258,7 @@ class PrivateMemoryStore:
                             "assistant message requires a live source user message "
                             "for the same user"
                         )
-                connection.execute(
+                cursor = connection.execute(
                     """
                     INSERT INTO private_chat_messages(
                         user_id,message_id,direction,text,content_hash,event_time,
@@ -214,7 +289,7 @@ class PrivateMemoryStore:
                 if row is None:
                     raise sqlite3.DatabaseError("message insert did not produce a row")
                 connection.commit()
-                return int(row["id"])
+                return (int(row["id"]), bool(cursor.rowcount))
             except Exception:
                 connection.rollback()
                 raise
@@ -717,4 +792,4 @@ class PrivateMemoryStore:
         )
 
 
-__all__ = ["PrivateMemoryStore"]
+__all__ = ["PrivateMemoryStore", "PrivateUserEventState"]

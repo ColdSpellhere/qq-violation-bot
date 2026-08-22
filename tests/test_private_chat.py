@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
@@ -100,6 +100,27 @@ class PrivateConversationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        state = FeatureState(
+            business_enabled=True,
+            chat_enabled=True,
+            group_chat_enabled=False,
+            private_chat_enabled=True,
+            group_chat_allowed_group_ids=(),
+            private_chat_allowed_user_ids=("123456", "654321"),
+            private_memory_enabled=False,
+            relationship_state_enabled=False,
+        )
+        features = Mock()
+        features.snapshot.return_value = state
+        features.private_chat_allowed.side_effect = lambda user_id: str(user_id) in {
+            "123456",
+            "654321",
+        }
+        self.features_patcher = patch.object(private_matcher, "FEATURES", features)
+        self.features_patcher.start()
+        self.addCleanup(self.features_patcher.stop)
+
     async def test_private_gate_requires_parent_child_and_allowlist(self):
         event = _private_event("你好")
 
