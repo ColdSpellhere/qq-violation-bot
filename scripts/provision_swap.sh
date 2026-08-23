@@ -63,7 +63,9 @@ apply_swap() {
       required_kib=$((size_mib * 1024 + 262144))
       (( available_kib >= required_kib )) || { echo "insufficient disk space" >&2; exit 1; }
     fi
-    truncate -s "${size_mib}M" "$swap_file"
+    # A sparse file created by truncate is rejected by swapon on ext4/XFS and
+    # several cloud block-storage layouts. Write every block explicitly.
+    dd if=/dev/zero of="$swap_file" bs=1048576 count="$size_mib" 2>/dev/null
   fi
   chmod 0600 "$swap_file"
   write_fstab

@@ -48,6 +48,11 @@ class ProvisionSwapTests(unittest.TestCase):
         self.assertEqual(0, second.returncode, second.stderr)
         self.assertTrue(self.swap.is_file())
         self.assertEqual(0o600, self.swap.stat().st_mode & 0o777)
+        self.assertGreaterEqual(
+            self.swap.stat().st_blocks * 512,
+            self.swap.stat().st_size,
+            "swap file must be fully allocated rather than sparse",
+        )
         fstab = self.fstab.read_text(encoding="utf-8")
         self.assertEqual(1, fstab.count("# BEGIN qq-bots managed swap"))
         self.assertIn(f"{self.swap} none swap sw 0 0", fstab)
