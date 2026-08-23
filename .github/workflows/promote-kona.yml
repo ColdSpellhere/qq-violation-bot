@@ -1,0 +1,52 @@
+name: Promote kona
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact approved main commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: kona-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment: kona-production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify exact current main SHA and successful CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_SHA: ${{ github.event.inputs.sha }}
+        run: |
+          [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin main
+          test "$(git rev-parse origin/main)" = "$REQUESTED_SHA"
+          test "$(gh run list --workflow=ci.yml --commit "$REQUESTED_SHA" --status success --limit 1 --json databaseId --jq length)" = 1
+      - name: Install restricted SSH identity
+        env:
+          DEPLOY_KEY: ${{ secrets.KONA_DEPLOY_SSH_KEY }}
+          DEPLOY_HOST_KEY: ${{ secrets.KONA_DEPLOY_HOST_KEY }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+      - name: Deploy exact SHA to kona
+        env:
+          DEPLOY_HOST: ${{ secrets.KONA_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.KONA_DEPLOY_USER }}
+          REQUESTED_SHA: ${{ github.event.inputs.sha }}
+        run: |
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo /opt/qq-bots/repository/.venv/bin/python /opt/qq-bots/repository/scripts/deploy_instance.py --instance kona --sha '$REQUESTED_SHA'"

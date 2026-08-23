@@ -634,6 +634,19 @@ sudo scripts/provision_swap.sh remove
 
 Swap 只用于降低突发内存压力导致进程被系统终止的概率，不代替内存监控；若长期持续使用 Swap，应升级内存或调整实例负载。
 
+## CArroT / kona 双实例发布
+
+两个机器人共用按 Git SHA 生成的只读发布目录，但各自拥有独立的 `.env`、`character.md`、数据库、记忆、图片、表情包、NapCat 配置、日志和备份。CArroT 使用 `BOT_MODE=full`，kona 必须使用 `BOT_MODE=chat_only`。实例目录分别为：
+
+```text
+/opt/qq-bots/instances/carrot
+/opt/qq-bots/instances/kona
+```
+
+CArroT 是候选验证实例。开发提交先通过 `scripts/deploy_carrot_candidate.sh` 的完整本地门禁，仅推到服务器的 `release/carrot-candidate`，随后只切换 CArroT。QQ 验证通过后，才把同一提交合入并推送 GitHub `main`。`main` 的 CI 通过后，在 GitHub Actions 手动运行 `Promote kona`，输入当前 `main` 的完整 40 位 SHA，并在受保护的 `kona-production` 环境中人工批准。任何 `push` 都不会自动部署 kona。
+
+群内模块管理与记忆治理命令必须以目标机器人的真实 @ 开头；私聊管理命令不需要 @。因此两个机器人在同一群时，只会由明确被 @ 的实例执行命令。
+
 ## NapCat 资源监控与定时重启
 
 `qqbot-napcat-watchdog.timer` 每 5 分钟检查一次 `napcat.service` systemd cgroup 内的进程。任一 QQ/Node 进程文件描述符达到 `1500`、重复打开 `/proc/<pid>/maps` 的文件描述符达到 `1000`、任一 Xvfb 进程文件描述符达到 `220`，或最近 10 分钟出现 `Maximum number of clients reached` 时触发恢复。反向 WebSocket 未建立必须连续检查失败两次才触发恢复。每次实际重启后有 30 分钟冷却期，避免重复重启。
