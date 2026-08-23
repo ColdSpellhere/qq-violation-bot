@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from typing import Callable
 
 
@@ -20,6 +21,23 @@ SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 class DeploymentError(RuntimeError):
     pass
+
+
+def wait_for_health(
+    probe: Callable[[], bool],
+    *,
+    timeout_seconds: float = 60,
+    interval_seconds: float = 2,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    deadline = monotonic() + timeout_seconds
+    while True:
+        if probe():
+            return True
+        if monotonic() >= deadline:
+            return False
+        sleep(interval_seconds)
 
 
 def _validate(instance: str, sha: str, root: Path) -> tuple[Path, Path, Path]:
@@ -153,20 +171,25 @@ def main() -> int:
         subprocess.run(["systemctl", "restart", f"qqbot@{instance}.service"], check=True)
 
     def health(instance: str, sha: str) -> bool:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).with_name("instance_health.py")),
-                "--instance",
-                instance,
-                "--sha",
-                sha,
-                "--root",
-                str(args.root),
-            ],
-            check=False,
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("instance_health.py")),
+            "--instance",
+            instance,
+            "--sha",
+            sha,
+            "--root",
+            str(args.root),
+        ]
+        return wait_for_health(
+            lambda: subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode
+            == 0
         )
-        return completed.returncode == 0
 
     deploy_existing_release(
         args.instance, args.sha, args.root, restart=restart, health=health

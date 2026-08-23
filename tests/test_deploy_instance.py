@@ -97,6 +97,45 @@ class DeployInstanceTests(unittest.TestCase):
 
         self.assertFalse((self.instances / "kona" / "current").exists())
 
+    def test_health_wait_allows_bounded_service_startup(self) -> None:
+        try:
+            from scripts.deploy_instance import wait_for_health
+        except ImportError as exc:
+            self.fail(str(exc))
+        probe = Mock(side_effect=[False, False, True])
+        clock = iter((0.0, 1.0, 2.0))
+        sleeper = Mock()
+
+        self.assertTrue(
+            wait_for_health(
+                probe,
+                timeout_seconds=10,
+                interval_seconds=1,
+                monotonic=lambda: next(clock),
+                sleep=sleeper,
+            )
+        )
+        self.assertEqual(3, probe.call_count)
+        self.assertEqual(2, sleeper.call_count)
+
+    def test_health_wait_times_out_instead_of_waiting_forever(self) -> None:
+        try:
+            from scripts.deploy_instance import wait_for_health
+        except ImportError as exc:
+            self.fail(str(exc))
+        probe = Mock(return_value=False)
+        clock = iter((0.0, 1.0, 3.0))
+
+        self.assertFalse(
+            wait_for_health(
+                probe,
+                timeout_seconds=2,
+                interval_seconds=1,
+                monotonic=lambda: next(clock),
+                sleep=Mock(),
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
