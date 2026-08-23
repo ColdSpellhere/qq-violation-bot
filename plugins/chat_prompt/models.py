@@ -28,6 +28,33 @@ class RelationshipStateLike(Protocol):
     communication_style: str
 
 
+@dataclass(frozen=True)
+class SpeakerIdentity:
+    ref: str
+    user_id: str
+    nickname: str
+    current: bool = False
+
+
+@dataclass(frozen=True)
+class SpeakerDirectory:
+    identities: tuple[SpeakerIdentity, ...]
+    refs_by_user: tuple[tuple[str, str], ...]
+    refs_by_message: tuple[tuple[str, str], ...]
+
+    def ref_for_user(self, user_id: str) -> str | None:
+        normalized = str(user_id).strip()
+        return next(
+            (ref for value, ref in self.refs_by_user if value == normalized), None
+        )
+
+    def ref_for_message(self, message_id: str) -> str | None:
+        normalized = str(message_id).strip()
+        return next(
+            (ref for value, ref in self.refs_by_message if value == normalized), None
+        )
+
+
 def _has_fields(value: object, fields: tuple[str, ...]) -> bool:
     return all(hasattr(value, field) for field in fields)
 
@@ -161,5 +188,7 @@ __all__ = [
     "PromptBudget",
     "RelationshipStateLike",
     "RenderedPrompt",
+    "SpeakerDirectory",
+    "SpeakerIdentity",
     "TruncationCounters",
 ]
