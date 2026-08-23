@@ -4,12 +4,38 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstanceHealthTests(unittest.TestCase):
+    def test_log_check_is_scoped_to_current_systemd_invocation(self) -> None:
+        from scripts.instance_health import current_invocation_logs
+
+        invocation = "a" * 32
+        runner = Mock(side_effect=[invocation + "\n", "current logs\n"])
+
+        self.assertEqual(
+            "current logs\n",
+            current_invocation_logs("qqbot@carrot.service", run=runner),
+        )
+        self.assertEqual(
+            ("systemctl", "show", "qqbot@carrot.service", "-p", "InvocationID", "--value"),
+            runner.call_args_list[0].args,
+        )
+        self.assertEqual(
+            ("journalctl", f"_SYSTEMD_INVOCATION_ID={invocation}", "--no-pager"),
+            runner.call_args_list[1].args,
+        )
+
+    def test_log_check_rejects_missing_invocation_id(self) -> None:
+        from scripts.instance_health import current_invocation_logs
+
+        with self.assertRaisesRegex(RuntimeError, "invocation"):
+            current_invocation_logs("qqbot@carrot.service", run=Mock(return_value=""))
+
     def test_persisted_state_is_parseable_and_kona_business_is_off(self) -> None:
         from scripts.instance_health import validate_runtime_state
 

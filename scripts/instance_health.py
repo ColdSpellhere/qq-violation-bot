@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+from typing import Callable
 
 
 INSTANCES = frozenset({"carrot", "kona"})
@@ -28,6 +29,19 @@ def validate_runtime_state(instance: str, path: Path) -> None:
 
 def _run(*args: str) -> str:
     return subprocess.run(args, check=True, text=True, capture_output=True).stdout
+
+
+def current_invocation_logs(
+    unit: str,
+    *,
+    run: Callable[..., str] = _run,
+) -> str:
+    invocation_id = run(
+        "systemctl", "show", unit, "-p", "InvocationID", "--value"
+    ).strip()
+    if re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None:
+        raise RuntimeError("service has no current systemd invocation")
+    return run("journalctl", f"_SYSTEMD_INVOCATION_ID={invocation_id}", "--no-pager")
 
 
 def verify(instance: str, sha: str, root: Path) -> None:
@@ -53,14 +67,7 @@ def verify(instance: str, sha: str, root: Path) -> None:
         for line in sockets.splitlines()
     ):
         raise RuntimeError("OneBot loopback connection is not established")
-    logs = _run(
-        "journalctl",
-        "-u",
-        f"qqbot@{instance}.service",
-        "-n",
-        "100",
-        "--no-pager",
-    ).lower()
+    logs = current_invocation_logs(f"qqbot@{instance}.service").lower()
     if "traceback (most recent call last)" in logs or "critical" in logs:
         raise RuntimeError("recent service logs contain a startup failure")
     validate_runtime_state(instance, instance_root / "data/runtime_features.json")
