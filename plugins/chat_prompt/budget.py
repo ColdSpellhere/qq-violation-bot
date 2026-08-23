@@ -12,6 +12,7 @@ from .models import (
     RelationshipStateLike,
     TruncationCounters,
 )
+from .speakers import build_speaker_directory
 
 
 def _clip(value: str, limit: int) -> tuple[str, int]:
@@ -20,9 +21,10 @@ def _clip(value: str, limit: int) -> tuple[str, int]:
     return value[:limit], len(value) - limit
 
 
-def _context_text(item: ContextMessageLike) -> str:
+def _context_text(item: ContextMessageLike, speaker_ref: str) -> str:
     return json.dumps(
         {
+            "speaker_ref": speaker_ref,
             "message_id": item.message_id,
             "sender_qq": item.user_id,
             "nickname": item.nickname,
@@ -37,14 +39,38 @@ def _context_text(item: ContextMessageLike) -> str:
     )
 
 
-def _profile_text(profile: MemberProfileLike) -> str:
+def _profile_text(profile: MemberProfileLike, speaker_ref: str) -> str:
     details: list[str] = []
     if profile.summary.strip():
         details.append(profile.summary.strip())
     details.extend(
         trait.text.strip() for trait in profile.traits if trait.text.strip()
     )
-    return f"{profile.nickname}[QQ:{profile.user_id}]：" + "；".join(details)
+    return json.dumps(
+        {
+            "speaker_ref": speaker_ref,
+            "qq": profile.user_id,
+            "nickname": profile.nickname,
+            "memory": "；".join(details),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _prune_speakers(data: BudgetedPromptData) -> BudgetedPromptData:
+    used = {
+        data.current_speaker_ref,
+        *data.context_speaker_refs,
+        *data.fact_speaker_refs,
+        *data.current_at_speaker_refs,
+    }
+    if data.current_reply_author_ref:
+        used.add(data.current_reply_author_ref)
+    return replace(
+        data,
+        speakers=tuple(item for item in data.speakers if item.ref in used),
+    )
 
 
 def _relationship_text(value: RelationshipStateLike | None) -> str:
@@ -112,23 +138,53 @@ def apply_prompt_budget(
     persona, persona_removed = _clip(source.persona, budget.persona_chars)
     current, current_removed = _clip(source.current.text, budget.current_chars)
 
-    raw_context = tuple(_context_text(item) for item in source.context)
+    directory = build_speaker_directory(
+        current=source.current,
+        context=source.context,
+        profiles=source.profiles,
+    )
+    current_ref = (
+        directory.ref_for_user(source.current.user_id)
+        or directory.ref_for_message(source.current.message_id)
+    )
+    if current_ref is None:
+        raise ValueError("current speaker must have a stable request-local reference")
+    raw_context_refs = tuple(
+        directory.ref_for_user(item.user_id)
+        or directory.ref_for_message(item.message_id)
+        or ""
+        for item in source.context
+    )
+    raw_context = tuple(
+        _context_text(item, speaker_ref)
+        for item, speaker_ref in zip(source.context, raw_context_refs)
+    )
     raw_ids = tuple(item.message_id for item in source.context)
     count_removed = max(0, len(raw_context) - budget.context_messages)
     context = raw_context[count_removed:]
     context_ids = raw_ids[count_removed:]
+    context_refs = raw_context_refs[count_removed:]
     while len(context) > 1 and sum(map(len, context)) > budget.context_chars:
         count_removed += 1
         context = context[1:]
         context_ids = context_ids[1:]
+        context_refs = context_refs[1:]
     context_original_chars = sum(map(len, raw_context))
     if context and sum(map(len, context)) > budget.context_chars:
         context = (context[-1][: budget.context_chars],)
         context_ids = (context_ids[-1],)
+        context_refs = (context_refs[-1],)
     context_chars_removed = context_original_chars - sum(map(len, context))
 
-    raw_facts = tuple(_profile_text(item) for item in source.profiles)
+    raw_fact_refs = tuple(
+        directory.ref_for_user(item.user_id) or "" for item in source.profiles
+    )
+    raw_facts = tuple(
+        _profile_text(item, speaker_ref)
+        for item, speaker_ref in zip(source.profiles, raw_fact_refs)
+    )
     facts, _, facts_removed = _fit_sequence(raw_facts, budget.facts_chars)
+    fact_refs = raw_fact_refs[: len(facts)]
     raw_relationship = _relationship_text(source.relationship)
     relationship, relationship_removed = _clip(
         raw_relationship, budget.relationship_chars
@@ -149,9 +205,12 @@ def apply_prompt_budget(
         mode=source.mode,
         now_text=source.now_text,
         persona=persona,
+        speakers=directory.identities,
         context=context,
         context_message_ids=context_ids,
+        context_speaker_refs=context_refs,
         facts=facts,
+        fact_speaker_refs=fact_refs,
         relationship=relationship,
         open_topics=topics,
         image_descriptions=images,
@@ -163,6 +222,15 @@ def apply_prompt_budget(
         current_at_user_ids=source.current.at_user_ids,
         current_reply_message_id=source.current.reply_message_id,
         current_replied_to_user_id=source.current.replied_to_user_id,
+        current_speaker_ref=current_ref,
+        current_at_speaker_refs=tuple(
+            ref
+            for user_id in source.current.at_user_ids
+            if (ref := directory.ref_for_user(user_id)) is not None
+        ),
+        current_reply_author_ref=directory.ref_for_user(
+            source.current.replied_to_user_id or ""
+        ),
         addressed=source.addressed,
         truncation=TruncationCounters(
             persona_chars_removed=persona_removed,
@@ -189,8 +257,10 @@ def apply_prompt_budget(
             data,
             context=data.context[1:],
             context_message_ids=data.context_message_ids[1:],
+            context_speaker_refs=data.context_speaker_refs[1:],
             truncation=counters,
         )
+        data = _prune_speakers(data)
 
     for field, counter_chars, counter_items in (
         ("image_descriptions", "images_chars_removed", "images_removed"),
@@ -214,6 +284,9 @@ def apply_prompt_budget(
             **{field: trimmed},
             truncation=replace(data.truncation, **updates),
         )
+        if field == "facts":
+            data = replace(data, fact_speaker_refs=data.fact_speaker_refs[: len(trimmed)])
+        data = _prune_speakers(data)
 
     for field, counter in (
         ("relationship", "relationship_chars_removed"),
@@ -248,7 +321,7 @@ def apply_prompt_budget(
                 current_chars_removed=data.truncation.current_chars_removed + removed,
             ),
         )
-    return data
+    return _prune_speakers(data)
 
 
 __all__ = ["apply_prompt_budget", "prompt_data_chars"]

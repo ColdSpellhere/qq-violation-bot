@@ -123,6 +123,15 @@ class LLMGatewayChatMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("图中是一朵月季", user)
         self.assertIn('"at_targets":["200"]', user)
         self.assertIn('"reply_author_qq":"200"', user)
+        self.assertIn("S1|qq=100|nickname=甲|current=true", user)
+        self.assertIn("S2|qq=200|nickname=乙", user)
+        self.assertIn('"speaker_ref":"S2"', user)
+        self.assertIn('"current_speaker_ref":"S1"', user)
+        self.assertIn('"reply_author_ref":"S2"', user)
+        self.assertRegex(
+            user,
+            r'<member_memory_data>[^<]*"speaker_ref":"S1"[^<]*喜欢月季',
+        )
 
     async def test_character_is_reloaded_and_switches_are_hot_for_every_reply(self) -> None:
         features = _Features(builder=True, gateway=True)

@@ -46,6 +46,10 @@ def _system_text(data: BudgetedPromptData) -> str:
         _FIXED_SECURITY
         + "\n"
         + scene
+        + "\n说话者归属：每条消息的第一人称只属于该消息的 speaker_ref；"
+        "不同 speaker_ref 绝不能合并为同一人。昵称不是身份键，只能按目录中的精确 QQ 与"
+        "speaker_ref 识别。current_speaker_ref 永远是当前发言者；reply_author_ref 只表示被引用者，"
+        "不能替换当前发言者。未知作者不得猜测或并入任何已知成员。"
         + "\n表达要求：接住具体内容，像熟悉的人自然聊天；不编造身份、现实经历、聊天事实或已完成动作。"
     )
 
@@ -53,12 +57,15 @@ def _system_text(data: BudgetedPromptData) -> str:
 def _current_text(data: BudgetedPromptData) -> str:
     return json.dumps(
         {
+            "current_speaker_ref": data.current_speaker_ref,
             "message_id": data.current_message_id,
             "sender_qq": data.current_user_id,
             "nickname": data.current_nickname,
             "at_targets": data.current_at_user_ids,
             "reply_message_id": data.current_reply_message_id,
             "reply_author_qq": data.current_replied_to_user_id,
+            "at_speaker_refs": data.current_at_speaker_refs,
+            "reply_author_ref": data.current_reply_author_ref,
             "addressed_to_radish_cat": data.addressed or data.mode == "private",
             "text": data.current,
         },
@@ -80,6 +87,20 @@ def _user_text(data: BudgetedPromptData) -> str:
         (
             "当前时间：" + _escape(data.now_text),
             _section("persona_data", data.persona),
+            _section(
+                "speaker_directory_data",
+                tuple(
+                    "|".join(
+                        (
+                            item.ref,
+                            f"qq={item.user_id or 'unknown'}",
+                            *((f"nickname={item.nickname}",) if item.nickname else ()),
+                            *(("current=true",) if item.current else ()),
+                        )
+                    )
+                    for item in data.speakers
+                ),
+            ),
             _section("history_data", data.context),
             _section("member_memory_data", data.facts),
             _section("relationship_data", data.relationship),

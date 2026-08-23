@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import re
 
 from plugins.chat_archive.db import ContextMessage
-from plugins.member_memory.store import MemberProfile
+from plugins.member_memory.store import MemberProfile, MemoryTrait
 
 
 def turn(
@@ -105,6 +106,127 @@ class SpeakerDirectoryTests(unittest.TestCase):
         self.assertNotEqual(
             directory.ref_for_message("u1"), directory.ref_for_message("u2")
         )
+
+
+class SpeakerPromptRenderingTests(unittest.TestCase):
+    def build_input(
+        self,
+        *,
+        current: ContextMessage,
+        context: tuple[ContextMessage, ...] = (),
+        profiles: tuple[MemberProfile, ...] = (),
+    ):
+        from plugins.chat_prompt.models import ChatPromptInput
+
+        return ChatPromptInput(
+            mode="group",
+            now_text="2026-08-23T08:30+08:00",
+            persona="萝卜猫",
+            context=context,
+            profiles=profiles,
+            relationship=None,
+            open_topics=(),
+            image_descriptions=(),
+            current=current,
+            addressed=True,
+        )
+
+    def test_first_person_stays_with_history_author(self) -> None:
+        from plugins.chat_prompt.builder import build_chat_prompt
+
+        prompt = build_chat_prompt(
+            self.build_input(
+                current=turn("200", "乙", "他说的花是什么？", message_id="m2"),
+                context=(turn("100", "甲", "我喜欢养花", message_id="m1"),),
+            )
+        )
+
+        system = str(prompt.messages[0]["content"])
+        user = str(prompt.messages[1]["content"])
+        self.assertIn("第一人称", system)
+        self.assertIn("不同 speaker_ref", system)
+        self.assertIn("S1|qq=200|nickname=乙|current=true", user)
+        self.assertIn("S2|qq=100|nickname=甲", user)
+        self.assertIn('"speaker_ref":"S2"', user)
+        self.assertIn("我喜欢养花", user)
+        self.assertIn('"current_speaker_ref":"S1"', user)
+
+    def test_reply_author_does_not_replace_current_sender(self) -> None:
+        from plugins.chat_prompt.builder import build_chat_prompt
+
+        prompt = build_chat_prompt(
+            self.build_input(
+                current=turn(
+                    "200",
+                    "乙",
+                    "这句话呢",
+                    message_id="m2",
+                    replied_to_user_id="100",
+                ),
+                context=(turn("100", "甲", "我喜欢养花", message_id="m1"),),
+            )
+        )
+
+        user = str(prompt.messages[1]["content"])
+        self.assertIn('"current_speaker_ref":"S1"', user)
+        self.assertIn('"reply_author_ref":"S2"', user)
+
+    def test_member_fact_uses_same_ref_as_its_history_author(self) -> None:
+        from plugins.chat_prompt.builder import build_chat_prompt
+
+        remembered = MemberProfile(
+            group_id=1,
+            user_id="100",
+            nickname="甲",
+            aliases=(),
+            traits=(MemoryTrait("喜欢花", "m1", "now"),),
+            updated_at="now",
+        )
+        prompt = build_chat_prompt(
+            self.build_input(
+                current=turn("200", "乙", "继续", message_id="m2"),
+                context=(turn("100", "甲", "我喜欢养花", message_id="m1"),),
+                profiles=(remembered,),
+            )
+        )
+
+        user = str(prompt.messages[1]["content"])
+        self.assertRegex(
+            user,
+            r'<member_memory_data>[^<]*"speaker_ref":"S2"[^<]*喜欢花',
+        )
+        self.assertNotRegex(
+            user,
+            r'<member_memory_data>[^<]*"speaker_ref":"S1"[^<]*喜欢花',
+        )
+
+    def test_escape_heavy_budget_has_no_dangling_speaker_refs(self) -> None:
+        from plugins.chat_prompt.builder import build_chat_prompt
+
+        context = tuple(
+            turn(str(100 + index), f"成员<{index}", "<&" * 500, message_id=f"m{index}")
+            for index in range(20)
+        )
+        prompt = build_chat_prompt(
+            self.build_input(
+                current=turn("999", "当前<&", "当前消息", message_id="current"),
+                context=context,
+            )
+        )
+        user = str(prompt.messages[1]["content"])
+        directory_match = re.search(
+            r"<speaker_directory_data>(.*?)</speaker_directory_data>", user, re.S
+        )
+        self.assertIsNotNone(directory_match)
+        directory_refs = set(re.findall(r"(?:S|U)\d+", directory_match.group(1)))
+        referenced = set(re.findall(r'"speaker_ref":"((?:S|U)\d+)"', user))
+        current_refs = set(
+            re.findall(r'"current_speaker_ref":"((?:S|U)\d+)"', user)
+        )
+        self.assertTrue(referenced | current_refs)
+        self.assertEqual(referenced | current_refs, directory_refs)
+        self.assertLessEqual(prompt.total_chars, 12_000)
+        self.assertIn("当前消息", user)
 
 
 if __name__ == "__main__":

@@ -152,9 +152,12 @@ class BudgetedPromptData:
     mode: Literal["group", "private"]
     now_text: str
     persona: str
+    speakers: tuple[SpeakerIdentity, ...]
     context: tuple[str, ...]
     context_message_ids: tuple[str, ...]
+    context_speaker_refs: tuple[str, ...]
     facts: tuple[str, ...]
+    fact_speaker_refs: tuple[str, ...]
     relationship: str
     open_topics: tuple[str, ...]
     image_descriptions: tuple[str, ...]
@@ -166,6 +169,9 @@ class BudgetedPromptData:
     current_at_user_ids: tuple[str, ...]
     current_reply_message_id: str | None
     current_replied_to_user_id: str | None
+    current_speaker_ref: str
+    current_at_speaker_refs: tuple[str, ...]
+    current_reply_author_ref: str | None
     addressed: bool
     truncation: TruncationCounters
     safety_required: bool = True
