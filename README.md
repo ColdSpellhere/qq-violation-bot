@@ -617,6 +617,23 @@ bash scripts/backup_db.sh
 
 业务开启时，每周日 00:10 先以 `weekly:<date>` 登记当日任务，再生成 XLSX 周报，包含本周操作日志和当前各分区成员统计；启用 v1.0.2beta 后还会附加“减数策略日志”“减数待办”“通知发送历史”和“状态联动作业”。生成后会尝试上传到群文件；成功状态会跨重启阻止重复生成和发送，离线、API 失败或发送中途关闭业务会记入后续合并漏发概览。业务关闭时本次周报工作直接跳过，不生成、不发送、不上传，也不加入漏发队列。
 
+## 双实例 Swap 安全垫
+
+同机运行 CArroT 与 kona 前，使用仓库内的幂等脚本配置 2 GiB Swap。脚本只管理精确的 `/swapfile`、带标记的 `/etc/fstab` 段和 `/etc/sysctl.d/99-qq-bots-swap.conf`，默认将 `vm.swappiness` 设为 10：
+
+```bash
+sudo scripts/provision_swap.sh apply --size-gib 2 --swappiness 10
+sudo scripts/provision_swap.sh status --swappiness 10
+```
+
+重复执行 `apply` 不会重复写入配置。只有明确执行 `remove` 才会先停用并删除这组受管状态：
+
+```bash
+sudo scripts/provision_swap.sh remove
+```
+
+Swap 只用于降低突发内存压力导致进程被系统终止的概率，不代替内存监控；若长期持续使用 Swap，应升级内存或调整实例负载。
+
 ## NapCat 资源监控与定时重启
 
 `qqbot-napcat-watchdog.timer` 每 5 分钟检查一次 `napcat.service` systemd cgroup 内的进程。任一 QQ/Node 进程文件描述符达到 `1500`、重复打开 `/proc/<pid>/maps` 的文件描述符达到 `1000`、任一 Xvfb 进程文件描述符达到 `220`，或最近 10 分钟出现 `Maximum number of clients reached` 时触发恢复。反向 WebSocket 未建立必须连续检查失败两次才触发恢复。每次实际重启后有 30 分钟冷却期，避免重复重启。
