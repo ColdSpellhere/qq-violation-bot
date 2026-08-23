@@ -1,11 +1,23 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from plugins.random_chat.persona import DEFAULT_CHARACTER_PROMPT, load_character_prompt
 
 
 class CharacterPromptTests(unittest.TestCase):
+    def test_default_path_is_reloaded_from_current_instance_root(self):
+        from plugins.random_chat import persona
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instance_file = Path(temp_dir) / "character.md"
+            instance_file.write_text("kona 第一版", encoding="utf-8")
+            with patch.object(persona, "CHARACTER_FILE", instance_file):
+                self.assertEqual("kona 第一版", persona.load_character_prompt())
+                instance_file.write_text("kona 第二版", encoding="utf-8")
+                self.assertEqual("kona 第二版", persona.load_character_prompt())
+
     def test_reads_utf8_markdown_and_strips_outer_whitespace(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "character.md"

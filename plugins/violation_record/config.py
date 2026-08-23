@@ -3,12 +3,17 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from plugins.runtime_paths import (
+    BACKUP_DIR,
+    CHARACTER_FILE,
+    DATA_DIR,
+    EXPORT_DIR,
+    INSTANCE_ROOT,
+    LOG_DIR,
+)
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = BASE_DIR / "data"
-EXPORT_DIR = BASE_DIR / "exports"
-BACKUP_DIR = BASE_DIR / "backups"
-LOG_DIR = BASE_DIR / "logs"
+
+BASE_DIR = INSTANCE_ROOT
 
 
 def _int_env(name: str, default: int) -> int:
@@ -108,6 +113,7 @@ legacy_group_chat_config = (
 
 @dataclass(frozen=True)
 class AppConfig:
+    character_file: Path = CHARACTER_FILE
     allowed_group_ids: tuple[int, ...] = (_TARGET_GROUP_ID,)
     target_group_id: int = _TARGET_GROUP_ID
     bot_self_id: str = os.getenv("BOT_SELF_ID", "")
@@ -117,7 +123,7 @@ class AppConfig:
     chat_archive_path: Path = DATA_DIR / "chat_archive.db"
     member_memory_root: Path = DATA_DIR / "member_memory"
     evidence_database_path: Path = DATA_DIR / "evidence.db"
-    evidence_root: Path = BASE_DIR / "evidence"
+    evidence_root: Path = INSTANCE_ROOT / "evidence"
     evidence_required: bool = _bool_env("EVIDENCE_REQUIRED", False)
     chat_vision_enabled: bool = _bool_env("CHAT_VISION_ENABLED", False)
     chat_vision_model: str = os.getenv(

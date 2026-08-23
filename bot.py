@@ -1,12 +1,10 @@
-from pathlib import Path
-
-from dotenv import load_dotenv
 import nonebot
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
+from plugins.runtime_paths import load_instance_env
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+
+load_instance_env()
 
 nonebot.init()
 driver = nonebot.get_driver()
