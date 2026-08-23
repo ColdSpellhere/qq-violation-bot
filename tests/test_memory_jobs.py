@@ -49,6 +49,9 @@ class MemoryJobQueueTests(unittest.TestCase):
         migrate(self.database)
         from plugins.private_memory.jobs import MemoryJobQueue
 
+        now_patch = patch("plugins.private_memory.jobs._now", return_value=NOW)
+        now_patch.start()
+        self.addCleanup(now_patch.stop)
         self.queue = MemoryJobQueue(
             self.database, lease_seconds=10, max_attempts=3, backoff_base_seconds=2
         )
