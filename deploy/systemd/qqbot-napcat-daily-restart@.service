@@ -1,0 +1,8 @@
+[Unit]
+Description=QQ Bot scheduled NapCat restart for %i
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/qq-bots/instances/%i/current
+ExecStart=/opt/qq-bots/instances/%i/current/.venv/bin/python /opt/qq-bots/instances/%i/current/scripts/napcat_watchdog.py --instance %i --scheduled
+TimeoutStartSec=150

@@ -11,6 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class StartNapCatTests(unittest.TestCase):
+    def test_env_parser_uses_portable_awk_quote_class(self) -> None:
+        source = (ROOT / "scripts/start_napcat.sh").read_text(encoding="utf-8")
+        self.assertNotIn(r"\"", source)
+
     def _run(self, instance: str, *, port: int, bot_id: str) -> subprocess.CompletedProcess[str]:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

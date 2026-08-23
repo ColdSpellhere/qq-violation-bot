@@ -20,7 +20,7 @@ read_env_value() {
   awk -F= -v key="$key" '
     $1 == key {
       value = substr($0, index($0, "=") + 1)
-      gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, "", value)
+      gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", value)
       print value
       exit
     }

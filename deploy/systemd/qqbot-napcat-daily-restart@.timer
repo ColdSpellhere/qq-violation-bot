@@ -1,0 +1,10 @@
+[Unit]
+Description=Restart QQ Bot NapCat for %i daily at 04:10
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

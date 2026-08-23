@@ -15,6 +15,35 @@ HEALTHY = Metrics(
 
 
 class WatchdogDecisionTests(unittest.TestCase):
+    def test_runtime_target_is_isolated_per_instance(self) -> None:
+        from scripts.napcat_watchdog import target_for_instance
+
+        carrot = target_for_instance("carrot")
+        kona = target_for_instance("kona")
+
+        self.assertEqual("napcat@carrot.service", carrot.napcat_unit)
+        self.assertEqual("qqbot@carrot.service", carrot.bot_unit)
+        self.assertEqual(6199, carrot.port)
+        self.assertEqual(6299, kona.port)
+        self.assertNotEqual(carrot.state_path, kona.state_path)
+        self.assertNotEqual(carrot.lock_path, kona.lock_path)
+        with self.assertRaises(ValueError):
+            target_for_instance("../kona")
+
+    def test_systemd_watchdog_units_are_instance_scoped(self) -> None:
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        service = (root / "deploy/systemd/qqbot-napcat-watchdog@.service").read_text(
+            encoding="utf-8"
+        )
+        daily = (
+            root / "deploy/systemd/qqbot-napcat-daily-restart@.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--instance %i", service)
+        self.assertIn("--instance %i --scheduled", daily)
+        self.assertIn("/opt/qq-bots/instances/%i/current", service)
+
     def test_healthy_metrics_do_not_restart(self) -> None:
         decision = decide(HEALTHY, State(), now_epoch=10_000)
         self.assertFalse(decision.restart)

@@ -651,33 +651,33 @@ CArroT 是候选验证实例。开发提交先通过 `scripts/deploy_carrot_cand
 
 ## NapCat 资源监控与定时重启
 
-`qqbot-napcat-watchdog.timer` 每 5 分钟检查一次 `napcat.service` systemd cgroup 内的进程。任一 QQ/Node 进程文件描述符达到 `1500`、重复打开 `/proc/<pid>/maps` 的文件描述符达到 `1000`、任一 Xvfb 进程文件描述符达到 `220`，或最近 10 分钟出现 `Maximum number of clients reached` 时触发恢复。反向 WebSocket 未建立必须连续检查失败两次才触发恢复。每次实际重启后有 30 分钟冷却期，避免重复重启。
+`qqbot-napcat-watchdog@<实例>.timer` 每 5 分钟只检查对应 `napcat@<实例>.service` systemd cgroup 内的进程。任一 QQ/Node 进程文件描述符达到 `1500`、重复打开 `/proc/<pid>/maps` 的文件描述符达到 `1000`、任一 Xvfb 进程文件描述符达到 `220`，或最近 10 分钟出现 `Maximum number of clients reached` 时触发恢复。反向 WebSocket 会按 carrot=6199、kona=6299 分别检查，连续失败两次才触发恢复。每个实例有独立状态与 30 分钟重启冷却期。
 
-`qqbot-napcat-daily-restart.timer` 每天 04:10 请求一次计划重启，并在备份服务之后运行。触发恢复时只重启 `napcat.service`，不会重启 `qq-violation-bot.service`。重启后最多等待 90 秒，检查 NapCat、机器人服务、反向 WebSocket 和资源指标是否恢复。
+`qqbot-napcat-daily-restart@<实例>.timer` 每天 04:10 请求一次计划重启。触发恢复时只重启目标 `napcat@<实例>.service`，不会重启另一个 QQ 或机器人服务。重启后最多等待 90 秒，检查对应 NapCat、机器人服务、反向 WebSocket 和资源指标是否恢复。
 
 查看两个 timer 的加载、启用和运行状态：
 
 ```bash
-systemctl status qqbot-napcat-watchdog.timer qqbot-napcat-daily-restart.timer
+systemctl status qqbot-napcat-watchdog@carrot.timer qqbot-napcat-daily-restart@carrot.timer
 ```
 
 只采集当前指标和决策，不执行重启：
 
 ```bash
 cd /opt/qq-violation-bot
-.venv/bin/python scripts/napcat_watchdog.py --check-only
+.venv/bin/python scripts/napcat_watchdog.py --instance carrot --check-only
 ```
 
 查看当天 watchdog 执行记录：
 
 ```bash
-journalctl -u qqbot-napcat-watchdog.service --since today --no-pager
+journalctl -u qqbot-napcat-watchdog@carrot.service --since today --no-pager
 ```
 
 回滚自动恢复策略时，立即停止并禁用两个 timer；此命令不会停止机器人或 NapCat：
 
 ```bash
-systemctl disable --now qqbot-napcat-watchdog.timer qqbot-napcat-daily-restart.timer
+systemctl disable --now qqbot-napcat-watchdog@carrot.timer qqbot-napcat-daily-restart@carrot.timer
 ```
 
 ## 历史 XLSX 导入
