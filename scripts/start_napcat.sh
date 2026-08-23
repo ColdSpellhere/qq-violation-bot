@@ -53,10 +53,8 @@ export HOME="$INSTANCE_ROOT/napcat/home"
 export XDG_CONFIG_HOME="$INSTANCE_ROOT/napcat/config"
 export XDG_DATA_HOME="$INSTANCE_ROOT/napcat/data"
 export XDG_CACHE_HOME="$INSTANCE_ROOT/napcat/cache"
-readonly QQ_USER_DATA="$INSTANCE_ROOT/napcat/qq-user-data"
 install -d -m 0700 "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" \
-  "$XDG_CACHE_HOME" "$QQ_USER_DATA"
+  "$XDG_CACHE_HOME"
 
 cd "$NAPCAT_INSTALL_ROOT"
-exec "$XVFB_RUN" -a "$QQ_BINARY" --no-sandbox \
-  "--user-data-dir=$QQ_USER_DATA" -q "$BOT_SELF_ID"
+exec "$XVFB_RUN" -a "$QQ_BINARY" --no-sandbox -q "$BOT_SELF_ID"

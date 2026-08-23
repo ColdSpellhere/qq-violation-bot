@@ -62,7 +62,9 @@ class StartNapCatTests(unittest.TestCase):
         kona_lines = kona.capture.splitlines()
         for index in range(5):
             self.assertNotEqual(carrot_lines[index], kona_lines[index])
-        self.assertIn("--user-data-dir=", carrot_lines[-1])
+        self.assertNotIn("--user-data-dir=", carrot_lines[-1])
+        self.assertTrue(carrot_lines[1].endswith("/instances/carrot/napcat/config"))
+        self.assertTrue(kona_lines[1].endswith("/instances/kona/napcat/config"))
         self.assertIn("-q 1234567890", carrot_lines[-1])
         self.assertIn("-q 2345678901", kona_lines[-1])
 
