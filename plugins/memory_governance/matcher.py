@@ -8,6 +8,7 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 from nonebot.exception import FinishedException
 from nonebot.rule import Rule
 
+from plugins.feature_control.addressing import addressed_group_admin_message
 from plugins.feature_control.runtime import FEATURES
 from plugins.violation_record.config import CONFIG
 
@@ -23,8 +24,11 @@ if TYPE_CHECKING:
 
 
 async def is_memory_governance_event(event: Event) -> bool:
+    message = addressed_group_admin_message(event)
+    if message is None:
+        return False
     return is_memory_command(
-        canonical_memory_command_text(getattr(event, "message", ()))
+        canonical_memory_command_text(message)
     )
 
 
@@ -60,6 +64,9 @@ async def _send_private_receipt(bot: Bot, *, actor: str, message: str) -> bool:
 
 @memory_governance_matcher.handle()
 async def handle_memory_governance(bot: Bot, event: Event) -> None:
+    message = addressed_group_admin_message(event)
+    if message is None:
+        return
     actor = str(event.user_id)
     superusers = {str(user_id) for user_id in get_driver().config.superusers}
     if actor not in superusers:
@@ -73,11 +80,11 @@ async def handle_memory_governance(bot: Bot, event: Event) -> None:
 
     try:
         command_text = canonical_memory_command_text(
-            getattr(event, "message", ())
+            message
         )
         command = parse_memory_command(
             command_text,
-            getattr(event, "message", None),
+            message,
             group_id=getattr(event, "group_id", None),
             private_allowed_user_ids=state.private_chat_allowed_user_ids,
         )

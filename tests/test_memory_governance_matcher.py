@@ -25,9 +25,14 @@ from plugins.memory_governance import matcher
 
 
 def _event(text: str, *, user_id: int = 900, group_id: int | None = 123):
+    message = Message(text)
+    if group_id is not None:
+        message = Message([MessageSegment.at(999999), MessageSegment.text(text)])
     values = {
         "user_id": user_id,
-        "message": Message(text),
+        "self_id": 999999,
+        "message_type": "group" if group_id is not None else "private",
+        "message": message,
         "get_plaintext": lambda: text,
     }
     if group_id is not None:
@@ -38,6 +43,8 @@ def _event(text: str, *, user_id: int = 900, group_id: int | None = 123):
 def _segment_event(
     message: Message, *, user_id: int = 900, group_id: int | None = 123
 ):
+    if group_id is not None:
+        message = Message([MessageSegment.at(999999), *message])
     event = _event(
         message.extract_plain_text(), user_id=user_id, group_id=group_id
     )
@@ -66,6 +73,36 @@ class MemoryGovernanceRuleTests(unittest.IsolatedAsyncioTestCase):
     def test_matcher_is_priority_zero_and_blocks(self) -> None:
         self.assertEqual(0, matcher.memory_governance_matcher.priority)
         self.assertTrue(matcher.memory_governance_matcher.block)
+
+    async def test_group_governance_targets_only_the_first_mentioned_bot(self) -> None:
+        command = Message(
+            [MessageSegment.at(10001), MessageSegment.text(" /记忆 状态")]
+        )
+        event = _segment_event(command, group_id=None)
+        event.group_id = 123
+        event.message_type = "group"
+        event.self_id = 10001
+        self.assertTrue(await matcher.is_memory_governance_event(event))
+
+        event.self_id = 20002
+        self.assertFalse(await matcher.is_memory_governance_event(event))
+
+        event.self_id = 10001
+        event.message = Message(
+            [
+                MessageSegment.at(10001),
+                MessageSegment.at(20002),
+                MessageSegment.text(" /记忆 状态"),
+            ]
+        )
+        self.assertFalse(await matcher.is_memory_governance_event(event))
+
+    async def test_private_governance_does_not_require_bot_at(self) -> None:
+        self.assertTrue(
+            await matcher.is_memory_governance_event(
+                _event("/记忆 状态", group_id=None)
+            )
+        )
 
 
 class MemoryGovernanceHandlerTests(unittest.IsolatedAsyncioTestCase):

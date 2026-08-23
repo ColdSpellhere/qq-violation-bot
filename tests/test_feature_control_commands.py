@@ -10,7 +10,12 @@ from unittest.mock import AsyncMock, patch
 os.environ.setdefault("TARGET_GROUP_ID", "999000111")
 
 import nonebot
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
+from nonebot.adapters.onebot.v11 import (
+    GroupMessageEvent,
+    Message,
+    MessageSegment,
+    PrivateMessageEvent,
+)
 
 try:
     nonebot.get_driver()
@@ -21,15 +26,24 @@ from plugins.feature_control.commands import (
     execute_control_command,
     is_control_command,
 )
-from plugins.feature_control.matcher import handle_control_command
+from plugins.feature_control.matcher import handle_control_command, is_control_event
 from plugins.feature_control.state import FeatureController, FeatureState
 
 
-def _event(text: str, *, user_id: int = 1) -> GroupMessageEvent:
-    message = Message(text)
+def _event(
+    text: str,
+    *,
+    user_id: int = 1,
+    self_id: int = 999999,
+    addressed: bool = True,
+) -> GroupMessageEvent:
+    message = Message()
+    if addressed:
+        message += MessageSegment.at(self_id)
+    message += MessageSegment.text(text)
     return GroupMessageEvent(
         time=2000,
-        self_id=999999,
+        self_id=self_id,
         post_type="message",
         sub_type="normal",
         user_id=user_id,
@@ -38,9 +52,27 @@ def _event(text: str, *, user_id: int = 1) -> GroupMessageEvent:
         group_id=123456,
         message=message,
         original_message=message,
-        raw_message=text,
+        raw_message=str(message),
         font=0,
         sender={"user_id": user_id, "nickname": "测试者", "role": "member"},
+    )
+
+
+def _private_event(text: str, *, user_id: int = 1) -> PrivateMessageEvent:
+    message = Message(text)
+    return PrivateMessageEvent(
+        time=2000,
+        self_id=999999,
+        post_type="message",
+        sub_type="friend",
+        user_id=user_id,
+        message_type="private",
+        message_id=789,
+        message=message,
+        original_message=message,
+        raw_message=text,
+        font=0,
+        sender={"user_id": user_id, "nickname": "测试者"},
     )
 
 
@@ -269,6 +301,35 @@ class FeatureControlCommandTests(unittest.TestCase):
 
 
 class FeatureControlMatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_group_control_requires_real_at_for_this_bot(self) -> None:
+        command = "/提示构建 关"
+        self.assertTrue(await is_control_event(_event(command, self_id=10001)))
+        self.assertTrue(await is_control_event(_event(command, self_id=20002)))
+        self.assertFalse(
+            await is_control_event(
+                _event(command, self_id=10001, addressed=False)
+            )
+        )
+        fake = _event("@10001 " + command, self_id=10001, addressed=False)
+        self.assertFalse(await is_control_event(fake))
+        wrong = _event(command, self_id=10001)
+        wrong.message = Message(
+            [MessageSegment.at(20002), MessageSegment.text(" " + command)]
+        )
+        self.assertFalse(await is_control_event(wrong))
+        multiple = _event(command, self_id=10001)
+        multiple.message = Message(
+            [
+                MessageSegment.at(10001),
+                MessageSegment.at(20002),
+                MessageSegment.text(" " + command),
+            ]
+        )
+        self.assertFalse(await is_control_event(multiple))
+
+    async def test_private_control_command_does_not_require_at(self) -> None:
+        self.assertTrue(await is_control_event(_private_event("/模块状态")))
+
     async def test_non_superuser_is_rejected_without_mutating_state(self) -> None:
         with TemporaryDirectory() as directory:
             controller = FeatureController(
