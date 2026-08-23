@@ -207,6 +207,24 @@ class FeatureControlCommandTests(unittest.TestCase):
         self.assertNotIn("100", status)
         self.assertNotIn("200", status)
 
+    def test_chat_only_reports_business_unavailable_and_rejects_enable(self) -> None:
+        controller = FeatureController(
+            Path(self.temporary_directory.name) / "chat-only.json",
+            self.controller.snapshot(),
+            business_capable=False,
+        )
+
+        status = execute_control_command("/模块状态", controller, "1")
+        self.assertIn("业务功能：不可用（纯聊天实例）", status)
+        self.assertIn("模型网关业务调用：不可用（纯聊天实例）", status)
+        for command in ("/业务 开", "/模型网关 业务 开"):
+            self.assertEqual(
+                "业务功能不可用：当前为纯聊天实例。",
+                execute_control_command(command, controller, "1"),
+            )
+        self.assertFalse(controller.snapshot().business_enabled)
+        self.assertFalse(controller.snapshot().llm_gateway_business_enabled)
+
     def test_reports_duplicate_missing_invalid_and_usage_errors(self) -> None:
         self.assertEqual(
             "群聊群：100 已在允许列表中。",

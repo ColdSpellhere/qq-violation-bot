@@ -112,6 +112,32 @@ class GroupRouterTests(unittest.IsolatedAsyncioTestCase):
         ):
             await group_router.route_group_message(bot, event)
 
+    async def test_chat_only_controller_never_calls_business_handler(self) -> None:
+        bot = AsyncMock()
+        event = _group_event("帮助", addressed=True)
+        controller = FeatureController(
+            Path(self.directory.name) / "chat-only.json",
+            self.defaults,
+            business_capable=False,
+        )
+        with patch.object(group_router, "FEATURES", controller), patch.object(
+            group_router,
+            "CONFIG",
+            SimpleNamespace(
+                target_group_id=TARGET_GROUP_ID,
+                random_chat_probability=0.05,
+            ),
+        ), patch.object(
+            group_router,
+            "handle_business_message",
+            new=AsyncMock(side_effect=AssertionError("business handler called")),
+        ), patch.object(
+            group_router, "send_random_reply", new=AsyncMock(return_value=True)
+        ) as casual:
+            await group_router.route_group_message(bot, event)
+
+        casual.assert_not_awaited()
+
     async def test_known_business_request_does_not_call_chat(self) -> None:
         bot = AsyncMock()
         event = _group_event("帮助", addressed=True)

@@ -48,6 +48,25 @@ class FeatureControllerTests(unittest.TestCase):
         self.assertFalse(controller.private_chat_allowed("200"))
         self.assertTrue(controller.business_allowed(999, 999))
 
+    def test_chat_only_capability_cannot_be_enabled_at_runtime(self):
+        controller = FeatureController(
+            self.path,
+            replace(
+                self.defaults,
+                business_enabled=True,
+                llm_gateway_business_enabled=True,
+            ),
+            business_capable=False,
+        )
+
+        self.assertFalse(controller.snapshot().business_enabled)
+        self.assertFalse(controller.snapshot().llm_gateway_business_enabled)
+        self.assertFalse(controller.business_allowed(100, 100))
+        self.assertFalse(controller.llm_gateway_allowed("business"))
+        for switch in ("business_enabled", "llm_gateway_business_enabled"):
+            with self.assertRaisesRegex(ValueError, "chat-only"):
+                controller.set_switch(switch, True, actor="1")
+
     def test_new_memory_switches_default_to_disabled(self):
         state = FeatureController(self.path, self.defaults).snapshot()
 

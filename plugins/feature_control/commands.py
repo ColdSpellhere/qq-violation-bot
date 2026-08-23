@@ -54,9 +54,19 @@ def execute_control_command(
 
 def _status(controller: FeatureController) -> str:
     state = controller.snapshot()
+    business_status = (
+        _switch_text(state.business_enabled)
+        if controller.business_capable
+        else "不可用（纯聊天实例）"
+    )
+    gateway_business_status = (
+        _switch_text(state.llm_gateway_business_enabled)
+        if controller.business_capable
+        else "不可用（纯聊天实例）"
+    )
     return "\n".join(
         (
-            f"业务功能：{_switch_text(state.business_enabled)}",
+            f"业务功能：{business_status}",
             f"聊天总开关：{_switch_text(state.chat_enabled)}",
             "群聊功能："
             f"{_switch_text(state.group_chat_enabled)}"
@@ -74,7 +84,7 @@ def _status(controller: FeatureController) -> str:
             "模型网关成员记忆调用："
             f"{_switch_text(state.llm_gateway_member_memory_enabled)}",
             f"模型网关聊天调用：{_switch_text(state.llm_gateway_chat_enabled)}",
-            f"模型网关业务调用：{_switch_text(state.llm_gateway_business_enabled)}",
+            f"模型网关业务调用：{gateway_business_status}",
             f"提示构建：{_switch_text(state.prompt_builder_enabled)}",
         )
     )
@@ -92,6 +102,8 @@ def _set_gateway_switch(
     ):
         field_name, label = _GATEWAY_DOMAIN_COMMANDS[parts[1]]
         enabled = parts[2] == "开"
+        if field_name == "llm_gateway_business_enabled" and not controller.business_capable:
+            return "业务功能不可用：当前为纯聊天实例。"
         controller.set_switch(field_name, enabled, actor)
         return f"{label}已{'开启' if enabled else '关闭'}。"
     return (
@@ -106,6 +118,8 @@ def _set_switch(parts: list[str], controller: FeatureController, actor: str) -> 
     if len(parts) != 2 or parts[1] not in {"开", "关"}:
         return f"用法：{command} 开|关。"
     enabled = parts[1] == "开"
+    if field_name == "business_enabled" and not controller.business_capable:
+        return "业务功能不可用：当前为纯聊天实例。"
     controller.set_switch(field_name, enabled, actor)
     return f"{label}已{'开启' if enabled else '关闭'}。"
 

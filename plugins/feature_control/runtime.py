@@ -23,4 +23,5 @@ FEATURES = FeatureController(
         llm_gateway_chat_enabled=CONFIG.llm_gateway_chat_enabled,
         llm_gateway_business_enabled=CONFIG.llm_gateway_business_enabled,
     ),
+    business_capable=CONFIG.business_capable,
 )

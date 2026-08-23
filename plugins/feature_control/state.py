@@ -57,12 +57,32 @@ class FeatureState:
 
 
 class FeatureController:
-    def __init__(self, path: Path, defaults: FeatureState):
+    def __init__(
+        self,
+        path: Path,
+        defaults: FeatureState,
+        *,
+        business_capable: bool = True,
+    ):
         self._path = Path(path)
         self._lock = RLock()
-        self._state = self._load_state(self._path, defaults) or self._load_state(
+        self._business_capable = bool(business_capable)
+        loaded = self._load_state(self._path, defaults) or self._load_state(
             self._backup_path, defaults
         ) or defaults
+        self._state = (
+            loaded
+            if self._business_capable
+            else replace(
+                loaded,
+                business_enabled=False,
+                llm_gateway_business_enabled=False,
+            )
+        )
+
+    @property
+    def business_capable(self) -> bool:
+        return self._business_capable
 
     @property
     def _backup_path(self) -> Path:
@@ -77,6 +97,12 @@ class FeatureController:
             raise ValueError(f"unknown feature switch: {name}")
         if not isinstance(enabled, bool):
             raise ValueError("feature switch values must be boolean")
+        if (
+            not self._business_capable
+            and enabled
+            and name in {"business_enabled", "llm_gateway_business_enabled"}
+        ):
+            raise ValueError("business capability is unavailable in chat-only mode")
 
         with self._lock:
             return self._replace_state(**{name: enabled}, updated_by=str(actor))
@@ -103,7 +129,8 @@ class FeatureController:
 
     def business_allowed(self, group_id: int, target_group_id: int) -> bool:
         return (
-            self.snapshot().business_enabled
+            self._business_capable
+            and self.snapshot().business_enabled
             and self._as_positive_int(group_id) == self._as_positive_int(target_group_id)
             and self._as_positive_int(group_id) is not None
         )
@@ -133,6 +160,8 @@ class FeatureController:
             field_name = GATEWAY_DOMAIN_SWITCHES[domain]
         except KeyError as exc:
             raise ValueError(f"unknown llm gateway domain: {domain}") from exc
+        if domain == "business" and not self._business_capable:
+            return False
         state = self.snapshot()
         return state.llm_gateway_enabled and getattr(state, field_name)
 

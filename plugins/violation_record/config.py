@@ -2,6 +2,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 from plugins.runtime_paths import (
     BACKUP_DIR,
@@ -77,6 +78,13 @@ def _target_group_id_env() -> int:
     return group_id
 
 
+def _bot_mode_env() -> Literal["full", "chat_only"]:
+    value = str(os.getenv("BOT_MODE") or "full").strip().lower()
+    if value not in {"full", "chat_only"}:
+        raise RuntimeError("BOT_MODE must be full or chat_only")
+    return cast(Literal["full", "chat_only"], value)
+
+
 def _database_path(url: str) -> Path:
     if url.startswith("sqlite:///"):
         return Path(url.removeprefix("sqlite:///"))
@@ -104,7 +112,9 @@ def _chat_vision_root_env() -> Path:
     return configured
 
 
-_TARGET_GROUP_ID = _target_group_id_env()
+_BOT_MODE = _bot_mode_env()
+_TARGET_GROUP_ID = 0 if _BOT_MODE == "chat_only" else _target_group_id_env()
+_DEFAULT_BUSINESS_GROUPS = () if _TARGET_GROUP_ID == 0 else (_TARGET_GROUP_ID,)
 legacy_private_ids = _string_id_tuple_env("PRIVATE_CHAT_ALLOWED_USER_ID", ())
 legacy_group_chat_config = (
     "CHAT_ENABLED" not in os.environ and "GROUP_CHAT_ENABLED" not in os.environ
@@ -114,7 +124,9 @@ legacy_group_chat_config = (
 @dataclass(frozen=True)
 class AppConfig:
     character_file: Path = CHARACTER_FILE
-    allowed_group_ids: tuple[int, ...] = (_TARGET_GROUP_ID,)
+    bot_mode: Literal["full", "chat_only"] = _BOT_MODE
+    business_capable: bool = _BOT_MODE == "full"
+    allowed_group_ids: tuple[int, ...] = _DEFAULT_BUSINESS_GROUPS
     target_group_id: int = _TARGET_GROUP_ID
     bot_self_id: str = os.getenv("BOT_SELF_ID", "")
     napcat_access_token: str = os.getenv("NAPCAT_ACCESS_TOKEN", "")
@@ -170,7 +182,9 @@ class AppConfig:
     private_chat_allowed_user_id: str = str(
         os.getenv("PRIVATE_CHAT_ALLOWED_USER_ID") or ""
     ).strip()
-    business_enabled: bool = _bool_env("BUSINESS_ENABLED", True)
+    business_enabled: bool = (
+        _bool_env("BUSINESS_ENABLED", True) if _BOT_MODE == "full" else False
+    )
     chat_enabled: bool = _bool_env(
         "CHAT_ENABLED",
         True if legacy_group_chat_config else random_chat_enabled or private_chat_enabled,
@@ -180,7 +194,7 @@ class AppConfig:
         True if legacy_group_chat_config else random_chat_enabled,
     )
     group_chat_allowed_group_ids: tuple[int, ...] = _id_tuple_env(
-        "GROUP_CHAT_ALLOWED_GROUP_IDS", (_TARGET_GROUP_ID,)
+        "GROUP_CHAT_ALLOWED_GROUP_IDS", _DEFAULT_BUSINESS_GROUPS
     )
     private_chat_allowed_user_ids: tuple[str, ...] = _string_id_tuple_env(
         "PRIVATE_CHAT_ALLOWED_USER_IDS", legacy_private_ids
@@ -202,8 +216,10 @@ class AppConfig:
         "LLM_GATEWAY_MEMBER_MEMORY_ENABLED", False
     )
     llm_gateway_chat_enabled: bool = _bool_env("LLM_GATEWAY_CHAT_ENABLED", False)
-    llm_gateway_business_enabled: bool = _bool_env(
-        "LLM_GATEWAY_BUSINESS_ENABLED", False
+    llm_gateway_business_enabled: bool = (
+        _bool_env("LLM_GATEWAY_BUSINESS_ENABLED", False)
+        if _BOT_MODE == "full"
+        else False
     )
     llm_gateway_max_connections: int = _bounded_int_env(
         "LLM_GATEWAY_MAX_CONNECTIONS", 8, 1, 64
