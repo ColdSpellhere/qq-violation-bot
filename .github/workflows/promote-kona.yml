@@ -49,4 +49,4 @@ jobs:
           REQUESTED_SHA: ${{ github.event.inputs.sha }}
         run: |
           ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
-            "sudo /opt/qq-bots/repository/.venv/bin/python /opt/qq-bots/repository/scripts/deploy_instance.py --instance kona --sha '$REQUESTED_SHA'"
+            "sudo git --git-dir=/opt/qq-bots/repository.git fetch --no-tags https://github.com/ColdSpellhere/qq-violation-bot.git main:refs/remotes/github/main && sudo /usr/bin/python3 /opt/qq-bots/bin/deploy_instance.py --repo /opt/qq-bots/repository.git --instance kona --sha '$REQUESTED_SHA'"

@@ -26,4 +26,4 @@ export TARGET_GROUP_ID="$test_group_id"
 
 git push "$server_remote" "HEAD:refs/heads/release/carrot-candidate"
 ssh -o BatchMode=yes "$deploy_user@$deploy_host" \
-  "sudo /opt/qq-bots/repository/.venv/bin/python /opt/qq-bots/repository/scripts/deploy_instance.py --instance carrot --sha '$candidate_sha'"
+  "sudo /usr/bin/python3 /opt/qq-bots/bin/deploy_instance.py --repo /opt/qq-bots/repository.git --instance carrot --sha '$candidate_sha'"

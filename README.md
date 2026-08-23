@@ -645,6 +645,8 @@ Swap 只用于降低突发内存压力导致进程被系统终止的概率，不
 
 CArroT 是候选验证实例。开发提交先通过 `scripts/deploy_carrot_candidate.sh` 的完整本地门禁，仅推到服务器的 `release/carrot-candidate`，随后只切换 CArroT。QQ 验证通过后，才把同一提交合入并推送 GitHub `main`。`main` 的 CI 通过后，在 GitHub Actions 手动运行 `Promote kona`，输入当前 `main` 的完整 40 位 SHA，并在受保护的 `kona-production` 环境中人工批准。任何 `push` 都不会自动部署 kona。
 
+服务器把候选代码对象保存在 `/opt/qq-bots/repository.git` 裸仓库，稳定部署入口保存在 `/opt/qq-bots/bin/`。部署入口不依赖某个发布目录，因此即使当前版本健康检查失败并回滚，也不会丢失下一次部署能力。kona 晋级时先从公开 GitHub `main` 获取已批准的精确提交，再只切换 kona。
+
 群内模块管理与记忆治理命令必须以目标机器人的真实 @ 开头；私聊管理命令不需要 @。因此两个机器人在同一群时，只会由明确被 @ 的实例执行命令。
 
 ## NapCat 资源监控与定时重启

@@ -25,6 +25,10 @@ class DeploymentWorkflowTests(unittest.TestCase):
         self.assertIn("github.event.inputs.sha", source)
         self.assertIn("origin/main", source)
         self.assertIn("--instance kona", source)
+        self.assertIn("/opt/qq-bots/bin/deploy_instance.py", source)
+        self.assertIn("/opt/qq-bots/repository.git", source)
+        self.assertIn("git --git-dir=/opt/qq-bots/repository.git fetch", source)
+        self.assertNotIn("/opt/qq-bots/repository/scripts/deploy_instance.py", source)
         self.assertNotIn("push:", source)
         for secret in (
             "KONA_DEPLOY_HOST",
@@ -40,6 +44,9 @@ class DeploymentWorkflowTests(unittest.TestCase):
         )
         self.assertIn("release/carrot-candidate", source)
         self.assertIn("--instance carrot", source)
+        self.assertIn("/opt/qq-bots/bin/deploy_instance.py", source)
+        self.assertIn("--repo /opt/qq-bots/repository.git", source)
+        self.assertNotIn("/opt/qq-bots/repository/scripts/deploy_instance.py", source)
         self.assertIn("github.com", source)
         self.assertIn("refusing GitHub remote", source)
         self.assertNotIn("git push origin", source)
