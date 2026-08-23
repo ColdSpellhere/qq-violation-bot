@@ -1,0 +1,21 @@
+[Unit]
+Description=QQ Bot instance %i
+After=network-online.target napcat@%i.service
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Environment=BOT_INSTANCE_ROOT=/opt/qq-bots/instances/%i
+EnvironmentFile=/opt/qq-bots/instances/%i/.env
+WorkingDirectory=/opt/qq-bots/instances/%i/current
+ExecStart=/opt/qq-bots/instances/%i/current/scripts/start_bot.sh %i
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
