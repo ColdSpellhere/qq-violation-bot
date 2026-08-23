@@ -301,6 +301,12 @@ class FeatureControlCommandTests(unittest.TestCase):
 
 
 class FeatureControlMatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_group_control_uses_original_at_after_adapter_preprocessing(self) -> None:
+        event = _event("/模块状态", self_id=10001)
+        event.message = Message("/模块状态")
+
+        self.assertTrue(await is_control_event(event))
+
     async def test_group_control_requires_real_at_for_this_bot(self) -> None:
         command = "/提示构建 关"
         self.assertTrue(await is_control_event(_event(command, self_id=10001)))
@@ -316,6 +322,7 @@ class FeatureControlMatcherTests(unittest.IsolatedAsyncioTestCase):
         wrong.message = Message(
             [MessageSegment.at(20002), MessageSegment.text(" " + command)]
         )
+        wrong.original_message = wrong.message
         self.assertFalse(await is_control_event(wrong))
         multiple = _event(command, self_id=10001)
         multiple.message = Message(
@@ -325,6 +332,7 @@ class FeatureControlMatcherTests(unittest.IsolatedAsyncioTestCase):
                 MessageSegment.text(" " + command),
             ]
         )
+        multiple.original_message = multiple.message
         self.assertFalse(await is_control_event(multiple))
 
     async def test_private_control_command_does_not_require_at(self) -> None:

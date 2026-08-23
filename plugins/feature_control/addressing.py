@@ -13,9 +13,13 @@ def is_group_event(event: Any) -> bool:
 
 
 def addressed_group_admin_message(event: Any) -> Message | None:
-    message = Message(getattr(event, "message", ()))
     if not is_group_event(event):
-        return message
+        return Message(getattr(event, "message", ()))
+
+    message = Message(
+        getattr(event, "original_message", None)
+        or getattr(event, "message", ())
+    )
 
     self_id = str(getattr(event, "self_id", ""))
     target_index: int | None = None
