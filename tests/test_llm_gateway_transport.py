@@ -15,10 +15,12 @@ from plugins.llm_gateway.errors import (
     GatewayConfigurationError,
     GatewayContractError,
     GatewayEmptyContentError,
+    GatewayPaymentRequiredError,
     GatewayRateLimitError,
     GatewayServerError,
     GatewayTimeout,
     GatewayTransportError,
+    is_retryable,
 )
 from plugins.llm_gateway.transport import LLMTransport
 
@@ -164,6 +166,25 @@ class LLMTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, attempts)
             self.assertNotIn("sensitive", str(raised.exception))
             self.assertEqual(status, raised.exception.status_code)
+
+    async def test_payment_required_is_precise_non_retryable_and_redacted(self) -> None:
+        attempts = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(402, text="sensitive provider balance detail")
+
+        with self.assertRaises(GatewayPaymentRequiredError) as raised:
+            await self.make_transport(handler).complete(gateway_request())
+
+        self.assertEqual("GatewayPaymentRequiredError", type(raised.exception).__name__)
+        self.assertIsInstance(raised.exception, GatewayClientError)
+        self.assertFalse(is_retryable(raised.exception))
+        self.assertEqual(402, raised.exception.status_code)
+        self.assertEqual(0, raised.exception.retries)
+        self.assertEqual(1, attempts)
+        self.assertNotIn("sensitive", str(raised.exception))
 
     async def test_retryable_statuses_have_exact_attempts_and_bounded_delays(self) -> None:
         for status, expected in (

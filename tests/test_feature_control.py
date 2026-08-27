@@ -84,6 +84,19 @@ class FeatureControllerTests(unittest.TestCase):
         self.assertFalse(state.llm_gateway_member_memory_enabled)
         self.assertFalse(state.llm_gateway_chat_enabled)
         self.assertFalse(state.llm_gateway_business_enabled)
+        self.assertFalse(state.web_search_enabled)
+
+    def test_web_search_switch_persists_and_requires_boolean(self):
+        controller = FeatureController(self.path, self.defaults)
+        controller.set_switch("web_search_enabled", True, actor="1")
+        self.assertTrue(FeatureController(self.path, self.defaults).snapshot().web_search_enabled)
+
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        raw["web_search_enabled"] = "true"
+        self.path.write_text(json.dumps(raw), encoding="utf-8")
+        self.assertFalse(
+            FeatureController(self.path, self.defaults).snapshot().web_search_enabled
+        )
 
     def test_gateway_requires_master_and_domain_rollout_switch(self):
         controller = FeatureController(self.path, self.defaults)

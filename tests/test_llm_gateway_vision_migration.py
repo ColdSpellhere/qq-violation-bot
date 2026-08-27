@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from plugins.llm_gateway.errors import GatewayAuthenticationError, GatewayContractError
+from plugins.llm_gateway.errors import (
+    GatewayAuthenticationError,
+    GatewayContractError,
+    GatewayPaymentRequiredError,
+)
 
 
 class _Features:
@@ -120,6 +124,37 @@ class VisionGatewayMigrationTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertNotIn("PRIVATE", str(raised.exception))
             self.assertIsNone(raised.exception.__cause__)
+
+    async def test_payment_required_is_redacted_and_marked_non_retryable(self) -> None:
+        from plugins.chat_vision import client
+
+        marker = "data:image/jpeg;base64,PRIVATE-BYTES"
+        gateway = _Gateway()
+        gateway.describe_image.side_effect = GatewayPaymentRequiredError(
+            marker,
+            status_code=402,
+        )
+        with (
+            patch.object(client, "FEATURES", _Features(True), create=True),
+            patch.object(
+                client, "get_gateway", AsyncMock(return_value=gateway), create=True
+            ),
+            self.assertRaises(client.ChatVisionAIError) as raised,
+        ):
+            await client.describe_image(
+                b"PRIVATE-BYTES",
+                "image/jpeg",
+                base_url="https://api.deepseek.com",
+                api_key="secret",
+                model="vision-model",
+                timeout=60,
+            )
+
+        self.assertEqual("GatewayPaymentRequiredError", str(raised.exception))
+        self.assertEqual("payment_required", raised.exception.code)
+        self.assertFalse(raised.exception.retryable)
+        self.assertNotIn("PRIVATE", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
 
     async def test_missing_key_keeps_existing_redacted_value_error_before_gateway(self) -> None:
         from plugins.chat_vision import client

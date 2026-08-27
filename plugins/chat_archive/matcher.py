@@ -13,10 +13,18 @@ from .db import archive_payload
 
 
 def _reply_id(event: GroupMessageEvent) -> str | None:
-    for segment in event.message:
-        if segment.type == "reply":
+    if event.reply is not None:
+        for name in ("message_id", "id"):
+            value = getattr(event.reply, name, None)
+            if value not in (None, ""):
+                return str(value)
+    for message in (event.original_message, event.message):
+        for segment in message:
+            if segment.type != "reply":
+                continue
             value = segment.data.get("id") or segment.data.get("message_id")
-            return str(value) if value is not None else None
+            if value not in (None, ""):
+                return str(value)
     return None
 
 

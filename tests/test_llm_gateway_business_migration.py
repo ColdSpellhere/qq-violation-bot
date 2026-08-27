@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 from plugins.llm_gateway.errors import GatewayAuthenticationError
@@ -15,6 +16,13 @@ class _Gateway:
         self.generate_chat_reply = AsyncMock(
             side_effect=AssertionError("chat model must not parse business intent")
         )
+
+
+class _FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 8, 27, 12, 34, 56)
+        return value if tz is None else value.replace(tzinfo=tz)
 
 
 def _output(intent: str, **overrides: object) -> str:
@@ -69,7 +77,9 @@ class BusinessGatewayMigrationTests(unittest.IsolatedAsyncioTestCase):
         config = replace(ai_router.CONFIG, ai_api_key="synthetic-test-key")
 
         for message, output in corpus:
-            with self.subTest(message=message):
+            with self.subTest(message=message), patch.object(
+                ai_router, "datetime", _FixedDateTime
+            ):
                 legacy = AsyncMock(return_value=output)
                 with (
                     patch.object(ai_router, "CONFIG", config),

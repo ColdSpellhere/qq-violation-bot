@@ -107,6 +107,29 @@ class SpeakerDirectoryTests(unittest.TestCase):
             directory.ref_for_message("u1"), directory.ref_for_message("u2")
         )
 
+    def test_historical_mentions_and_reply_targets_get_stable_refs(self) -> None:
+        from plugins.chat_prompt.speakers import build_speaker_directory
+
+        historical = turn(
+            "100",
+            "甲",
+            "我在回复他们",
+            message_id="m1",
+            at_user_ids=("300",),
+            replied_to_user_id="400",
+        )
+        directory = build_speaker_directory(
+            current=turn("200", "乙", "当前", message_id="m2"),
+            context=(historical,),
+            profiles=(),
+        )
+
+        self.assertIsNotNone(directory.ref_for_user("300"))
+        self.assertIsNotNone(directory.ref_for_user("400"))
+        self.assertNotEqual(
+            directory.ref_for_user("200"), directory.ref_for_user("300")
+        )
+
 
 class SpeakerPromptRenderingTests(unittest.TestCase):
     def build_input(

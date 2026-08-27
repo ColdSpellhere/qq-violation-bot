@@ -60,6 +60,10 @@ class GatewayClientError(GatewayError):
     pass
 
 
+class GatewayPaymentRequiredError(GatewayClientError):
+    pass
+
+
 class GatewayContractError(GatewayError):
     pass
 

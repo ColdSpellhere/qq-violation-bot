@@ -66,6 +66,9 @@ def build_speaker_directory(
         add_known(user_id)
     for turn in context:
         add_turn(turn)
+        add_known(turn.replied_to_user_id)
+        for user_id in turn.at_user_ids:
+            add_known(user_id)
     for profile in profiles:
         add_known(profile.user_id, profile.nickname)
 

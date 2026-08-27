@@ -28,6 +28,10 @@ def _now_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _now_timestamp() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
 async def _cleanup_once(store: ChatVisionStore) -> None:
     try:
         await cleanup_expired(store, CONFIG.chat_vision_root, now_text=_now_text())
@@ -64,6 +68,10 @@ def setup_lifecycle() -> None:
                 store,
                 partial(process_pending_asset, store=store),
                 max_retries=CONFIG.chat_vision_max_retries,
+                min_event_time=(
+                    _now_timestamp() - CONFIG.chat_vision_recovery_window_seconds
+                ),
+                max_assets=CONFIG.chat_vision_recovery_max_assets,
             )
         await _cleanup_once(store)
         if _cleanup_task is None or _cleanup_task.done():

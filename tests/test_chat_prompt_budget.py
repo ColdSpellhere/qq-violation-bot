@@ -111,7 +111,7 @@ class ChatPromptBudgetTests(unittest.TestCase):
         self.assertEqual(("m-21", "m-22", "m-23"), first.context_message_ids)
         self.assertEqual(21, first.truncation.context_messages_removed)
 
-    def test_total_budget_removes_old_context_before_other_data(self) -> None:
+    def test_total_budget_removes_optional_data_before_recent_context(self) -> None:
         from plugins.chat_prompt.budget import apply_prompt_budget, prompt_data_chars
         from plugins.chat_prompt.models import PromptBudget
 
@@ -138,10 +138,9 @@ class ChatPromptBudgetTests(unittest.TestCase):
 
         result = apply_prompt_budget(source, budget)
 
-        self.assertEqual((), result.context)
-        self.assertEqual(source.persona, result.persona)
-        self.assertTrue(result.facts)
-        self.assertTrue(result.relationship)
+        self.assertTrue(result.context)
+        self.assertGreater(result.truncation.persona_chars_removed, 0)
+        self.assertFalse(result.image_descriptions)
         self.assertEqual("CURRENT-MUST-STAY", result.current_text)
         self.assertLessEqual(prompt_data_chars(result), budget.total_chars)
 

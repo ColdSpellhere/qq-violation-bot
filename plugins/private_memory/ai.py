@@ -17,6 +17,7 @@ from plugins.llm_gateway.errors import (
     GatewayContractError,
     GatewayEmptyContentError,
     GatewayError,
+    GatewayPaymentRequiredError,
     GatewayRateLimitError,
     GatewayServerError,
     GatewayTimeout,
@@ -59,6 +60,8 @@ class TransportError(PrivateMemoryAIError):
 def _classify_http_status(status: int) -> TransportError:
     if status in {401, 403}:
         return TransportError("auth_error", retryable=False)
+    if status == 402:
+        return TransportError("payment_required", retryable=False)
     if status == 408:
         return TransportError("request_timeout", retryable=True)
     if status == 429:
@@ -247,6 +250,8 @@ def _map_gateway_error(error: GatewayError) -> PrivateMemoryAIError:
         return TransportError("configuration_error", retryable=True)
     if isinstance(error, GatewayAuthenticationError):
         return TransportError("auth_error", retryable=False)
+    if isinstance(error, GatewayPaymentRequiredError):
+        return TransportError("payment_required", retryable=False)
     if isinstance(error, GatewayTimeout):
         return TransportError("request_timeout", retryable=True)
     if isinstance(error, GatewayTransportError):

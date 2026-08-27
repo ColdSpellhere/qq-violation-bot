@@ -20,7 +20,7 @@ from plugins.chat_archive import matcher as archive_matcher
 from plugins.feature_control.state import FeatureController, FeatureState
 
 
-def _group_event(group_id: int) -> GroupMessageEvent:
+def _group_event(group_id: int, *, reply: dict | None = None) -> GroupMessageEvent:
     message = Message("边界测试消息")
     return GroupMessageEvent(
         time=1785168002,
@@ -36,6 +36,7 @@ def _group_event(group_id: int) -> GroupMessageEvent:
         raw_message="边界测试消息",
         font=0,
         sender={"user_id": 456791, "nickname": "外群成员", "role": "member"},
+        reply=reply,
     )
 
 
@@ -94,6 +95,30 @@ class ChatArchiveTests(unittest.IsolatedAsyncioTestCase):
             archive_matcher, "remember_identity", side_effect=RuntimeError("memory failed")
         ):
             await archive_matcher.archive_chat_message(event)
+
+    async def test_reply_metadata_is_archived_even_when_message_has_no_reply_segment(self) -> None:
+        group_id = 987654321
+        event = _group_event(
+            group_id,
+            reply={
+                "time": 1785167000,
+                "message_type": "group",
+                "message_id": 88,
+                "real_id": 88,
+                "sender": {"user_id": 123, "nickname": "被引用者"},
+                "message": Message("被引用原文"),
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            archive_matcher,
+            "FEATURES",
+            self._controller(directory, allowed=(group_id,)),
+        ), patch.object(
+            archive_matcher, "archive_payload", return_value=True
+        ) as archive_insert, patch.object(archive_matcher, "remember_identity"):
+            await archive_matcher.archive_chat_message(event)
+
+        self.assertEqual("88", archive_insert.call_args.args[2]["reply_message_id"])
 
     async def test_global_chat_switch_blocks_archive_candidate(self) -> None:
         group_id = 987654321

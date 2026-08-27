@@ -49,14 +49,14 @@ class PrivateMemoryStoreTests(unittest.TestCase):
         assistant_row = self.store.append_assistant_message(
             user_id="200",
             source_message_id="u-1",
-            bot_user_id="2727968581",
+            bot_user_id="999000999",
             text="你好呀",
             event_time=1_700_000_001,
         )
         duplicate_assistant = self.store.append_assistant_message(
             user_id="200",
             source_message_id="u-1",
-            bot_user_id="2727968581",
+            bot_user_id="999000999",
             text="重复发送不覆盖",
             event_time=1_700_000_002,
         )
@@ -127,12 +127,15 @@ class PrivateMemoryStoreTests(unittest.TestCase):
         self.store.append_assistant_message(
             user_id="200",
             source_message_id="u-1",
-            bot_user_id="2727968581",
+            bot_user_id="999000999",
             text="在的",
             event_time=1_700_000_001,
         )
         after_delivery = self.store.recent_context(user_id="200", limit=10)
         self.assertEqual(["在吗", "在的"], [item.text for item in after_delivery])
+        self.assertFalse(after_delivery[0].is_bot)
+        self.assertTrue(after_delivery[1].is_bot)
+        self.assertEqual("机器人自己", after_delivery[1].nickname)
 
     def test_assistant_requires_a_live_source_user_message_for_the_same_user(self) -> None:
         self.append_user("other-source", "别人的消息", 100, user_id="300")
@@ -145,7 +148,7 @@ class PrivateMemoryStoreTests(unittest.TestCase):
                     self.store.append_assistant_message(
                         user_id=user_id,
                         source_message_id=source_message_id,
-                        bot_user_id="2727968581",
+                        bot_user_id="999000999",
                         text="不应记录",
                         event_time=101,
                     )
@@ -161,7 +164,7 @@ class PrivateMemoryStoreTests(unittest.TestCase):
             self.store.append_assistant_message(
                 user_id="200",
                 source_message_id="purged-source",
-                bot_user_id="2727968581",
+                bot_user_id="999000999",
                 text="也不应记录",
                 event_time=102,
             )
@@ -173,7 +176,7 @@ class PrivateMemoryStoreTests(unittest.TestCase):
         original_id = self.store.append_assistant_message(
             user_id="200",
             source_message_id="source",
-            bot_user_id="2727968581",
+            bot_user_id="999000999",
             text="已经成功发送",
             event_time=now_epoch,
         )
@@ -186,7 +189,7 @@ class PrivateMemoryStoreTests(unittest.TestCase):
         replay_id = self.store.append_assistant_message(
             user_id="200",
             source_message_id="source",
-            bot_user_id="2727968581",
+            bot_user_id="999000999",
             text="重放不得覆盖",
             event_time=now_epoch + 1,
         )
@@ -214,6 +217,153 @@ class PrivateMemoryStoreTests(unittest.TestCase):
         self.assertEqual(["甲二", "甲三"], [item.text for item in context])
         self.assertTrue(all(item.user_id == "200" for item in context))
         self.assertEqual((), self.store.recent_context(user_id="200", limit=0))
+
+    def test_private_image_descriptions_are_persisted_and_isolated_by_user(self) -> None:
+        self.store.append_user_message(
+            user_id="200",
+            message_id="same-message",
+            text="[图片]",
+            event_time=100,
+            source_kind="image",
+            image_descriptions=("一朵白花", "一只绿色小虫"),
+        )
+        self.store.append_user_message(
+            user_id="300",
+            message_id="same-message",
+            text="[图片]",
+            event_time=101,
+            source_kind="image",
+            image_descriptions=("一辆红色汽车",),
+        )
+
+        first = self.store.recent_context(user_id="200", limit=10)
+        second = self.store.recent_context(user_id="300", limit=10)
+
+        self.assertEqual(("一朵白花", "一只绿色小虫"), first[0].image_descriptions)
+        self.assertEqual(("一辆红色汽车",), second[0].image_descriptions)
+        self.assertNotIn("红色汽车", repr(first))
+        self.assertNotIn("白花", repr(second))
+
+    def test_private_image_descriptions_can_be_completed_once_after_event_commit(self) -> None:
+        self.append_user("vision-later", "[图片]", 100, user_id="200")
+
+        self.assertTrue(self.store.update_user_image_descriptions(
+            user_id="200",
+            message_id="vision-later",
+            image_descriptions=("一盆盛开的月季",),
+            source_kind="image",
+        ))
+        self.assertTrue(self.store.update_user_image_descriptions(
+            user_id="200",
+            message_id="vision-later",
+            image_descriptions=("一盆盛开的月季",),
+            source_kind="image",
+        ))
+        self.assertFalse(self.store.update_user_image_descriptions(
+            user_id="300",
+            message_id="vision-later",
+            image_descriptions=("不应串线",),
+            source_kind="image",
+        ))
+        self.assertFalse(self.store.update_user_image_descriptions(
+            user_id="200",
+            message_id="vision-later",
+            image_descriptions=("旧任务不应覆盖新结果",),
+            source_kind="image",
+        ))
+        context = self.store.recent_context(user_id="200", limit=10)
+        self.assertEqual(("一盆盛开的月季",), context[0].image_descriptions)
+
+    def test_private_image_description_json_corruption_fails_closed(self) -> None:
+        self.append_user("broken-image-json", "[图片]", 100)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                """
+                UPDATE private_chat_messages SET image_descriptions_json='not-json'
+                WHERE user_id='200' AND message_id='broken-image-json'
+                """
+            )
+            connection.commit()
+
+        context = self.store.recent_context(user_id="200", limit=10)
+
+        self.assertEqual((), context[0].image_descriptions)
+
+    def test_private_image_descriptions_are_normalized_and_bounded(self) -> None:
+        self.store.append_user_message(
+            user_id="200",
+            message_id="bounded-images",
+            text="图文",
+            event_time=100,
+            source_kind="text_image",
+            image_descriptions=(
+                "  第一张   图片  ",
+                "二" * 1_500,
+                "三" * 1_500,
+                "第四张",
+                "第五张不会进入",
+            ),
+        )
+
+        descriptions = self.store.recent_context(
+            user_id="200", limit=10
+        )[0].image_descriptions
+
+        self.assertLessEqual(len(descriptions), 4)
+        self.assertEqual("第一张 图片", descriptions[0])
+        self.assertTrue(all(len(item) <= 1_000 for item in descriptions))
+        self.assertLessEqual(sum(map(len, descriptions)), 2_000)
+        with self.assertRaises(TypeError):
+            self.store.append_user_message(
+                user_id="200",
+                message_id="invalid-image-description",
+                text="[图片]",
+                event_time=101,
+                source_kind="image",
+                image_descriptions=(object(),),
+            )
+
+    def test_purge_and_clear_remove_private_image_descriptions(self) -> None:
+        self.store.append_user_message(
+            user_id="200",
+            message_id="expired-image",
+            text="[图片]",
+            event_time=1,
+            source_kind="image",
+            image_descriptions=("过期图片隐私正文",),
+        )
+        current_epoch = int(datetime(2026, 8, 22, tzinfo=UTC).timestamp())
+        self.store.append_user_message(
+            user_id="300",
+            message_id="clear-image",
+            text="[图片]",
+            event_time=current_epoch,
+            source_kind="image",
+            image_descriptions=("待人工清理的图片正文",),
+        )
+
+        self.store.purge_expired(
+            now=datetime(2026, 8, 22, tzinfo=UTC),
+            retention_days=30,
+            max_messages=500,
+        )
+        self.store.clear_private_layers(
+            user_id="300", actor="admin", reason="隐私清理", operation_id=91
+        )
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            rows = connection.execute(
+                """
+                SELECT user_id,text,image_descriptions_json,purged_at
+                FROM private_chat_messages ORDER BY user_id
+                """
+            ).fetchall()
+        self.assertEqual("", rows[0][1])
+        self.assertEqual("[]", rows[0][2])
+        self.assertIsNotNone(rows[0][3])
+        self.assertEqual("", rows[1][1])
+        self.assertEqual("[]", rows[1][2])
+        self.assertIsNotNone(rows[1][3])
 
     def test_retention_applies_age_and_per_user_count_with_exact_survivors(self) -> None:
         day = 86_400
@@ -683,13 +833,22 @@ class PrivateMemoryStoreTests(unittest.TestCase):
 
     def test_wal_is_truncated_after_purge_and_raw_marker_is_not_recoverable(self) -> None:
         sentinel = "PRIVATE-WAL-MARKER-20260822-UNIQUE"
+        image_sentinel = "PRIVATE-IMAGE-DESCRIPTION-MARKER-20260827-UNIQUE"
         marker = sentinel + ("-独特正文" * 1024)
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual("wal", connection.execute("PRAGMA journal_mode=WAL").fetchone()[0])
-        self.append_user("old-marker", marker, 1)
+        self.store.append_user_message(
+            user_id="200",
+            message_id="old-marker",
+            text=marker,
+            event_time=1,
+            source_kind="text_image",
+            image_descriptions=(image_sentinel + ("-图片描述" * 512),),
+        )
         wal = Path(str(self.database) + "-wal")
         before = self.database.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
         self.assertIn(sentinel.encode("utf-8"), before)
+        self.assertIn(image_sentinel.encode("utf-8"), before)
 
         report = self.store.purge_expired(
             now=datetime(2026, 8, 22, tzinfo=UTC),
@@ -700,6 +859,7 @@ class PrivateMemoryStoreTests(unittest.TestCase):
         after = self.database.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
         self.assertTrue(report.checkpoint_complete)
         self.assertNotIn(sentinel.encode("utf-8"), after)
+        self.assertNotIn(image_sentinel.encode("utf-8"), after)
         self.assertTrue(not wal.exists() or wal.stat().st_size == 0)
 
     def test_checkpoint_busy_does_not_misreport_committed_purge_as_failure(self) -> None:

@@ -38,6 +38,8 @@ class PrivateConversation:
         self.lock = _user_lock(user_id)
 
     def use_store(self, store: "PrivateMemoryStore | None") -> None:
+        if (self.store is None) != (store is None):
+            self._turns.clear()
         self.store = store
 
     def append(self, turn: ContextMessage) -> None:
@@ -54,7 +56,11 @@ class PrivateConversation:
         return ((state.row_id, state.created) if state is not None else (None, True))
 
     def append_user_state(
-        self, turn: ContextMessage, *, event_time: int
+        self,
+        turn: ContextMessage,
+        *,
+        event_time: int,
+        source_kind: str = "text",
     ) -> "PrivateUserEventState | None":
         state = None
         if self.store is not None:
@@ -63,21 +69,35 @@ class PrivateConversation:
                 message_id=turn.message_id,
                 text=turn.text,
                 event_time=event_time,
-                source_kind="text",
+                source_kind=source_kind,
+                image_descriptions=turn.image_descriptions,
             )
         self.append(turn)
         return state
 
+    def replace_user_turn(self, turn: ContextMessage) -> bool:
+        for index in range(len(self._turns) - 1, -1, -1):
+            existing = self._turns[index]
+            if (
+                existing.user_id == turn.user_id
+                and existing.message_id == turn.message_id
+                and not existing.is_bot
+            ):
+                self._turns[index] = turn
+                return True
+        return False
+
     def append_assistant(self, turn: ContextMessage, *, event_time: int) -> int | None:
         watermark = None
         if self.store is not None:
-            source_message_id = turn.message_id.removeprefix("bot:")
+            source_message_id = turn.message_id.removeprefix("bot:").split(":", 1)[0]
             watermark = self.store.append_assistant_message(
                 user_id=self.user_id,
                 source_message_id=source_message_id,
                 bot_user_id=turn.user_id,
                 text=turn.text,
                 event_time=event_time,
+                message_id=f"assistant:{turn.message_id.removeprefix('bot:')}",
             )
         self.append(turn)
         return watermark

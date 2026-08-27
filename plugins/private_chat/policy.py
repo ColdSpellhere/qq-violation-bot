@@ -17,8 +17,10 @@ def is_private_candidate(
     )
 
 
-def eligible_private_text(text: str) -> str | None:
+def eligible_private_text(text: str, *, has_image: bool = False) -> str | None:
     cleaned = text.strip()
-    if not cleaned or cleaned.startswith("/"):
+    if cleaned.startswith("/"):
         return None
-    return cleaned
+    if cleaned:
+        return cleaned
+    return "[图片]" if has_image else None

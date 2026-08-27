@@ -101,8 +101,8 @@ class LLMUsageSchemaMigrationTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
 
-    def test_fresh_legacy_and_v1_databases_upgrade_to_v2_idempotently(self) -> None:
-        self.assertEqual(2, PRIVATE_MEMORY_SCHEMA_VERSION)
+    def test_fresh_legacy_and_v1_databases_upgrade_to_current_idempotently(self) -> None:
+        self.assertEqual(3, PRIVATE_MEMORY_SCHEMA_VERSION)
         for kind in ("fresh", "legacy", "v1"):
             path = self.root / f"{kind}.db"
             if kind != "fresh":
@@ -124,16 +124,16 @@ class LLMUsageSchemaMigrationTests(unittest.TestCase):
             first = migrate(path)
             with closing(sqlite3.connect(path)) as connection:
                 connection.execute(
-                    "UPDATE private_memory_schema_meta SET updated_at='v2-sentinel' WHERE singleton=1"
+                    "UPDATE private_memory_schema_meta SET updated_at='current-sentinel' WHERE singleton=1"
                 )
                 connection.commit()
             second = migrate(path)
-            self.assertEqual((2, 2), (first.schema_version, second.schema_version))
+            self.assertEqual((3, 3), (first.schema_version, second.schema_version))
             with closing(sqlite3.connect(path)) as connection:
                 self.assertIsNotNone(connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_usage_events'"
                 ).fetchone())
-                self.assertEqual("v2-sentinel", connection.execute(
+                self.assertEqual("current-sentinel", connection.execute(
                     "SELECT updated_at FROM private_memory_schema_meta WHERE singleton=1"
                 ).fetchone()[0])
                 if kind == "legacy":

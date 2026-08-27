@@ -683,7 +683,9 @@ class MemoryGovernanceService:
             "SELECT COALESCE(MAX(id),0) FROM private_chat_messages WHERE user_id=?", (scope.user_id,)
         ).fetchone()[0])
         connection.execute(
-            "UPDATE private_chat_messages SET text='',purged_at=? WHERE user_id=? AND purged_at IS NULL",
+            "UPDATE private_chat_messages "
+            "SET text='',image_descriptions_json='[]',purged_at=? "
+            "WHERE user_id=? AND purged_at IS NULL",
             (now, scope.user_id),
         )
         connection.execute(

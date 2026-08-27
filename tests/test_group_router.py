@@ -37,10 +37,12 @@ def _group_event(
     reply_image: bool = False,
     user_id: int = 123,
     self_id: int = 999,
+    at_user_ids: tuple[int, ...] = (),
 ) -> GroupMessageEvent:
     segments = []
     if addressed:
         segments.append(MessageSegment.at(self_id))
+    segments.extend(MessageSegment.at(user_id) for user_id in at_user_ids)
     if image:
         segments.append(MessageSegment.image("https://example.invalid/chat.jpg"))
     if text:
@@ -92,6 +94,18 @@ class GroupRouterTests(unittest.IsolatedAsyncioTestCase):
     def controller(self, **changes) -> FeatureController:
         state = replace(self.defaults, **changes)
         return FeatureController(Path(self.directory.name) / "features.json", state)
+
+    async def test_configured_peer_bot_is_not_a_chat_candidate(self) -> None:
+        event = _group_event("机器人之间不要互相触发", user_id=888)
+        with patch.object(
+            group_router,
+            "CONFIG",
+            SimpleNamespace(
+                target_group_id=TARGET_GROUP_ID,
+                peer_bot_user_ids=("888",),
+            ),
+        ):
+            self.assertFalse(await group_router.group_message_candidate(event))
 
     async def test_non_business_group_never_calls_business_parser(self) -> None:
         bot = AsyncMock()
@@ -396,6 +410,74 @@ class GroupRouterTests(unittest.IsolatedAsyncioTestCase):
             await group_router.route_group_message(bot, event)
 
         casual.assert_awaited_once_with(bot, event, "随便聊聊")
+
+    async def test_direct_attack_at_protected_member_bypasses_probability(self) -> None:
+        bot = AsyncMock()
+        event = _group_event(
+            "你这个废物",
+            group_id=CHAT_GROUP_ID,
+            at_user_ids=(67890,),
+        )
+        config = SimpleNamespace(
+            target_group_id=TARGET_GROUP_ID,
+            random_chat_probability=0.0,
+            protected_chat_user_ids=("67890",),
+        )
+        with patch.object(group_router, "FEATURES", self.controller()), patch.object(
+            group_router, "CONFIG", config
+        ), patch.object(group_router, "should_reply") as sample, patch.object(
+            group_router, "send_random_reply", new=AsyncMock(return_value=True)
+        ) as casual:
+            await group_router.route_group_message(bot, event)
+
+        sample.assert_not_called()
+        casual.assert_awaited_once_with(
+            bot,
+            event,
+            "@67890 你这个废物",
+            required=True,
+        )
+
+    async def test_normal_at_of_protected_member_stays_probability_gated(self) -> None:
+        bot = AsyncMock()
+        event = _group_event(
+            "一起吃饭吗",
+            group_id=CHAT_GROUP_ID,
+            at_user_ids=(67890,),
+        )
+        config = SimpleNamespace(
+            target_group_id=TARGET_GROUP_ID,
+            random_chat_probability=0.0,
+            protected_chat_user_ids=("67890",),
+        )
+        with patch.object(group_router, "FEATURES", self.controller()), patch.object(
+            group_router, "CONFIG", config
+        ), patch.object(group_router, "should_reply", return_value=False) as sample, patch.object(
+            group_router, "send_random_reply", new=AsyncMock()
+        ) as casual:
+            await group_router.route_group_message(bot, event)
+
+        sample.assert_called_once_with(0.0)
+        casual.assert_not_awaited()
+
+    async def test_explicit_alias_attack_bypasses_probability_without_at(self) -> None:
+        bot = AsyncMock()
+        event = _group_event("momo是豬", group_id=CHAT_GROUP_ID)
+        config = SimpleNamespace(
+            target_group_id=TARGET_GROUP_ID,
+            random_chat_probability=0.0,
+            protected_chat_user_ids=("67890",),
+            protected_chat_aliases=("momo",),
+        )
+        with patch.object(group_router, "FEATURES", self.controller()), patch.object(
+            group_router, "CONFIG", config
+        ), patch.object(group_router, "should_reply") as sample, patch.object(
+            group_router, "send_random_reply", new=AsyncMock(return_value=True)
+        ) as casual:
+            await group_router.route_group_message(bot, event)
+
+        sample.assert_not_called()
+        casual.assert_awaited_once_with(bot, event, "momo是豬", required=True)
 
     async def test_chat_disabled_blocks_reply_archive_and_memory(self) -> None:
         bot = AsyncMock()

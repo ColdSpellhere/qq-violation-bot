@@ -19,9 +19,12 @@ class PluginLoadingTests(unittest.TestCase):
             'nonebot.load_plugin("plugins.feature_control.matcher")'
         )
         private_handler = source.index('nonebot.load_plugin("plugins.private_chat")')
+        web_search = source.index("import plugins.web_search.runtime")
         self.assertLess(private_schema, gateway)
         self.assertLess(gateway, feature_handler)
         self.assertLess(gateway, private_handler)
+        self.assertLess(gateway, web_search)
+        self.assertLess(web_search, feature_handler)
 
     def test_gateway_package_import_has_no_runtime_registration_side_effect(self) -> None:
         env = os.environ.copy()

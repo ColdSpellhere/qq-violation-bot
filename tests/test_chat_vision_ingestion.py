@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sqlite3
+import subprocess
+import sys
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -17,6 +22,7 @@ except ValueError:
     nonebot.init()
 
 from plugins.chat_vision import lifecycle, matcher, service
+from plugins.chat_vision.client import ChatVisionAIError
 from plugins.chat_vision.download import DownloadedChatImage
 from plugins.chat_vision.store import ChatVisionStore
 
@@ -33,10 +39,11 @@ def _event(
     group_id: int = GROUP_ID,
     user_id: int = 123,
     message_id: int = 456,
+    event_time: int | None = None,
 ) -> GroupMessageEvent:
     message = Message(list(segments))
     return GroupMessageEvent(
-        time=1_755_734_400,
+        time=int(time.time()) if event_time is None else event_time,
         self_id=BOT_ID,
         post_type="message",
         sub_type="normal",
@@ -100,6 +107,66 @@ class ChatVisionMatcherTests(unittest.TestCase):
                 )
             )
 
+    def test_candidate_rejects_event_older_than_recovery_window(self) -> None:
+        now = 2_000_000_000
+        event = _event(
+            _image("https://cdn.example/old.jpg"),
+            event_time=now - 3600,
+        )
+        features = SimpleNamespace(group_chat_allowed=lambda group_id: True)
+
+        with (
+            patch.object(matcher, "CONFIG", SimpleNamespace(chat_vision_enabled=True)),
+            patch.object(matcher, "FEATURES", features),
+            patch.object(
+                service,
+                "CONFIG",
+                SimpleNamespace(chat_vision_recovery_window_seconds=900),
+            ),
+            patch.object(service, "_now_timestamp", return_value=now, create=True),
+        ):
+            self.assertFalse(matcher.chat_image_candidate(event))
+
+    def test_candidate_accepts_small_future_clock_skew(self) -> None:
+        now = 2_000_000_000
+        event = _event(
+            _image("https://cdn.example/future.jpg"),
+            event_time=now + 60,
+        )
+        features = SimpleNamespace(group_chat_allowed=lambda group_id: True)
+
+        with (
+            patch.object(matcher, "CONFIG", SimpleNamespace(chat_vision_enabled=True)),
+            patch.object(matcher, "FEATURES", features),
+            patch.object(
+                service,
+                "CONFIG",
+                SimpleNamespace(chat_vision_recovery_window_seconds=900),
+            ),
+            patch.object(service, "_now_timestamp", return_value=now, create=True),
+        ):
+            self.assertTrue(matcher.chat_image_candidate(event))
+
+    def test_candidate_rejects_large_future_clock_skew(self) -> None:
+        now = 2_000_000_000
+        event = _event(
+            _image("https://cdn.example/far-future.jpg"),
+            event_time=now + 3600,
+        )
+        features = SimpleNamespace(group_chat_allowed=lambda group_id: True)
+
+        with (
+            patch.object(matcher, "CONFIG", SimpleNamespace(chat_vision_enabled=True)),
+            patch.object(matcher, "FEATURES", features),
+            patch.object(
+                service,
+                "CONFIG",
+                SimpleNamespace(chat_vision_recovery_window_seconds=900),
+            ),
+            patch.object(service, "_now_timestamp", return_value=now, create=True),
+        ):
+            self.assertFalse(matcher.chat_image_candidate(event))
+
 
 class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -113,6 +180,7 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
             chat_vision_max_bytes=1_234_567,
             chat_vision_timeout=17,
             chat_vision_max_retries=3,
+            chat_vision_recovery_window_seconds=900,
             chat_vision_model="vision-test-model",
             ai_base_url="https://ai.example",
             ai_api_key="test-key",
@@ -314,6 +382,79 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("OSError", error_type)
         self.assertNotIn("credential", error_type)
 
+    async def test_payment_required_is_persisted_once_and_never_retried(self) -> None:
+        event = _event(_image("https://cdn.example/payment.jpg"))
+        download = AsyncMock(
+            return_value=DownloadedChatImage(JPEG_ONE, "image/jpeg", "jpg")
+        )
+        describe = AsyncMock(
+            side_effect=ChatVisionAIError(
+                "GatewayPaymentRequiredError",
+                code="payment_required",
+                retryable=False,
+            )
+        )
+        with (
+            patch.object(service, "STORE", self.store),
+            patch.object(service, "CONFIG", self.config),
+            patch.object(service, "download_chat_image", new=download),
+            patch.object(service, "describe_image", new=describe),
+        ):
+            first = await service.process_image_event(event)
+            second = await service.process_image_event(event)
+
+        self.assertEqual("failed", first[0].status)
+        self.assertEqual("payment_required", self._stored_error_type(first[0].id))
+        self.assertEqual([], self.store.claimable(max_retries=3))
+        self.assertEqual(1, second[0].attempts)
+        download.assert_awaited_once()
+        describe.assert_awaited_once()
+
+    async def test_historical_live_event_does_not_reclaim_existing_asset(self) -> None:
+        now = 2_000_000_000
+        event_time = now - 3600
+        message_id = 789
+        source_url = "https://cdn.example/old.jpg"
+        stored = self.store.ensure_pending(
+            GROUP_ID,
+            str(message_id),
+            1,
+            source_url,
+            event_time,
+        )
+        event = _event(
+            _image(source_url),
+            message_id=message_id,
+            event_time=event_time,
+        )
+        download = AsyncMock(
+            return_value=DownloadedChatImage(JPEG_ONE, "image/jpeg", "jpg")
+        )
+        describe = AsyncMock(return_value="不应生成的描述")
+
+        with (
+            patch.object(service, "STORE", self.store),
+            patch.object(service, "CONFIG", self.config),
+            patch.object(service, "_now_timestamp", return_value=now, create=True),
+            patch.object(service, "download_chat_image", new=download),
+            patch.object(service, "describe_image", new=describe),
+        ):
+            assets = await service.process_image_event(event)
+
+        self.assertEqual([stored.id], [asset.id for asset in assets])
+        self.assertEqual("pending", assets[0].status)
+        self.assertEqual(0, assets[0].attempts)
+        download.assert_not_awaited()
+        describe.assert_not_awaited()
+
+    def _stored_error_type(self, asset_id: int) -> str:
+        with sqlite3.connect(self.store.database_path) as conn:
+            return str(
+                conn.execute(
+                    "SELECT error_type FROM chat_image_assets WHERE id=?", (asset_id,)
+                ).fetchone()[0]
+            )
+
     async def test_retry_with_valid_file_skips_download_and_retries_description(self) -> None:
         event = _event(_image("https://cdn.example/one.jpg"))
         download = AsyncMock(
@@ -415,9 +556,10 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(id=1),
             SimpleNamespace(id=2),
             SimpleNamespace(id=3),
+            SimpleNamespace(id=4),
         ]
         store = MagicMock()
-        store.claimable.side_effect = [pending[:2], pending[2:], []]
+        store.claimable.side_effect = [pending[:2], pending[2:3]]
         processor = AsyncMock()
 
         with patch("plugins.chat_archive.db.recent_text_context") as archive_scan:
@@ -426,13 +568,14 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
                 processor,
                 max_retries=3,
                 batch_size=2,
+                min_event_time=1_700_000_000,
+                max_assets=3,
             )
 
         self.assertEqual(
             [
-                call(3, after_id=0, limit=2),
-                call(3, after_id=2, limit=2),
-                call(3, after_id=3, limit=2),
+                call(3, after_id=0, limit=2, min_event_time=1_700_000_000),
+                call(3, after_id=2, limit=1, min_event_time=1_700_000_000),
             ],
             store.claimable.call_args_list,
         )
@@ -441,6 +584,77 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
             processor.await_args_list,
         )
         archive_scan.assert_not_called()
+
+
+class ChatVisionRecoveryConfigTests(unittest.TestCase):
+    @staticmethod
+    def _probe(**overrides: str) -> tuple[int, int]:
+        environment = os.environ.copy()
+        environment["TARGET_GROUP_ID"] = "999000111"
+        for key in (
+            "CHAT_VISION_RECOVERY_WINDOW_SECONDS",
+            "CHAT_VISION_RECOVERY_MAX_ASSETS",
+        ):
+            environment.pop(key, None)
+        environment.update(overrides)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json; "
+                    "from plugins.violation_record.config import CONFIG; "
+                    "print(json.dumps([CONFIG.chat_vision_recovery_window_seconds, "
+                    "CONFIG.chat_vision_recovery_max_assets]))"
+                ),
+            ],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr)
+        return tuple(json.loads(completed.stdout.strip().splitlines()[-1]))
+
+    def test_recovery_config_has_small_positive_defaults(self) -> None:
+        self.assertEqual((900, 20), self._probe())
+
+    def test_recovery_config_accepts_explicit_positive_values(self) -> None:
+        self.assertEqual(
+            (120, 7),
+            self._probe(
+                CHAT_VISION_RECOVERY_WINDOW_SECONDS="120",
+                CHAT_VISION_RECOVERY_MAX_ASSETS="7",
+            ),
+        )
+
+    def test_recovery_config_rejects_nonpositive_values(self) -> None:
+        self.assertEqual(
+            (900, 20),
+            self._probe(
+                CHAT_VISION_RECOVERY_WINDOW_SECONDS="0",
+                CHAT_VISION_RECOVERY_MAX_ASSETS="-7",
+            ),
+        )
+
+    def test_recovery_config_rejects_non_integer_values(self) -> None:
+        self.assertEqual(
+            (900, 20),
+            self._probe(
+                CHAT_VISION_RECOVERY_WINDOW_SECONDS="recent",
+                CHAT_VISION_RECOVERY_MAX_ASSETS="many",
+            ),
+        )
+
+    def test_recovery_config_clamps_values_above_hard_limits(self) -> None:
+        self.assertEqual(
+            (1800, 100),
+            self._probe(
+                CHAT_VISION_RECOVERY_WINDOW_SECONDS="999999999",
+                CHAT_VISION_RECOVERY_MAX_ASSETS="999999999",
+            ),
+        )
 
 
 class FakeDriver:
@@ -500,11 +714,13 @@ class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         driver = FakeDriver()
         store = MagicMock()
         steps: list[str] = []
+        recovery_kwargs: list[dict[str, object]] = []
         store_factory = MagicMock(side_effect=lambda path: steps.append("init") or store)
         store.recover_interrupted_claims.side_effect = lambda: steps.append("reset")
 
         async def recover(*args: object, **kwargs: object) -> None:
             steps.append("recover")
+            recovery_kwargs.append(kwargs)
 
         async def cleanup(*args: object, **kwargs: object) -> None:
             steps.append("cleanup")
@@ -517,10 +733,13 @@ class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             chat_archive_path=Path("chat_archive.db"),
             chat_vision_enabled=True,
             chat_vision_max_retries=3,
+            chat_vision_recovery_window_seconds=900,
+            chat_vision_recovery_max_assets=20,
             chat_vision_root=Path("images"),
         )
         with (
             patch.object(lifecycle, "get_driver", return_value=driver),
+            patch.object(lifecycle, "_now_timestamp", return_value=2_000_000_000),
             patch.object(lifecycle, "CONFIG", config),
             patch.object(lifecycle, "ChatVisionStore", new=store_factory),
             patch.object(lifecycle, "recover_pending", new=recover),
@@ -534,6 +753,16 @@ class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["init", "reset", "recover", "cleanup", "worker"], steps)
         store_factory.assert_called_once_with(config.chat_archive_path)
+        self.assertEqual(
+            [
+                {
+                    "max_retries": 3,
+                    "min_event_time": 1_999_999_100,
+                    "max_assets": 20,
+                }
+            ],
+            recovery_kwargs,
+        )
 
     async def test_disabled_startup_initializes_and_cleans_without_recovery(self) -> None:
         driver = FakeDriver()

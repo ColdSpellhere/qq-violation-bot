@@ -25,6 +25,20 @@ if TYPE_CHECKING:
 STORE: ChatVisionStore | None = None
 _PROCESS_CONCURRENCY = 3
 _RECOVERY_BATCH_SIZE = 50
+_LIVE_EVENT_FUTURE_SKEW_SECONDS = 5 * 60
+
+
+def _now_timestamp() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def live_event_time_allowed(event_time: int) -> bool:
+    now = _now_timestamp()
+    return (
+        now - CONFIG.chat_vision_recovery_window_seconds
+        <= event_time
+        <= now + _LIVE_EVENT_FUTURE_SKEW_SECONDS
+    )
 
 
 def set_store(store: ChatVisionStore) -> None:
@@ -229,6 +243,10 @@ async def _finish_claim(store: ChatVisionStore, asset: ChatImageAsset) -> None:
         store.mark_ready(asset.id, description)
     except Exception as exc:
         error_type = type(exc).__name__
+        if getattr(exc, "retryable", True) is False:
+            stable_code = str(getattr(exc, "code", "") or "").strip()
+            if stable_code:
+                error_type = stable_code
         try:
             store.mark_failed(asset.id, error_type)
         except Exception as mark_exc:
@@ -258,6 +276,13 @@ async def process_image_event(event: GroupMessageEvent) -> list[ChatImageAsset]:
     store = _active_store()
     group_id = int(event.group_id)
     message_id = str(event.message_id)
+    event_time = int(event.time)
+    if not live_event_time_allowed(event_time):
+        logger.warning(
+            "群聊图片事件时间超出实时处理窗口 "
+            f"group_id={group_id} message_id={message_id}"
+        )
+        return store.for_message(group_id, message_id)
     pending: list[ChatImageAsset] = []
     for ordinal, source_url in _image_segments(event):
         try:
@@ -266,7 +291,7 @@ async def process_image_event(event: GroupMessageEvent) -> list[ChatImageAsset]:
                 message_id,
                 ordinal,
                 source_url,
-                int(event.time),
+                event_time,
             )
             pending.append(asset)
         except Exception as exc:
@@ -292,13 +317,22 @@ async def recover_pending(
     *,
     max_retries: int,
     batch_size: int = _RECOVERY_BATCH_SIZE,
+    min_event_time: int | None = None,
+    max_assets: int | None = None,
 ) -> None:
     after_id = 0
+    processed = 0
     while True:
+        if max_assets is not None and processed >= max_assets:
+            return
+        limit = batch_size
+        if max_assets is not None:
+            limit = min(limit, max_assets - processed)
         assets = store.claimable(
             max_retries,
             after_id=after_id,
-            limit=batch_size,
+            limit=limit,
+            min_event_time=min_event_time,
         )
         if not assets:
             return
@@ -316,4 +350,5 @@ async def recover_pending(
                     )
 
         await asyncio.gather(*(process(asset) for asset in assets))
+        processed += len(assets)
         after_id = max(asset.id for asset in assets)

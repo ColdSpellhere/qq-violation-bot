@@ -13,6 +13,8 @@ class ContextMessageLike(Protocol):
     reply_message_id: str | None
     replied_to_user_id: str | None
     image_descriptions: tuple[str, ...]
+    is_bot: bool
+    is_peer_bot: bool
 
 
 class MemberProfileLike(Protocol):
@@ -71,6 +73,9 @@ class ChatPromptInput:
     image_descriptions: tuple[str, ...]
     current: ContextMessageLike
     addressed: bool
+    required_reply: bool = False
+    web_search_data: tuple[str, ...] = ()
+    web_search_failed: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in {"group", "private"}:
@@ -113,6 +118,14 @@ class ChatPromptInput:
             raise ValueError("relationship must be RelationshipState or None")
         if type(self.addressed) is not bool:
             raise ValueError("addressed must be bool")
+        if type(self.required_reply) is not bool:
+            raise ValueError("required_reply must be bool")
+        if type(self.web_search_data) is not tuple or not all(
+            type(item) is str for item in self.web_search_data
+        ):
+            raise ValueError("web_search_data must be a text tuple")
+        if type(self.web_search_failed) is not bool:
+            raise ValueError("web_search_failed must be bool")
 
 
 @dataclass(frozen=True)
@@ -124,6 +137,7 @@ class PromptBudget:
     relationship_chars: int = 600
     topics_chars: int = 400
     images_chars: int = 2000
+    web_search_chars: int = 4000
     current_chars: int = 2000
     total_chars: int = 12000
 
@@ -144,6 +158,7 @@ class TruncationCounters:
     topics_chars_removed: int = 0
     images_removed: int = 0
     images_chars_removed: int = 0
+    web_search_chars_removed: int = 0
     current_chars_removed: int = 0
 
 
@@ -161,6 +176,8 @@ class BudgetedPromptData:
     relationship: str
     open_topics: tuple[str, ...]
     image_descriptions: tuple[str, ...]
+    web_search_data: tuple[str, ...]
+    web_search_failed: bool
     current: str
     current_text: str
     current_message_id: str
@@ -173,6 +190,7 @@ class BudgetedPromptData:
     current_at_speaker_refs: tuple[str, ...]
     current_reply_author_ref: str | None
     addressed: bool
+    required_reply: bool
     truncation: TruncationCounters
     safety_required: bool = True
     direction_required: bool = True

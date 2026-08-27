@@ -13,6 +13,7 @@ from .models import (
     TruncationCounters,
 )
 from .speakers import build_speaker_directory
+from .sanitize import neutralize_role_markers
 
 
 def _clip(value: str, limit: int) -> tuple[str, int]:
@@ -31,7 +32,14 @@ def _context_text(item: ContextMessageLike, speaker_ref: str) -> str:
             "at_targets": item.at_user_ids,
             "reply_message_id": item.reply_message_id,
             "reply_author_qq": item.replied_to_user_id,
-            "text": item.text,
+            "speaker_role": (
+                "assistant_history"
+                if getattr(item, "is_bot", False)
+                else "peer_bot"
+                if getattr(item, "is_peer_bot", False)
+                else "group_member"
+            ),
+            "text": neutralize_role_markers(item.text),
             "images": item.image_descriptions,
         },
         ensure_ascii=False,
@@ -120,6 +128,7 @@ def prompt_data_chars(data: BudgetedPromptData) -> int:
             len(data.relationship),
             sum(map(len, data.open_topics)),
             sum(map(len, data.image_descriptions)),
+            sum(map(len, data.web_search_data)),
             len(data.current),
         )
     )
@@ -136,7 +145,8 @@ def apply_prompt_budget(
     source: ChatPromptInput, budget: PromptBudget = PromptBudget()
 ) -> BudgetedPromptData:
     persona, persona_removed = _clip(source.persona, budget.persona_chars)
-    current, current_removed = _clip(source.current.text, budget.current_chars)
+    safe_current = neutralize_role_markers(source.current.text)
+    current, current_removed = _clip(safe_current, budget.current_chars)
 
     directory = build_speaker_directory(
         current=source.current,
@@ -200,6 +210,9 @@ def apply_prompt_budget(
     images, images_count_removed, images_chars_removed = _fit_sequence(
         raw_images, budget.images_chars
     )
+    searches, _, search_chars_removed = _fit_sequence(
+        source.web_search_data, budget.web_search_chars
+    )
 
     data = BudgetedPromptData(
         mode=source.mode,
@@ -214,6 +227,8 @@ def apply_prompt_budget(
         relationship=relationship,
         open_topics=topics,
         image_descriptions=images,
+        web_search_data=searches,
+        web_search_failed=source.web_search_failed,
         current=current,
         current_text=current,
         current_message_id=source.current.message_id,
@@ -232,6 +247,7 @@ def apply_prompt_budget(
             source.current.replied_to_user_id or ""
         ),
         addressed=source.addressed,
+        required_reply=source.required_reply,
         truncation=TruncationCounters(
             persona_chars_removed=persona_removed,
             context_messages_removed=count_removed,
@@ -242,27 +258,13 @@ def apply_prompt_budget(
             topics_chars_removed=topics_chars_removed,
             images_removed=images_count_removed,
             images_chars_removed=images_chars_removed,
+            web_search_chars_removed=search_chars_removed,
             current_chars_removed=current_removed,
         ),
     )
 
-    while data.context and prompt_data_chars(data) > budget.total_chars:
-        removed = data.context[0]
-        counters = replace(
-            data.truncation,
-            context_messages_removed=data.truncation.context_messages_removed + 1,
-            context_chars_removed=data.truncation.context_chars_removed + len(removed),
-        )
-        data = replace(
-            data,
-            context=data.context[1:],
-            context_message_ids=data.context_message_ids[1:],
-            context_speaker_refs=data.context_speaker_refs[1:],
-            truncation=counters,
-        )
-        data = _prune_speakers(data)
-
     for field, counter_chars, counter_items in (
+        ("web_search_data", "web_search_chars_removed", None),
         ("image_descriptions", "images_chars_removed", "images_removed"),
         ("open_topics", "topics_chars_removed", "topics_removed"),
         ("facts", "facts_chars_removed", None),
@@ -288,6 +290,22 @@ def apply_prompt_budget(
             data = replace(data, fact_speaker_refs=data.fact_speaker_refs[: len(trimmed)])
         data = _prune_speakers(data)
 
+    while len(data.context) > 2 and prompt_data_chars(data) > budget.total_chars:
+        removed = data.context[0]
+        counters = replace(
+            data.truncation,
+            context_messages_removed=data.truncation.context_messages_removed + 1,
+            context_chars_removed=data.truncation.context_chars_removed + len(removed),
+        )
+        data = replace(
+            data,
+            context=data.context[1:],
+            context_message_ids=data.context_message_ids[1:],
+            context_speaker_refs=data.context_speaker_refs[1:],
+            truncation=counters,
+        )
+        data = _prune_speakers(data)
+
     for field, counter in (
         ("relationship", "relationship_chars_removed"),
         ("persona", "persona_chars_removed"),
@@ -306,6 +324,22 @@ def apply_prompt_budget(
                 **{counter: getattr(data.truncation, counter) + removed},
             ),
         )
+
+    while data.context and prompt_data_chars(data) > budget.total_chars:
+        removed = data.context[0]
+        counters = replace(
+            data.truncation,
+            context_messages_removed=data.truncation.context_messages_removed + 1,
+            context_chars_removed=data.truncation.context_chars_removed + len(removed),
+        )
+        data = replace(
+            data,
+            context=data.context[1:],
+            context_message_ids=data.context_message_ids[1:],
+            context_speaker_refs=data.context_speaker_refs[1:],
+            truncation=counters,
+        )
+        data = _prune_speakers(data)
 
     excess = prompt_data_chars(data) - budget.total_chars
     if excess > 0:

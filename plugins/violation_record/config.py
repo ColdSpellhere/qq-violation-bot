@@ -15,6 +15,8 @@ from plugins.runtime_paths import (
 
 
 BASE_DIR = INSTANCE_ROOT
+_CHAT_VISION_RECOVERY_WINDOW_SECONDS_LIMIT = 30 * 60
+_CHAT_VISION_RECOVERY_MAX_ASSETS_LIMIT = 100
 
 
 def _int_env(name: str, default: int) -> int:
@@ -25,6 +27,11 @@ def _int_env(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _bounded_positive_int_env(name: str, default: int, maximum: int) -> int:
+    value = _int_env(name, default)
+    return min(value, maximum) if value > 0 else default
 
 
 def _float_env(name: str, default: float) -> float:
@@ -66,6 +73,14 @@ def _string_id_tuple_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]
     if not values or any(not item.isdigit() or int(item) <= 0 for item in values):
         return default
     return tuple(str(item) for item in sorted({int(item) for item in values}))
+
+
+def _text_tuple_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    values = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return tuple(dict.fromkeys(values)) or default
 
 
 def _target_group_id_env() -> int:
@@ -146,6 +161,16 @@ class AppConfig:
     chat_vision_max_bytes: int = max(1, _int_env("CHAT_VISION_MAX_BYTES", 10 * 1024 * 1024))
     chat_vision_timeout: int = max(1, _int_env("CHAT_VISION_TIMEOUT", 60))
     chat_vision_max_retries: int = max(1, _int_env("CHAT_VISION_MAX_RETRIES", 3))
+    chat_vision_recovery_window_seconds: int = _bounded_positive_int_env(
+        "CHAT_VISION_RECOVERY_WINDOW_SECONDS",
+        900,
+        _CHAT_VISION_RECOVERY_WINDOW_SECONDS_LIMIT,
+    )
+    chat_vision_recovery_max_assets: int = _bounded_positive_int_env(
+        "CHAT_VISION_RECOVERY_MAX_ASSETS",
+        20,
+        _CHAT_VISION_RECOVERY_MAX_ASSETS_LIMIT,
+    )
     mute_enabled: bool = _bool_env("MUTE_ENABLED", False)
     deduction_policy_v102_enabled: bool = _bool_env(
         "DEDUCTION_POLICY_V102_ENABLED", False
@@ -165,8 +190,26 @@ class AppConfig:
     random_chat_probability: float = min(
         1.0, max(0.0, _float_env("RANDOM_CHAT_PROBABILITY", 0.05))
     )
+    chat_context_messages: int = _bounded_int_env(
+        "CHAT_CONTEXT_MESSAGES", 20, 5, 60
+    )
+    chat_context_minutes: int = _bounded_int_env(
+        "CHAT_CONTEXT_MINUTES", 30, 5, 180
+    )
+    chat_context_self_messages: int = _bounded_int_env(
+        "CHAT_CONTEXT_SELF_MESSAGES", 3, 0, 10
+    )
     random_chat_direct_fallback_enabled: bool = _bool_env(
         "RANDOM_CHAT_DIRECT_FALLBACK_ENABLED", False
+    )
+    protected_chat_user_ids: tuple[str, ...] = _string_id_tuple_env(
+        "PROTECTED_CHAT_USER_IDS", ()
+    )
+    protected_chat_aliases: tuple[str, ...] = _text_tuple_env(
+        "PROTECTED_CHAT_ALIASES", ()
+    )
+    peer_bot_user_ids: tuple[str, ...] = _string_id_tuple_env(
+        "PEER_BOT_USER_IDS", ()
     )
     random_chat_sticker_probability: float = min(
         1.0, max(0.0, _float_env("RANDOM_CHAT_STICKER_PROBABILITY", 0.20))
@@ -206,6 +249,13 @@ class AppConfig:
     memory_governance_enabled: bool = _bool_env("MEMORY_GOVERNANCE_ENABLED", False)
     llm_gateway_enabled: bool = _bool_env("LLM_GATEWAY_ENABLED", False)
     prompt_builder_enabled: bool = _bool_env("PROMPT_BUILDER_ENABLED", False)
+    web_search_enabled: bool = _bool_env("WEB_SEARCH_ENABLED", False)
+    tavily_api_key: str = os.getenv("TAVILY_API_KEY", "").strip()
+    web_search_timeout: int = _bounded_int_env("WEB_SEARCH_TIMEOUT", 8, 1, 30)
+    web_search_max_results: int = _bounded_int_env("WEB_SEARCH_MAX_RESULTS", 5, 1, 5)
+    web_search_max_context_chars: int = _bounded_int_env(
+        "WEB_SEARCH_MAX_CONTEXT_CHARS", 4000, 500, 8000
+    )
     llm_gateway_vision_enabled: bool = _bool_env(
         "LLM_GATEWAY_VISION_ENABLED", False
     )

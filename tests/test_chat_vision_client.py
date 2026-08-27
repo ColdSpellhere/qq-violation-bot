@@ -131,6 +131,32 @@ class ChatVisionClientTests(unittest.IsolatedAsyncioTestCase):
 
         self._assert_redacted(raised.exception)
 
+    async def test_legacy_payment_required_is_precise_and_non_retryable(self):
+        request = httpx.Request("POST", "https://api.deepseek.com/v1/chat/completions")
+        response = httpx.Response(402, request=request)
+        legacy_response = _Response(
+            error=httpx.HTTPStatusError(
+                "sensitive provider balance detail",
+                request=request,
+                response=response,
+            )
+        )
+        legacy_response.status_code = 402
+        _Client.response = legacy_response
+
+        with (
+            patch("plugins.chat_vision.client.httpx.AsyncClient", _Client),
+            self.assertRaisesRegex(
+                ChatVisionAIError,
+                "^GatewayPaymentRequiredError$",
+            ) as raised,
+        ):
+            await self._call()
+
+        self.assertEqual("payment_required", raised.exception.code)
+        self.assertFalse(raised.exception.retryable)
+        self._assert_redacted(raised.exception)
+
     async def test_malformed_json_raises_redacted_json_decode_error(self):
         _Client.response = _Response(
             json_error=json.JSONDecodeError(

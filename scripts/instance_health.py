@@ -8,9 +8,15 @@ import re
 import subprocess
 from typing import Callable
 
+try:
+    from scripts.deploy_instance import DeploymentError, verify_release
+except ImportError:
+    from deploy_instance import DeploymentError, verify_release
+
 
 INSTANCES = frozenset({"carrot", "kona"})
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+DEFAULT_REPOSITORY = Path("/opt/qq-bots/repository.git")
 
 
 def validate_runtime_state(instance: str, path: Path) -> None:
@@ -44,13 +50,25 @@ def current_invocation_logs(
     return run("journalctl", f"_SYSTEMD_INVOCATION_ID={invocation_id}", "--no-pager")
 
 
-def verify(instance: str, sha: str, root: Path) -> None:
+def verify(
+    instance: str,
+    sha: str,
+    root: Path,
+    *,
+    repo: Path = DEFAULT_REPOSITORY,
+) -> None:
     if instance not in INSTANCES or SHA_RE.fullmatch(sha) is None:
         raise ValueError("invalid instance or sha")
-    instance_root = Path(root) / "instances" / instance
+    root = Path(root)
+    instance_root = root / "instances" / instance
     current = instance_root / "current"
-    if not current.is_symlink() or current.resolve().name != sha:
+    expected_release = (root / "releases" / sha).resolve()
+    if not current.is_symlink() or current.resolve() != expected_release:
         raise RuntimeError("instance release pointer does not match requested sha")
+    try:
+        verify_release(Path(repo), expected_release, sha)
+    except DeploymentError as exc:
+        raise RuntimeError(str(exc)) from exc
     if _run("systemctl", "is-active", f"qqbot@{instance}.service").strip() != "active":
         raise RuntimeError("service is not active")
     values: dict[str, str] = {}
@@ -78,8 +96,9 @@ def main() -> int:
     parser.add_argument("--instance", choices=sorted(INSTANCES), required=True)
     parser.add_argument("--sha", required=True)
     parser.add_argument("--root", type=Path, default=Path("/opt/qq-bots"))
+    parser.add_argument("--repo", type=Path, default=DEFAULT_REPOSITORY)
     args = parser.parse_args()
-    verify(args.instance, args.sha, args.root)
+    verify(args.instance, args.sha, args.root, repo=args.repo)
     return 0
 
 

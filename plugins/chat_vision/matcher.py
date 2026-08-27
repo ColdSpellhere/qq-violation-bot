@@ -7,7 +7,7 @@ from nonebot.rule import Rule
 from plugins.feature_control.runtime import FEATURES
 from plugins.violation_record.config import CONFIG
 
-from .service import process_image_event
+from .service import live_event_time_allowed, process_image_event
 
 
 def chat_image_candidate(event: Event) -> bool:
@@ -16,6 +16,7 @@ def chat_image_candidate(event: Event) -> bool:
         and isinstance(event, GroupMessageEvent)
         and int(event.user_id) != int(event.self_id)
         and FEATURES.group_chat_allowed(int(event.group_id))
+        and live_event_time_allowed(int(event.time))
     )
 
 

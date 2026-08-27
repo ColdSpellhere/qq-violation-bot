@@ -17,6 +17,7 @@ FEATURES = FeatureController(
         memory_governance_enabled=CONFIG.memory_governance_enabled,
         llm_gateway_enabled=CONFIG.llm_gateway_enabled,
         prompt_builder_enabled=CONFIG.prompt_builder_enabled,
+        web_search_enabled=CONFIG.web_search_enabled,
         llm_gateway_vision_enabled=CONFIG.llm_gateway_vision_enabled,
         llm_gateway_private_memory_enabled=CONFIG.llm_gateway_private_memory_enabled,
         llm_gateway_member_memory_enabled=CONFIG.llm_gateway_member_memory_enabled,

@@ -13,6 +13,7 @@ _SWITCH_COMMANDS = {
     "/记忆治理": ("memory_governance_enabled", "记忆治理"),
     "/模型网关": ("llm_gateway_enabled", "模型网关"),
     "/提示构建": ("prompt_builder_enabled", "提示构建"),
+    "/联网搜索": ("web_search_enabled", "联网搜索"),
 }
 _GATEWAY_DOMAIN_COMMANDS = {
     "视觉": ("llm_gateway_vision_enabled", "模型网关视觉调用"),
@@ -86,6 +87,7 @@ def _status(controller: FeatureController) -> str:
             f"模型网关聊天调用：{_switch_text(state.llm_gateway_chat_enabled)}",
             f"模型网关业务调用：{gateway_business_status}",
             f"提示构建：{_switch_text(state.prompt_builder_enabled)}",
+            f"联网搜索：{_switch_text(state.web_search_enabled)}",
         )
     )
 

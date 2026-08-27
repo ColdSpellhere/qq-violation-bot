@@ -11,6 +11,7 @@ from plugins.llm_gateway.errors import (
     GatewayConfigurationError,
     GatewayContractError,
     GatewayEmptyContentError,
+    GatewayPaymentRequiredError,
     GatewayRateLimitError,
     GatewayServerError,
     GatewayTimeout,
@@ -340,6 +341,7 @@ class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             (GatewayConfigurationError(), "configuration_error", True),
             (GatewayAuthenticationError(), "auth_error", False),
+            (GatewayPaymentRequiredError(status_code=402), "payment_required", False),
             (GatewayTimeout(), "request_timeout", True),
             (GatewayTransportError(), "transport_error", True),
             (GatewayRateLimitError(), "rate_limited", True),
@@ -362,6 +364,14 @@ class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
                     await ai.summarize_private_conversation("", (_message(),))
             self.assertEqual(code, raised.exception.code)
             self.assertEqual(retryable, raised.exception.retryable)
+
+    def test_legacy_payment_required_keeps_queue_safe_non_retryable_code(self) -> None:
+        from plugins.private_memory import ai
+
+        error = ai._classify_http_status(402)
+
+        self.assertEqual("payment_required", error.code)
+        self.assertFalse(error.retryable)
 
     async def test_relationship_rejects_unknown_and_over_budget_gateway_output(self) -> None:
         from plugins.private_memory import ai

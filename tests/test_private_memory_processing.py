@@ -98,6 +98,191 @@ class PrivateMemoryProcessorTests(unittest.IsolatedAsyncioTestCase):
             (fact.fact_text, fact.source_message_id, fact.source_quote) for fact in facts
         ])
 
+    async def test_facts_never_use_pure_image_placeholder_as_source(self) -> None:
+        from plugins.private_memory.models import PrivateFactCandidate
+
+        self.store.append_user_message(
+            user_id="200",
+            message_id="image-1",
+            text="[图片]",
+            event_time=1,
+            source_kind="image",
+            image_descriptions=("一张私人图片",),
+        )
+        through = self.append("text-2", "继续聊", 2)
+        extract = AsyncMock(
+            return_value=(
+                PrivateFactCandidate(
+                    "200",
+                    "用户发送过图片",
+                    "image-1",
+                    "[图片]",
+                ),
+            )
+        )
+        processor = self.processor(extract=extract)
+
+        self.assertTrue(
+            await processor.process(_job("private_facts", watermark=through))
+        )
+
+        messages = extract.await_args.args[0]
+        self.assertEqual(["text-2"], [message.message_id for message in messages])
+        self.assertEqual((), self.store.active_facts(user_id="200", limit=10))
+
+    async def test_facts_keep_real_text_from_mixed_text_image_message(self) -> None:
+        from plugins.private_memory.models import PrivateFactCandidate
+
+        through = self.store.append_user_message(
+            user_id="200",
+            message_id="mixed-1",
+            text="我喜欢月季",
+            event_time=1,
+            source_kind="text_image",
+            image_descriptions=("一张花朵图片",),
+        )
+        extract = AsyncMock(
+            return_value=(
+                PrivateFactCandidate(
+                    "200",
+                    "喜欢月季",
+                    "mixed-1",
+                    "我喜欢月季",
+                ),
+            )
+        )
+        processor = self.processor(extract=extract)
+
+        self.assertTrue(
+            await processor.process(_job("private_facts", watermark=through))
+        )
+
+        facts = self.store.active_facts(user_id="200", limit=10)
+        self.assertEqual(["喜欢月季"], [fact.fact_text for fact in facts])
+
+    async def test_summary_excludes_image_turn_and_its_derived_assistant_reply(
+        self,
+    ) -> None:
+        self.store.append_user_message(
+            user_id="200",
+            message_id="image-1",
+            text="[图片]",
+            event_time=1,
+            source_kind="image",
+            image_descriptions=("一张私人图片",),
+        )
+        self.store.append_assistant_message(
+            user_id="200",
+            source_message_id="image-1",
+            bot_user_id="999",
+            text="图片派生回复不应进入摘要",
+            event_time=1,
+        )
+        through = self.append("text-2", "继续聊", 2)
+        summarize = AsyncMock(return_value="仅包含安全文字的摘要")
+        processor = self.processor(summarize=summarize)
+
+        self.assertTrue(
+            await processor.process(_job("private_summary", watermark=through))
+        )
+
+        _, messages = summarize.await_args.args
+        self.assertEqual(["text-2"], [message.message_id for message in messages])
+        summary = self.store.get_summary(user_id="200")
+        self.assertEqual(through, summary.summarized_through_id)
+
+    async def test_summary_keeps_mixed_user_text_but_excludes_its_assistant_reply(
+        self,
+    ) -> None:
+        self.store.append_user_message(
+            user_id="200",
+            message_id="mixed-1",
+            text="这张图是我养的月季",
+            event_time=1,
+            source_kind="text_image",
+            image_descriptions=("一张花朵图片",),
+        )
+        self.store.append_assistant_message(
+            user_id="200",
+            source_message_id="mixed-1",
+            bot_user_id="999",
+            text="图片派生回复不应进入摘要",
+            event_time=1,
+        )
+        through = self.append("text-2", "继续聊", 2)
+        summarize = AsyncMock(return_value="仅包含用户文字的摘要")
+        processor = self.processor(summarize=summarize)
+
+        self.assertTrue(
+            await processor.process(_job("private_summary", watermark=through))
+        )
+
+        _, messages = summarize.await_args.args
+        self.assertEqual(
+            ["mixed-1", "text-2"],
+            [message.message_id for message in messages],
+        )
+
+    async def test_relationship_never_uses_pure_image_placeholder(self) -> None:
+        from plugins.private_memory.ai import RelationshipCandidate
+
+        watermark = self.store.append_user_message(
+            user_id="200",
+            message_id="image-1",
+            text="[图片]",
+            event_time=1,
+            source_kind="image",
+            image_descriptions=("一张私人图片",),
+        )
+        update = AsyncMock(
+            return_value=RelationshipCandidate(
+                state_text="不应生成",
+                open_topics=("不应生成",),
+                preferred_address="",
+                communication_style="",
+            )
+        )
+        processor = self.processor(update_relationship=update)
+
+        self.assertFalse(
+            await processor.process(_job("relationship", watermark=watermark))
+        )
+
+        update.assert_not_awaited()
+        self.assertIsNone(
+            self.relationships.get_private(user_id="200", persona_id="radish-cat")
+        )
+
+    async def test_relationship_keeps_real_text_from_mixed_text_image_message(
+        self,
+    ) -> None:
+        from plugins.private_memory.ai import RelationshipCandidate
+
+        watermark = self.store.append_user_message(
+            user_id="200",
+            message_id="mixed-1",
+            text="下次继续聊月季",
+            event_time=1,
+            source_kind="text_image",
+            image_descriptions=("一张花朵图片",),
+        )
+        update = AsyncMock(
+            return_value=RelationshipCandidate(
+                state_text="愿意继续交流",
+                open_topics=("聊月季",),
+                preferred_address="",
+                communication_style="轻松",
+            )
+        )
+        processor = self.processor(update_relationship=update)
+
+        self.assertTrue(
+            await processor.process(_job("relationship", watermark=watermark))
+        )
+
+        messages = update.await_args.args[1]
+        self.assertEqual(["mixed-1"], [message.message_id for message in messages])
+
     async def test_private_relationship_uses_private_message_id_watermark(self) -> None:
         from plugins.private_memory.ai import RelationshipCandidate
 

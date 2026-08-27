@@ -26,6 +26,24 @@ class ChatVisionStoreTests(unittest.TestCase):
         self.assertEqual([1, 2], [item.ordinal for item in store.for_message(100, "m1")])
         self.assertEqual(2, second.ordinal)
 
+    def test_ensure_pending_rejects_non_positive_group_before_insert(self) -> None:
+        store = ChatVisionStore(self.db_path)
+
+        for group_id in (0, -1):
+            with self.subTest(group_id=group_id):
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    store.ensure_pending(
+                        group_id,
+                        f"m{group_id}",
+                        1,
+                        "https://cdn.example/image.jpg",
+                        1000,
+                    )
+
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM chat_image_assets").fetchone()[0]
+        self.assertEqual(0, count)
+
     def test_schema_has_status_check_and_audit_timestamps(self) -> None:
         store = ChatVisionStore(self.db_path)
         asset = store.ensure_pending(
@@ -247,6 +265,68 @@ class ChatVisionStoreTests(unittest.TestCase):
         saved = store.for_message(100, "m1")[0]
         self.assertEqual("m1-1.jpg", saved.relative_path)
         self.assertEqual(2, saved.attempts)
+
+    def test_claimable_filters_old_and_nonretryable_failures(self) -> None:
+        store = ChatVisionStore(self.db_path)
+        old = store.ensure_pending(
+            100, "old", 1, "https://cdn.example/old.jpg", 1000
+        )
+        retryable = store.ensure_pending(
+            100, "retryable", 1, "https://cdn.example/retry.jpg", 2000
+        )
+        payment_code = store.ensure_pending(
+            100, "payment-code", 1, "https://cdn.example/payment.jpg", 2001
+        )
+        payment_class = store.ensure_pending(
+            100, "payment-class", 1, "https://cdn.example/payment2.jpg", 2002
+        )
+        pending = store.ensure_pending(
+            100, "pending", 1, "https://cdn.example/pending.jpg", 2003
+        )
+        for asset, error_type in (
+            (old, "server_error"),
+            (retryable, "server_error"),
+            (payment_code, "payment_required"),
+            (payment_class, "GatewayPaymentRequiredError"),
+        ):
+            self.assertIsNotNone(store.claim(asset.id, max_retries=3))
+            store.mark_failed(asset.id, error_type)
+
+        claimable = store.claimable(max_retries=3, min_event_time=2000)
+
+        self.assertEqual([retryable.id, pending.id], [asset.id for asset in claimable])
+
+    def test_nonretryable_failure_cannot_be_claimed_directly(self) -> None:
+        store = ChatVisionStore(self.db_path)
+
+        for ordinal, error_type in enumerate(
+            ("payment_required", "GatewayPaymentRequiredError"), start=1
+        ):
+            asset = store.ensure_pending(
+                100,
+                f"payment-{ordinal}",
+                ordinal,
+                "https://cdn.example/payment.jpg",
+                2000,
+            )
+            self.assertIsNotNone(store.claim(asset.id, max_retries=3))
+            store.mark_failed(asset.id, error_type)
+
+            self.assertIsNone(store.claim(asset.id, max_retries=3))
+
+    def test_legacy_non_positive_group_is_not_claimable(self) -> None:
+        store = ChatVisionStore(self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "INSERT INTO chat_image_assets("
+                "group_id,message_id,ordinal,source_url,event_time,status,attempts"
+                ") VALUES(0,'legacy-private',1,'https://cdn.example/image.jpg',"
+                "2000,'pending',0)"
+            )
+            asset_id = int(cursor.lastrowid)
+
+        self.assertEqual([], store.claimable(max_retries=3, min_event_time=1000))
+        self.assertIsNone(store.claim(asset_id, max_retries=3))
 
     def test_second_store_constructor_does_not_reset_active_claim(self) -> None:
         first_store = ChatVisionStore(self.db_path)

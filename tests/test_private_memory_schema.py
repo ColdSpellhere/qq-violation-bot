@@ -60,6 +60,10 @@ EXPECTED_MEMBER_FACT_COLUMNS = {
     "deleted_at",
 }
 
+EXPECTED_PRIVATE_MESSAGE_COLUMNS = {
+    "image_descriptions_json",
+}
+
 
 def object_sql(database: Path, kind: str, name: str) -> str:
     with closing(sqlite3.connect(database)) as connection:
@@ -80,6 +84,7 @@ class PrivateMemorySchemaTests(unittest.TestCase):
     def test_empty_database_gets_exact_schema_constraints_and_indexes(self) -> None:
         report = migrate(self.database)
 
+        self.assertEqual(3, PRIVATE_MEMORY_SCHEMA_VERSION)
         self.assertEqual(PRIVATE_MEMORY_SCHEMA_VERSION, report.schema_version)
         with closing(sqlite3.connect(self.database)) as connection:
             tables = {
@@ -104,6 +109,16 @@ class PrivateMemorySchemaTests(unittest.TestCase):
                 if int(row[2]) == 1
             }
         self.assertTrue(EXPECTED_UNIQUE_INDEXES <= unique_indexes)
+        with closing(sqlite3.connect(self.database)) as connection:
+            private_message_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(private_chat_messages)"
+                )
+            }
+        self.assertTrue(
+            EXPECTED_PRIVATE_MESSAGE_COLUMNS <= private_message_columns
+        )
         self.assertIn("CHECK(direction IN ('user','assistant'))", object_sql(
             self.database, "table", "private_chat_messages"
         ))
@@ -349,6 +364,73 @@ class PrivateMemorySchemaTests(unittest.TestCase):
         self.assertEqual("sentinel", meta_updated_at)
         self.assertEqual(legacy_columns, preserved_columns)
         self.assertEqual(legacy_rows, preserved_rows)
+
+    def test_v2_private_messages_gain_image_descriptions_idempotently(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE private_chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    direction TEXT NOT NULL CHECK(direction IN ('user','assistant')),
+                    text TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    event_time INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    purged_at TEXT,
+                    source_kind TEXT NOT NULL,
+                    source_message_id TEXT,
+                    UNIQUE(user_id,direction,message_id)
+                );
+                CREATE TABLE private_memory_schema_meta (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO private_memory_schema_meta
+                    (singleton,schema_version,updated_at)
+                VALUES(1,2,'v2-sentinel');
+                INSERT INTO private_chat_messages(
+                    user_id,message_id,direction,text,content_hash,event_time,
+                    created_at,expires_at,purged_at,source_kind,source_message_id
+                ) VALUES(
+                    '200','legacy-private','user','旧私聊正文','legacy-hash',1,
+                    '2026-08-22T00:00:00Z','2026-09-22T00:00:00Z',NULL,'text',NULL
+                );
+                """
+            )
+            connection.commit()
+
+        first = migrate(self.database)
+        second = migrate(self.database)
+
+        self.assertEqual(3, first.schema_version)
+        self.assertEqual(1, first.columns_added)
+        self.assertEqual(0, second.columns_added)
+        with closing(sqlite3.connect(self.database)) as connection:
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(private_chat_messages)"
+                )
+            }
+            row = connection.execute(
+                """
+                SELECT user_id,message_id,text,content_hash,image_descriptions_json
+                FROM private_chat_messages WHERE message_id='legacy-private'
+                """
+            ).fetchone()
+            version = connection.execute(
+                "SELECT schema_version FROM private_memory_schema_meta WHERE singleton=1"
+            ).fetchone()[0]
+        self.assertIn("image_descriptions_json", columns)
+        self.assertEqual(
+            ("200", "legacy-private", "旧私聊正文", "legacy-hash", "[]"),
+            row,
+        )
+        self.assertEqual(3, version)
 
     def test_migrate_rejects_failed_source_quick_check_before_schema_write(self) -> None:
         self.database.write_bytes(b"not a sqlite database")

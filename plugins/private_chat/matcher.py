@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from nonebot import logger, on_message
 from nonebot.adapters.onebot.v11 import (
     Bot,
@@ -16,11 +18,13 @@ from plugins.private_memory.models import RelationshipState
 from plugins.private_memory.relationship import RelationshipStore
 from plugins.private_memory.store import PrivateMemoryStore
 from plugins.random_chat.ai import RandomChatAIError, generate_reply
+from plugins.random_chat.delivery import deliver_replies
 from plugins.random_chat.stickers import choose_sticker
 from plugins.violation_record.config import CONFIG
 
 from .conversation import PrivateConversation
 from .policy import eligible_private_text
+from .vision import understand_private_images
 
 
 CONVERSATIONS: dict[str, PrivateConversation] = {}
@@ -181,8 +185,16 @@ def _enqueue_private_jobs(
 
 @private_matcher.handle()
 async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
-    text = eligible_private_text(event.get_plaintext())
+    plain_text = event.get_plaintext()
+    has_image = any(segment.type == "image" for segment in event.message)
+    text = eligible_private_text(plain_text, has_image=has_image)
     if text is None:
+        return
+    real_text = plain_text.strip()
+    vision_enabled = has_image and bool(
+        getattr(CONFIG, "chat_vision_enabled", False)
+    )
+    if has_image and not real_text and not vision_enabled:
         return
 
     user_id = str(event.user_id)
@@ -218,18 +230,20 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             message_id=str(event.message_id),
             user_id=str(event.user_id),
         )
+        if has_image:
+            source_kind = "text_image" if real_text else "image"
+        else:
+            source_kind = "text"
         try:
             user_event_state = conversation.append_user_state(
-                current, event_time=int(event.time)
+                current,
+                event_time=int(event.time),
+                source_kind=source_kind,
             )
         except Exception as exc:
             logger.warning(f"私聊用户消息持久化失败：{type(exc).__name__}")
             return
 
-        profiles: tuple[MemberProfile, ...] = ()
-        relationship = None
-        open_topics: tuple[str, ...] = ()
-        legacy_profiles: tuple[MemberProfile, ...] | None = None
         if persistent:
             if not _persistent_allowed(user_id):
                 return
@@ -250,15 +264,93 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                         and item.message_id == current.message_id
                     )
                 )
-            input_through_id = user_event_state.row_id
+
+        def current_event_is_live() -> bool:
+            if store is None or user_event_state is None:
+                return True
             try:
-                if user_event_state.created:
+                return store.user_event_is_live(
+                    user_id=user_id,
+                    message_id=str(event.message_id),
+                    row_id=user_event_state.row_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"私聊用户消息存活检查失败：{type(exc).__name__}"
+                )
+                return False
+
+        images = ()
+        descriptions: tuple[str, ...] = ()
+        if vision_enabled:
+            try:
+                vision = await understand_private_images(
+                    event.message,
+                    message_id=str(event.message_id),
+                    max_bytes=CONFIG.chat_vision_max_bytes,
+                    timeout=CONFIG.chat_vision_timeout,
+                    base_url=CONFIG.ai_base_url,
+                    api_key=CONFIG.ai_api_key,
+                    model=CONFIG.chat_vision_model,
+                )
+                images = vision.images
+                descriptions = vision.descriptions
+            except Exception as exc:
+                logger.warning(f"私聊图片理解失败：{type(exc).__name__}")
+
+        if not FEATURES.private_chat_allowed(user_id):
+            return
+        if persistent and not _persistent_allowed(user_id):
+            return
+        if not current_event_is_live():
+            return
+        if has_image and not real_text and not images and not descriptions:
+            return
+
+        if descriptions:
+            current = replace(current, image_descriptions=descriptions)
+            conversation.replace_user_turn(current)
+            if store is not None:
+                try:
+                    updated = store.update_user_image_descriptions(
+                        user_id=user_id,
+                        message_id=str(event.message_id),
+                        image_descriptions=descriptions,
+                        source_kind=source_kind,
+                    )
+                    if not updated:
+                        logger.warning("私聊图片描述持久化未更新")
+                        return
+                except Exception as exc:
+                    logger.warning(
+                        f"私聊图片描述持久化失败：{type(exc).__name__}"
+                    )
+                    return
+
+        if not FEATURES.private_chat_allowed(user_id):
+            return
+        if persistent and not _persistent_allowed(user_id):
+            return
+        if not current_event_is_live():
+            return
+
+        profiles: tuple[MemberProfile, ...] = ()
+        relationship = None
+        open_topics: tuple[str, ...] = ()
+        legacy_profiles: tuple[MemberProfile, ...] | None = None
+        if persistent:
+            assert store is not None
+            assert queue is not None
+            assert relationship_store is not None
+            assert user_event_state is not None
+            try:
+                if user_event_state.created and real_text:
                     _enqueue_private_jobs(
                         queue=queue,
                         store=store,
                         relationship_store=relationship_store,
                         user_id=user_id,
-                        input_through_id=input_through_id,
+                        input_through_id=user_event_state.row_id,
                     )
                 profiles = _private_profile(
                     store=store,
@@ -295,15 +387,20 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                 relationship=relationship,
                 open_topics=open_topics,
                 legacy_profiles=legacy_profiles,
+                max_messages=3,
+                images=images,
             )
         except RandomChatAIError as exc:
             logger.warning(f"私聊 AI 回复失败：{type(exc).__name__}")
             return
-        if not reply:
+        replies = (reply,) if isinstance(reply, str) else tuple(reply or ())
+        if not replies:
             return
         if not FEATURES.private_chat_allowed(user_id):
             return
         if persistent and not _persistent_allowed(user_id):
+            return
+        if not current_event_is_live():
             return
 
         try:
@@ -316,23 +413,39 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             logger.warning(f"私聊表情包选择失败：{type(exc).__name__}")
             sticker = None
 
-        message: str | Message = reply
-        if sticker is not None:
-            message = Message(reply)
+        def decorate(value: str) -> str | Message:
+            if sticker is None:
+                return value
+            message = Message(value)
             message += MessageSegment.image(file=f"file://{sticker}")
-        try:
-            await bot.send_private_msg(user_id=int(event.user_id), message=message)
-        except Exception as exc:
-            logger.warning(f"私聊消息发送失败：{type(exc).__name__}")
-            return
+            return message
 
-        assistant = ContextMessage(
-            "萝卜猫",
-            reply,
-            message_id=f"bot:{event.message_id}",
-            user_id=str(event.self_id),
-        )
-        try:
+        async def persist(value: str, index: int) -> None:
+            if not current_event_is_live():
+                raise RuntimeError("private message was cleared")
+            assistant = ContextMessage(
+                "机器人自己",
+                value,
+                message_id=f"bot:{event.message_id}:{index + 1}",
+                user_id=str(event.self_id),
+                is_bot=True,
+            )
             conversation.append_assistant(assistant, event_time=int(event.time))
-        except Exception as exc:
-            logger.warning(f"私聊助手消息持久化失败：{type(exc).__name__}")
+
+        async def send(message: object) -> None:
+            if not FEATURES.private_chat_allowed(user_id):
+                raise RuntimeError("private chat access changed")
+            if persistent and not _persistent_allowed(user_id):
+                raise RuntimeError("private memory access changed")
+            if not current_event_is_live():
+                raise RuntimeError("private message was cleared")
+            await bot.send_private_msg(user_id=int(event.user_id), message=message)
+
+        delivered = await deliver_replies(
+            replies[:3],
+            send=send,
+            decorate_final=decorate,
+            after_send=persist,
+        )
+        if not delivered:
+            logger.warning("私聊消息发送失败")

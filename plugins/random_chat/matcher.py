@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import TYPE_CHECKING
+import weakref
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
 
-from plugins.chat_archive.db import ContextMessage, archived_message_author, recent_text_context
+from plugins.chat_archive.db import (
+    ContextMessage,
+    archive_payload,
+    archived_message_author,
+    recent_text_context,
+)
 from plugins.feature_control.runtime import FEATURES
 from plugins.member_memory.store import load_profiles
 from plugins.violation_record.config import CONFIG
 
 from .ai import RandomChatAIError, generate_reply
+from .context import context_candidate_limit, select_chat_context
+from .delivery import deliver_replies
 from .stickers import choose_sticker
 
 if TYPE_CHECKING:
@@ -18,6 +28,18 @@ if TYPE_CHECKING:
 
 
 _RAW_REPLY_MAX_IMAGES = 4
+_GROUP_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _group_lock(self_id: int, group_id: int) -> asyncio.Lock:
+    key = f"{self_id}:{group_id}"
+    lock = _GROUP_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _GROUP_LOCKS[key] = lock
+    return lock
 
 
 def _reply_message_id(event: GroupMessageEvent) -> str | None:
@@ -36,17 +58,92 @@ def _reply_message_id(event: GroupMessageEvent) -> str | None:
     return None
 
 
+def _reply_sender_user_id(event: GroupMessageEvent) -> str | None:
+    if event.reply is None:
+        return None
+    value = getattr(getattr(event.reply, "sender", None), "user_id", None)
+    normalized = str(value or "").strip()
+    return normalized if normalized.isdigit() else None
+
+
+def _quoted_context(
+    event: GroupMessageEvent,
+    *,
+    message_id: str | None,
+    author_user_id: str | None,
+    image_descriptions: tuple[str, ...],
+) -> ContextMessage | None:
+    if event.reply is None or not message_id:
+        return None
+    reply_message = getattr(event.reply, "message", None)
+    text = (
+        str(reply_message.extract_plain_text()).strip()
+        if reply_message is not None and hasattr(reply_message, "extract_plain_text")
+        else ""
+    )
+    if not text and not image_descriptions:
+        return None
+    sender = getattr(event.reply, "sender", None)
+    nickname = str(
+        getattr(sender, "card", "")
+        or getattr(sender, "nickname", "")
+        or author_user_id
+        or "被引用消息"
+    ).strip()
+    at_user_ids = tuple(
+        str(segment.data.get("qq"))
+        for segment in (reply_message or ())
+        if segment.type == "at" and str(segment.data.get("qq") or "").isdigit()
+    )
+    return ContextMessage(
+        nickname=nickname,
+        text=text or "[图片]",
+        message_id=message_id,
+        user_id=author_user_id or "",
+        at_user_ids=at_user_ids,
+        image_descriptions=image_descriptions,
+        is_bot=str(author_user_id or "") == str(event.self_id),
+    )
+
+
 async def send_random_reply(
-    bot: Bot, event: GroupMessageEvent, text: str, *, addressed: bool = False
+    bot: Bot,
+    event: GroupMessageEvent,
+    text: str,
+    *,
+    addressed: bool = False,
+    required: bool = False,
 ) -> bool:
+    async with _group_lock(int(event.self_id), int(event.group_id)):
+        return await _send_random_reply_locked(
+            bot,
+            event,
+            text,
+            addressed=addressed,
+            required=required,
+        )
+
+
+async def _send_random_reply_locked(
+    bot: Bot,
+    event: GroupMessageEvent,
+    text: str,
+    *,
+    addressed: bool = False,
+    required: bool = False,
+) -> bool:
+    context_limit = getattr(CONFIG, "chat_context_messages", 20)
     try:
         context = recent_text_context(
             CONFIG.chat_archive_path,
             group_id=int(event.group_id),
-            since_epoch=int(event.time) - 1800,
-            limit=20,
+            since_epoch=int(event.time)
+            - (60 * getattr(CONFIG, "chat_context_minutes", 30)),
+            limit=context_candidate_limit(context_limit),
             exclude_message_id=str(event.message_id),
             bot_user_id=str(event.self_id),
+            include_bot_messages=True,
+            peer_bot_user_ids=getattr(CONFIG, "peer_bot_user_ids", ()),
         )
     except Exception as exc:
         logger.warning(f"随机闲聊读取上下文失败：{type(exc).__name__}")
@@ -131,23 +228,22 @@ async def send_random_reply(
         else:
             current_descriptions = ()
             images.clear()
-    replied_to_user_id = archived_message_author(
+    replied_to_user_id = _reply_sender_user_id(event) or archived_message_author(
         CONFIG.chat_archive_path,
         group_id=int(event.group_id),
         message_id=reply_message_id,
     )
-    if referenced_descriptions and not any(
+    if reply_message_id and not any(
         item.message_id == reply_message_id for item in context
     ):
-        context.append(
-            ContextMessage(
-                replied_to_user_id or "被引用消息",
-                "[图片]",
-                message_id=reply_message_id or "",
-                user_id=replied_to_user_id or "",
-                image_descriptions=referenced_descriptions,
-            )
+        quoted = _quoted_context(
+            event,
+            message_id=reply_message_id,
+            author_user_id=replied_to_user_id,
+            image_descriptions=referenced_descriptions,
         )
+        if quoted is not None:
+            context.append(quoted)
     current = ContextMessage(
         event.sender.card or event.sender.nickname or str(event.user_id),
         current_text,
@@ -158,11 +254,22 @@ async def send_random_reply(
         replied_to_user_id=replied_to_user_id,
         image_descriptions=current_descriptions,
     )
-    memory_context = [*context, current]
+    context = select_chat_context(
+        context,
+        limit=context_limit,
+        max_self_messages=getattr(CONFIG, "chat_context_self_messages", 3),
+        quoted_message_id=reply_message_id,
+        current_user_id=current.user_id,
+    )
+    memory_user_ids = [
+        current.user_id,
+        *(item for item in (replied_to_user_id, *at_user_ids) if item),
+        *(item.user_id for item in reversed(context)),
+    ]
     profiles = load_profiles(
         CONFIG.chat_archive_path,
         group_id=int(event.group_id),
-        user_ids=[item.user_id for item in memory_context],
+        user_ids=memory_user_ids,
         compact=True,
         include_summary=CONFIG.member_memory_summary_enabled,
     )
@@ -200,26 +307,76 @@ async def send_random_reply(
             current=current,
             profiles=profiles,
             addressed=addressed,
+            required_reply=required,
             images=images,
             relationship=relationship,
             open_topics=open_topics,
+            max_messages=3 if addressed or required else 1,
         )
     except RandomChatAIError as exc:
         logger.warning(f"随机闲聊 AI 回复失败：{exc}")
         return False
-    if reply:
+    replies = (reply,) if isinstance(reply, str) else tuple(reply or ())
+    if replies:
         try:
             sticker = choose_sticker(
                 CONFIG.random_chat_sticker_root,
                 special_filename=CONFIG.random_chat_special_sticker,
                 attachment_probability=CONFIG.random_chat_sticker_probability,
             )
-            message: str | Message = reply
-            if sticker is not None:
-                message = Message(reply)
+            def decorate(value: str) -> str | Message:
+                if sticker is None:
+                    return value
+                message = Message(value)
                 message += MessageSegment.image(file=f"file://{sticker}")
-            await bot.send_group_msg(group_id=int(event.group_id), message=message)
-            return True
+                return message
+
+            send_results: list[object] = []
+
+            async def send(message: object) -> None:
+                result = await bot.send_group_msg(
+                    group_id=int(event.group_id), message=message
+                )
+                send_results.append(result)
+
+            async def archive_reply(value: str, index: int) -> None:
+                result = send_results[index] if index < len(send_results) else None
+                message_id = (
+                    result.get("message_id")
+                    if isinstance(result, dict)
+                    else getattr(result, "message_id", None)
+                )
+                if message_id in (None, ""):
+                    return
+                try:
+                    archive_payload(
+                        CONFIG.chat_archive_path,
+                        int(event.group_id),
+                        {
+                            "message_id": str(message_id),
+                            "group_id": int(event.group_id),
+                            "event_time": int(time.time()),
+                            "user_id": str(event.self_id),
+                            "sender": {"nickname": "机器人自己"},
+                            "segments": [
+                                {"type": "text", "data": {"text": value}}
+                            ],
+                            "plaintext": value,
+                            "reply_message_id": str(event.message_id),
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"随机闲聊归档自身回复失败：{type(exc).__name__}"
+                    )
+
+            delivered = await deliver_replies(
+                replies[: (3 if addressed or required else 1)],
+                send=send,
+                decorate_final=decorate,
+                after_send=archive_reply,
+            )
+            return bool(delivered)
         except Exception as exc:
             logger.warning(f"随机闲聊群消息发送失败：{type(exc).__name__}")
     return False

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
@@ -36,6 +40,8 @@ class ContextMessage:
     reply_message_id: str | None = None
     replied_to_user_id: str | None = None
     image_descriptions: tuple[str, ...] = ()
+    is_bot: bool = False
+    is_peer_bot: bool = False
 
 
 def recent_text_context(
@@ -46,11 +52,18 @@ def recent_text_context(
     limit: int,
     exclude_message_id: str,
     bot_user_id: str,
+    include_bot_messages: bool = False,
+    peer_bot_user_ids: tuple[str, ...] = (),
 ) -> list[ContextMessage]:
     if not path.is_file() or limit <= 0:
         return []
     try:
         with sqlite3.connect(path) as conn:
+            boundary = conn.execute(
+                "SELECT rowid FROM chat_messages WHERE group_id=? AND message_id=?",
+                (group_id, exclude_message_id),
+            ).fetchone()
+            boundary_rowid = int(boundary[0]) if boundary is not None else None
             has_image_assets = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_image_assets'"
             ).fetchone()
@@ -63,7 +76,19 @@ def recent_text_context(
                     LEFT JOIN chat_messages AS replied
                       ON replied.message_id=m.reply_message_id AND replied.group_id=m.group_id
                     WHERE m.group_id=? AND m.event_time>=?
-                      AND m.message_id<>? AND m.user_id<>?
+                      AND m.message_id<>? AND (?=1 OR m.user_id<>?)
+                      AND (
+                          ? IS NULL OR m.rowid<?
+                          OR (
+                              m.user_id=? AND m.reply_message_id IS NOT NULL
+                              AND EXISTS (
+                                  SELECT 1 FROM chat_messages AS trigger
+                                  WHERE trigger.group_id=m.group_id
+                                    AND trigger.message_id=m.reply_message_id
+                                    AND trigger.rowid<?
+                              )
+                          )
+                      )
                       AND (
                           (trim(m.plaintext)<>'' AND substr(ltrim(m.plaintext),1,1)<>'/')
                           OR EXISTS (
@@ -72,10 +97,21 @@ def recent_text_context(
                                 AND asset.status='ready' AND trim(asset.description)<>''
                           )
                       )
-                    ORDER BY m.event_time DESC,m.message_id DESC
+                    ORDER BY m.event_time DESC,m.rowid DESC
                     LIMIT ?
                     """,
-                    (group_id, since_epoch, exclude_message_id, bot_user_id, limit),
+                    (
+                        group_id,
+                        since_epoch,
+                        exclude_message_id,
+                        int(include_bot_messages),
+                        bot_user_id,
+                        boundary_rowid,
+                        boundary_rowid,
+                        bot_user_id,
+                        boundary_rowid,
+                        limit,
+                    ),
                 ).fetchall()
                 descriptions = {
                     str(message_id): tuple(
@@ -101,16 +137,40 @@ def recent_text_context(
                     LEFT JOIN chat_messages AS replied
                       ON replied.message_id=m.reply_message_id AND replied.group_id=m.group_id
                     WHERE m.group_id=? AND m.event_time>=?
-                      AND m.message_id<>? AND m.user_id<>?
+                      AND m.message_id<>? AND (?=1 OR m.user_id<>?)
+                      AND (
+                          ? IS NULL OR m.rowid<?
+                          OR (
+                              m.user_id=? AND m.reply_message_id IS NOT NULL
+                              AND EXISTS (
+                                  SELECT 1 FROM chat_messages AS trigger
+                                  WHERE trigger.group_id=m.group_id
+                                    AND trigger.message_id=m.reply_message_id
+                                    AND trigger.rowid<?
+                              )
+                          )
+                      )
                       AND trim(m.plaintext)<>''
                       AND substr(ltrim(m.plaintext),1,1)<>'/'
-                    ORDER BY m.event_time DESC,m.message_id DESC
+                    ORDER BY m.event_time DESC,m.rowid DESC
                     LIMIT ?
                     """,
-                    (group_id, since_epoch, exclude_message_id, bot_user_id, limit),
+                    (
+                        group_id,
+                        since_epoch,
+                        exclude_message_id,
+                        int(include_bot_messages),
+                        bot_user_id,
+                        boundary_rowid,
+                        boundary_rowid,
+                        bot_user_id,
+                        boundary_rowid,
+                        limit,
+                    ),
                 ).fetchall()
                 descriptions = {}
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("chat context read failed error_class=%s", type(exc).__name__)
         return []
     context: list[ContextMessage] = []
     for message_id, user_id, sender_json, message_json, plaintext, reply_id, replied_user_id in reversed(rows):
@@ -147,6 +207,11 @@ def recent_text_context(
                     reply_message_id=str(reply_id) if reply_id else None,
                     replied_to_user_id=str(replied_user_id) if replied_user_id else None,
                     image_descriptions=image_descriptions,
+                    is_bot=str(user_id) == str(bot_user_id),
+                    is_peer_bot=(
+                        str(user_id) != str(bot_user_id)
+                        and str(user_id) in peer_bot_user_ids
+                    ),
                 )
             )
     return context

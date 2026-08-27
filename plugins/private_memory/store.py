@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import unicodedata
+from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,9 @@ from .schema import PRIVATE_MEMORY_SCHEMA_VERSION, schema_version
 
 _USER_ID_RE = re.compile(r"[1-9][0-9]*", re.ASCII)
 _SOURCE_QUOTE_LIMIT = 120
+MAX_PRIVATE_IMAGE_DESCRIPTIONS = 4
+MAX_PRIVATE_IMAGE_DESCRIPTION_LENGTH = 1_000
+MAX_PRIVATE_IMAGE_DESCRIPTION_TOTAL = 2_000
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,55 @@ def _normalize_text(text: str) -> str:
 
 def _normalize_compact(text: str) -> str:
     return " ".join(_normalize_text(text).split())
+
+
+def _normalize_image_descriptions(values: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError("image_descriptions must be a sequence of strings")
+    result: list[str] = []
+    remaining = MAX_PRIVATE_IMAGE_DESCRIPTION_TOTAL
+    for value in values:
+        if not isinstance(value, str):
+            raise TypeError("image descriptions must be strings")
+        compact = _normalize_compact(value)
+        if not compact:
+            continue
+        if len(result) >= MAX_PRIVATE_IMAGE_DESCRIPTIONS or remaining <= 0:
+            break
+        bounded = compact[: min(MAX_PRIVATE_IMAGE_DESCRIPTION_LENGTH, remaining)]
+        if bounded:
+            result.append(bounded)
+            remaining -= len(bounded)
+    return tuple(result)
+
+
+def _encode_image_descriptions(values: tuple[str, ...]) -> str:
+    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+
+
+def _decode_image_descriptions(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str) or len(value) > 8_192:
+        return ()
+    try:
+        decoded = json.loads(value)
+        if not isinstance(decoded, list):
+            return ()
+        return _normalize_image_descriptions(decoded)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+
+
+def _content_hash(text: str, image_descriptions: tuple[str, ...]) -> str:
+    if not image_descriptions:
+        payload = text
+    else:
+        payload = json.dumps(
+            {"text": text, "image_descriptions": image_descriptions},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _utc_text(value: datetime) -> str:
@@ -112,6 +165,7 @@ class PrivateMemoryStore:
         text: str,
         event_time: int,
         source_kind: str,
+        image_descriptions: Sequence[str] = (),
     ) -> int:
         message_row_id, _ = self.append_user_message_with_status(
             user_id=user_id,
@@ -119,6 +173,7 @@ class PrivateMemoryStore:
             text=text,
             event_time=event_time,
             source_kind=source_kind,
+            image_descriptions=image_descriptions,
         )
         return message_row_id
 
@@ -130,6 +185,7 @@ class PrivateMemoryStore:
         text: str,
         event_time: int,
         source_kind: str,
+        image_descriptions: Sequence[str] = (),
     ) -> tuple[int, bool]:
         """Return the row id and whether this call inserted the user event."""
         state = self.append_user_message_state(
@@ -138,6 +194,7 @@ class PrivateMemoryStore:
             text=text,
             event_time=event_time,
             source_kind=source_kind,
+            image_descriptions=image_descriptions,
         )
         return (state.row_id, state.created)
 
@@ -149,6 +206,7 @@ class PrivateMemoryStore:
         text: str,
         event_time: int,
         source_kind: str,
+        image_descriptions: Sequence[str] = (),
     ) -> PrivateUserEventState:
         user_id = _validate_user_id(user_id)
         message_id = _validate_nonempty(message_id, "message_id")
@@ -161,6 +219,7 @@ class PrivateMemoryStore:
             source_kind=_validate_nonempty(source_kind, "source_kind"),
             source_message_id=None,
             require_live_user_source=False,
+            image_descriptions=_normalize_image_descriptions(image_descriptions),
         )
         if created:
             return PrivateUserEventState(row_id, True, True, False)
@@ -197,19 +256,21 @@ class PrivateMemoryStore:
         bot_user_id: str,
         text: str,
         event_time: int,
+        message_id: str | None = None,
     ) -> int:
         user_id = _validate_user_id(user_id)
         source_message_id = _validate_nonempty(source_message_id, "source_message_id")
         bot_user_id = _validate_user_id(bot_user_id)
         message_row_id, _ = self._append_message(
             user_id=user_id,
-            message_id=f"assistant:{source_message_id}",
+            message_id=message_id or f"assistant:{source_message_id}",
             direction="assistant",
             text=text,
             event_time=event_time,
             source_kind=f"bot:{bot_user_id}",
             source_message_id=source_message_id,
             require_live_user_source=True,
+            image_descriptions=(),
         )
         return message_row_id
 
@@ -224,11 +285,13 @@ class PrivateMemoryStore:
         source_kind: str,
         source_message_id: str | None,
         require_live_user_source: bool,
+        image_descriptions: tuple[str, ...],
     ) -> tuple[int, bool]:
         if isinstance(event_time, bool) or not isinstance(event_time, int) or event_time < 0:
             raise ValueError("event_time must be a non-negative integer")
         normalized = _normalize_text(text)
-        content_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        content_hash = _content_hash(normalized, image_descriptions)
+        image_descriptions_json = _encode_image_descriptions(image_descriptions)
         created_at = _now_text()
         expires_at = _epoch_text(event_time + (self.retention_days * 86_400))
         with closing(self._connect()) as connection:
@@ -262,8 +325,9 @@ class PrivateMemoryStore:
                     """
                     INSERT INTO private_chat_messages(
                         user_id,message_id,direction,text,content_hash,event_time,
-                        created_at,expires_at,purged_at,source_kind,source_message_id
-                    ) VALUES(?,?,?,?,?,?,?,?,NULL,?,?)
+                        created_at,expires_at,purged_at,source_kind,source_message_id,
+                        image_descriptions_json
+                    ) VALUES(?,?,?,?,?,?,?,?,NULL,?,?,?)
                     ON CONFLICT(user_id,direction,message_id) DO NOTHING
                     """,
                     (
@@ -277,6 +341,7 @@ class PrivateMemoryStore:
                         expires_at,
                         source_kind,
                         source_message_id,
+                        image_descriptions_json,
                     ),
                 )
                 row = connection.execute(
@@ -294,6 +359,83 @@ class PrivateMemoryStore:
                 connection.rollback()
                 raise
 
+    def update_user_image_descriptions(
+        self,
+        *,
+        user_id: str,
+        message_id: str,
+        image_descriptions: Sequence[str],
+        source_kind: str,
+    ) -> bool:
+        user_id = _validate_user_id(user_id)
+        message_id = _validate_nonempty(message_id, "message_id")
+        source_kind = _validate_nonempty(source_kind, "source_kind")
+        normalized = _normalize_image_descriptions(image_descriptions)
+        if not normalized:
+            return False
+        encoded = _encode_image_descriptions(normalized)
+        with closing(self._connect()) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT id,text,image_descriptions_json
+                    FROM private_chat_messages
+                    WHERE user_id=? AND direction='user' AND message_id=?
+                      AND purged_at IS NULL
+                    """,
+                    (user_id, message_id),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    return False
+                existing = _decode_image_descriptions(
+                    row["image_descriptions_json"]
+                )
+                if existing:
+                    connection.rollback()
+                    return existing == normalized
+                connection.execute(
+                    """
+                    UPDATE private_chat_messages
+                    SET image_descriptions_json=?,source_kind=?,content_hash=?
+                    WHERE id=?
+                    """,
+                    (
+                        encoded,
+                        source_kind,
+                        _content_hash(str(row["text"]), normalized),
+                        int(row["id"]),
+                    ),
+                )
+                connection.commit()
+                return True
+            except Exception:
+                connection.rollback()
+                raise
+
+    def user_event_is_live(
+        self,
+        *,
+        user_id: str,
+        message_id: str,
+        row_id: int,
+    ) -> bool:
+        user_id = _validate_user_id(user_id)
+        message_id = _validate_nonempty(message_id, "message_id")
+        if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
+            raise ValueError("row_id must be a positive integer")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM private_chat_messages
+                WHERE id=? AND user_id=? AND direction='user' AND message_id=?
+                  AND purged_at IS NULL
+                """,
+                (row_id, user_id, message_id),
+            ).fetchone()
+        return row is not None
+
     def recent_context(self, *, user_id: str, limit: int) -> tuple[ContextMessage, ...]:
         user_id = _validate_user_id(user_id)
         if isinstance(limit, bool) or not isinstance(limit, int):
@@ -303,7 +445,7 @@ class PrivateMemoryStore:
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
-                SELECT message_id,direction,text,source_kind
+                SELECT message_id,direction,text,source_kind,image_descriptions_json
                 FROM private_chat_messages
                 WHERE user_id=? AND purged_at IS NULL
                 ORDER BY event_time DESC,id DESC
@@ -314,7 +456,7 @@ class PrivateMemoryStore:
         rows.reverse()
         return tuple(
             ContextMessage(
-                nickname="萝卜猫" if row["direction"] == "assistant" else user_id,
+                nickname="机器人自己" if row["direction"] == "assistant" else user_id,
                 text=str(row["text"]),
                 message_id=str(row["message_id"]),
                 user_id=(
@@ -322,6 +464,10 @@ class PrivateMemoryStore:
                     if row["direction"] == "assistant"
                     and str(row["source_kind"]).startswith("bot:")
                     else user_id
+                ),
+                is_bot=row["direction"] == "assistant",
+                image_descriptions=_decode_image_descriptions(
+                    row["image_descriptions_json"]
                 ),
             )
             for row in rows
@@ -638,7 +784,8 @@ class PrivateMemoryStore:
                     placeholders = ",".join("?" for _ in purge_ids)
                     connection.execute(
                         f"UPDATE private_chat_messages "  # noqa: S608 - placeholders only
-                        f"SET text='',purged_at=? WHERE id IN ({placeholders})",
+                        f"SET text='',image_descriptions_json='[]',purged_at=? "
+                        f"WHERE id IN ({placeholders})",
                         (purged_at, *sorted(purge_ids)),
                     )
                 connection.commit()
@@ -689,7 +836,8 @@ class PrivateMemoryStore:
                 )
                 connection.execute(
                     """
-                    UPDATE private_chat_messages SET text='',purged_at=?
+                    UPDATE private_chat_messages
+                    SET text='',image_descriptions_json='[]',purged_at=?
                     WHERE user_id=? AND purged_at IS NULL
                     """,
                     (now, user_id),

@@ -13,6 +13,7 @@ nonebot.load_plugin("plugins.violation_record")
 nonebot.load_plugin("plugins.feature_control")
 nonebot.load_plugin("plugins.private_memory")
 nonebot.load_plugin("plugins.llm_gateway.runtime")
+import plugins.web_search.runtime  # registers bounded search-client shutdown
 nonebot.load_plugin("plugins.feature_control.matcher")
 nonebot.load_plugin("plugins.memory_governance")
 nonebot.load_plugin("plugins.memory_governance.matcher")

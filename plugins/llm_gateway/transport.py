@@ -20,6 +20,7 @@ from .errors import (
     GatewayContractError,
     GatewayEmptyContentError,
     GatewayError,
+    GatewayPaymentRequiredError,
     GatewayRateLimitError,
     GatewayServerError,
     GatewayTimeout,
@@ -185,6 +186,8 @@ class LLMTransport:
             return None
         if status in {401, 403}:
             return GatewayAuthenticationError(**kwargs)
+        if status == 402:
+            return GatewayPaymentRequiredError(**kwargs)
         if status == 408:
             return GatewayTimeout(**kwargs)
         if status == 429:

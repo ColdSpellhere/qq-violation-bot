@@ -107,6 +107,7 @@ class FeatureControlCommandTests(unittest.TestCase):
     def test_recognizes_only_control_command_prefixes(self) -> None:
         for text in (
             "/模块状态",
+            "/联网搜索 开",
             "/业务 开",
             "/聊天 关",
             "/群聊 开",
@@ -125,6 +126,15 @@ class FeatureControlCommandTests(unittest.TestCase):
             "/提示构建 开",
         ):
             self.assertTrue(is_control_command(text), text)
+
+    def test_superuser_can_toggle_web_search_and_status_has_no_secret(self) -> None:
+        self.assertEqual(
+            "联网搜索已开启。",
+            execute_control_command("/联网搜索 开", self.controller, "1"),
+        )
+        status = execute_control_command("/模块状态", self.controller, "1")
+        self.assertIn("联网搜索：开", status)
+        self.assertNotIn("TAVILY", status.upper())
         for text in ("业务 开", "/未知 开", "/聊天会 开", "普通聊天"):
             self.assertFalse(is_control_command(text), text)
 

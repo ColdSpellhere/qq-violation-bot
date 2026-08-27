@@ -1,4 +1,5 @@
 import hashlib
+import asyncio
 import json
 import os
 import sqlite3
@@ -198,10 +199,10 @@ class RecentTextContextTests(unittest.TestCase):
             self._insert(path, message_id="bot", event_time=1002, user_id="999", text="机器人")
             self._insert(path, message_id="blank", event_time=1003, user_id="3", text="   ")
             self._insert(path, message_id="command", event_time=1004, user_id="3", text=" /help")
-            self._insert(path, message_id="current", event_time=1005, user_id="4", text="当前消息")
-            self._insert(path, message_id="a", event_time=1006, user_id="5", text="火锅", card="群名片", nickname="昵称")
-            self._insert(path, message_id="b", event_time=1007, user_id="6", text="同意", nickname="小红")
-            self._insert(path, message_id="c", event_time=1008, user_id="7", text="走起")
+            self._insert(path, message_id="a", event_time=1005, user_id="5", text="火锅", card="群名片", nickname="昵称")
+            self._insert(path, message_id="b", event_time=1006, user_id="6", text="同意", nickname="小红")
+            self._insert(path, message_id="c", event_time=1007, user_id="7", text="走起")
+            self._insert(path, message_id="current", event_time=1008, user_id="4", text="当前消息")
 
             result = recent_text_context(
                 path,
@@ -220,6 +221,66 @@ class RecentTextContextTests(unittest.TestCase):
             ],
             result,
         )
+
+    def test_can_include_bot_replies_as_typed_assistant_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._database(directory)
+            self._insert(
+                path,
+                message_id="human",
+                event_time=1001,
+                user_id="5",
+                text="你刚才说什么",
+                nickname="群友",
+            )
+            self._insert(
+                path,
+                message_id="bot-reply",
+                event_time=1002,
+                user_id="999",
+                text="我说先别急",
+                nickname="机器人自己",
+            )
+
+            result = recent_text_context(
+                path,
+                group_id=123,
+                since_epoch=1000,
+                limit=20,
+                exclude_message_id="none",
+                bot_user_id="999",
+                include_bot_messages=True,
+            )
+
+        self.assertEqual(2, len(result))
+        self.assertFalse(result[0].is_bot)
+        self.assertTrue(result[1].is_bot)
+        self.assertEqual("我说先别急", result[1].text)
+
+    def test_marks_configured_peer_bot_without_confusing_it_with_self(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._database(directory)
+            self._insert(
+                path,
+                message_id="peer-reply",
+                event_time=1001,
+                user_id="888",
+                text="另一个机器人的话",
+                nickname="另一个机器人",
+            )
+            result = recent_text_context(
+                path,
+                group_id=123,
+                since_epoch=1000,
+                limit=20,
+                exclude_message_id="none",
+                bot_user_id="999",
+                include_bot_messages=True,
+                peer_bot_user_ids=("888",),
+            )
+
+        self.assertFalse(result[0].is_bot)
+        self.assertTrue(result[0].is_peer_bot)
 
     def test_preserves_mentions_and_resolves_reply_author(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -274,6 +335,62 @@ class RecentTextContextTests(unittest.TestCase):
         self.assertEqual(20, len(result))
         self.assertEqual("消息5", result[0].text)
         self.assertEqual("消息24", result[-1].text)
+
+    def test_same_second_messages_keep_database_insertion_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._database(directory)
+            self._insert(
+                path,
+                message_id="900",
+                event_time=1001,
+                user_id="5",
+                text="先发",
+            )
+            self._insert(
+                path,
+                message_id="100",
+                event_time=1001,
+                user_id="999",
+                text="后发",
+                nickname="机器人自己",
+            )
+            result = recent_text_context(
+                path,
+                group_id=123,
+                since_epoch=1000,
+                limit=20,
+                exclude_message_id="none",
+                bot_user_id="999",
+                include_bot_messages=True,
+            )
+
+        self.assertEqual(["先发", "后发"], [item.text for item in result])
+
+    def test_context_watermark_excludes_future_users_but_keeps_prior_bot_reply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._database(directory)
+            self._insert(path, message_id="a", event_time=1001, user_id="1", text="A")
+            self._insert(path, message_id="b", event_time=1001, user_id="2", text="B")
+            self._insert(path, message_id="c", event_time=1001, user_id="3", text="C")
+            self._insert(
+                path,
+                message_id="bot-a",
+                event_time=1002,
+                user_id="999",
+                text="reply-A",
+                reply_message_id="a",
+            )
+            result = recent_text_context(
+                path,
+                group_id=123,
+                since_epoch=1000,
+                limit=20,
+                exclude_message_id="b",
+                bot_user_id="999",
+                include_bot_messages=True,
+            )
+
+        self.assertEqual(["A", "reply-A"], [item.text for item in result])
 
     def test_missing_database_or_table_returns_empty_list(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -506,7 +623,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         read_context.assert_called_once()
         kwargs = read_context.call_args.kwargs
         self.assertEqual(200, kwargs["since_epoch"])
-        self.assertEqual(20, kwargs["limit"])
+        self.assertEqual(40, kwargs["limit"])
         self.assertEqual("456", kwargs["exclude_message_id"])
         self.assertEqual("999", kwargs["bot_user_id"])
         generated = generate.await_args.kwargs
@@ -516,6 +633,363 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         bot.send_group_msg.assert_awaited_once_with(group_id=789, message="自然回复")
         extract.assert_not_awaited()
         apply.assert_not_called()
+
+    async def test_context_limits_bot_self_history_to_latest_three_replies(self):
+        history = [
+            item
+            for index in range(1, 13)
+            for item in (
+                ContextMessage(
+                    f"成员{index}",
+                    f"普通聊天内容{index}",
+                    message_id=f"u{index}",
+                    user_id=str(100 + index),
+                ),
+                ContextMessage(
+                    "机器人自己",
+                    f"机器人此前回复{index}",
+                    message_id=f"b{index}",
+                    user_id="999",
+                    is_bot=True,
+                ),
+            )
+        ]
+        config = self._vision_config(Path("/tmp/missing.db"), Path("/tmp"))
+        config.chat_context_messages = 8
+        config.chat_context_minutes = 30
+        config.chat_context_self_messages = 3
+        config.peer_bot_user_ids = ()
+        bot = AsyncMock()
+        bot.send_group_msg.return_value = {}
+        with patch(
+            "plugins.random_chat.matcher.CONFIG", config
+        ), patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=history
+        ) as read_context, patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ) as generate, patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(bot, _event(), "当前消息")
+
+        self.assertTrue(sent)
+        self.assertEqual(18, read_context.call_args.kwargs["limit"])
+        selected = generate.await_args.kwargs["context"]
+        self.assertLessEqual(len(selected), 8)
+        self.assertEqual(
+            ["b10", "b11", "b12"],
+            [item.message_id for item in selected if item.is_bot],
+        )
+
+    async def test_context_collapses_repeated_mention_spam_but_keeps_normal_short_turns(self):
+        history = [
+            ContextMessage("甲", "好", message_id="short-1", user_id="101"),
+            ContextMessage(
+                "甲",
+                "@kona @kona @kona 看我",
+                message_id="spam-1",
+                user_id="101",
+            ),
+            ContextMessage("乙", "好", message_id="short-2", user_id="102"),
+            ContextMessage(
+                "乙",
+                "@KONA  @kona @kona  看我",
+                message_id="spam-2",
+                user_id="102",
+            ),
+            ContextMessage("丙", "继续聊花", message_id="normal", user_id="103"),
+            ContextMessage(
+                "丙",
+                "@kona @kona @kona @kona 看我",
+                message_id="spam-3",
+                user_id="103",
+            ),
+        ]
+        config = self._vision_config(Path("/tmp/missing.db"), Path("/tmp"))
+        config.chat_context_messages = 20
+        config.chat_context_minutes = 30
+        config.chat_context_self_messages = 3
+        config.peer_bot_user_ids = ()
+        bot = AsyncMock()
+        bot.send_group_msg.return_value = {}
+        with patch(
+            "plugins.random_chat.matcher.CONFIG", config
+        ), patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=history
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ) as generate, patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(bot, _event(), "当前消息")
+
+        self.assertTrue(sent)
+        selected_ids = [
+            item.message_id for item in generate.await_args.kwargs["context"]
+        ]
+        self.assertEqual(
+            ["short-1", "short-2", "normal", "spam-3"], selected_ids
+        )
+
+    async def test_context_collapses_reposted_long_text_with_only_formatting_changes(self):
+        repeated = "这是一段被连续复制的很长回复，内容完全相同，只是标点和空格略有变化"
+        history = [
+            ContextMessage("甲", repeated, message_id="copy-1", user_id="101"),
+            ContextMessage("乙", "中间还有一条正常消息", message_id="normal", user_id="102"),
+            ContextMessage(
+                "丙",
+                "这是一段被连续复制的很长回复 内容完全相同 只是标点和空格略有变化。",
+                message_id="copy-2",
+                user_id="101",
+            ),
+        ]
+        config = self._vision_config(Path("/tmp/missing.db"), Path("/tmp"))
+        config.chat_context_messages = 20
+        config.chat_context_minutes = 30
+        config.chat_context_self_messages = 3
+        config.peer_bot_user_ids = ()
+        bot = AsyncMock()
+        bot.send_group_msg.return_value = {}
+        with patch(
+            "plugins.random_chat.matcher.CONFIG", config
+        ), patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=history
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ) as generate, patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(bot, _event(), "当前消息")
+
+        self.assertTrue(sent)
+        self.assertEqual(
+            ["normal", "copy-2"],
+            [item.message_id for item in generate.await_args.kwargs["context"]],
+        )
+
+    async def test_context_preserves_trigger_for_retained_bot_reply(self):
+        history = [
+            ContextMessage(
+                "提问者", "最初的问题", message_id="trigger", user_id="321"
+            ),
+            *[
+                ContextMessage(
+                    f"路人{index}",
+                    f"插入消息{index}",
+                    message_id=f"other-{index}",
+                    user_id=str(500 + index),
+                )
+                for index in range(6)
+            ],
+            ContextMessage(
+                "机器人自己",
+                "针对最初问题的回答",
+                message_id="bot-reply",
+                user_id="999",
+                reply_message_id="trigger",
+                is_bot=True,
+            ),
+            ContextMessage("路人甲", "最新消息一", message_id="latest-1", user_id="801"),
+            ContextMessage("路人乙", "最新消息二", message_id="latest-2", user_id="802"),
+        ]
+        config = self._vision_config(Path("/tmp/missing.db"), Path("/tmp"))
+        config.chat_context_messages = 5
+        config.chat_context_minutes = 30
+        config.chat_context_self_messages = 3
+        config.peer_bot_user_ids = ()
+        bot = AsyncMock()
+        bot.send_group_msg.return_value = {}
+        with patch(
+            "plugins.random_chat.matcher.CONFIG", config
+        ), patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=history
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ) as generate, patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(bot, _event(), "当前消息")
+
+        self.assertTrue(sent)
+        selected_ids = [
+            item.message_id for item in generate.await_args.kwargs["context"]
+        ]
+        self.assertEqual(5, len(selected_ids))
+        self.assertIn("bot-reply", selected_ids)
+        self.assertIn("trigger", selected_ids)
+
+    async def test_context_limit_preserves_quoted_turn_and_latest_current_speaker_turn(self):
+        history = [
+            ContextMessage(
+                "引用者", "最早的关键原话", message_id="111", user_id="321"
+            ),
+            ContextMessage(
+                "成员", "我前面说过的话", message_id="mine", user_id="123"
+            ),
+            *[
+                ContextMessage(
+                    f"路人{index}",
+                    f"路人消息{index}",
+                    message_id=f"other-{index}",
+                    user_id=str(500 + index),
+                )
+                for index in range(8)
+            ],
+        ]
+        config = self._vision_config(Path("/tmp/missing.db"), Path("/tmp"))
+        config.chat_context_messages = 5
+        config.chat_context_minutes = 30
+        config.chat_context_self_messages = 3
+        config.peer_bot_user_ids = ()
+        bot = AsyncMock()
+        bot.send_group_msg.return_value = {}
+        with patch(
+            "plugins.random_chat.matcher.CONFIG", config
+        ), patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=history
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value="321"
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ) as generate, patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(
+                bot,
+                _event(
+                    Message([MessageSegment.reply(111), MessageSegment.text("接着说")]),
+                    reply=_reply(111),
+                ),
+                "接着说",
+                addressed=True,
+            )
+
+        self.assertTrue(sent)
+        selected_ids = [
+            item.message_id for item in generate.await_args.kwargs["context"]
+        ]
+        self.assertEqual(5, len(selected_ids))
+        self.assertIn("111", selected_ids)
+        self.assertIn("mine", selected_ids)
+        self.assertEqual(
+            selected_ids,
+            [item.message_id for item in history if item.message_id in selected_ids],
+        )
+
+    async def test_same_group_model_calls_are_serialized_before_context_read(self):
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        call_count = 0
+
+        async def generate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                first_started.set()
+                await release_first.wait()
+            return "自然回复"
+
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ) as read_context, patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply", side_effect=generate
+        ), patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            first = asyncio.create_task(
+                send_random_reply(AsyncMock(), _event(), "第一条", addressed=True)
+            )
+            await first_started.wait()
+            second_event = _event()
+            second_event.message_id = 457
+            second = asyncio.create_task(
+                send_random_reply(AsyncMock(), second_event, "第二条", addressed=True)
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(1, read_context.call_count)
+            release_first.set()
+            await asyncio.gather(first, second)
+
+        self.assertEqual(2, read_context.call_count)
+
+    async def test_includes_quoted_text_and_exact_author_when_archive_window_misses_it(self):
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="接住引用"),
+        ) as generate, patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(
+                AsyncMock(),
+                _event(Message([MessageSegment.reply(111), MessageSegment.text("然后呢")]), reply=_reply(111)),
+                "然后呢",
+                addressed=True,
+            )
+
+        self.assertTrue(sent)
+        current = generate.await_args.kwargs["current"]
+        context = generate.await_args.kwargs["context"]
+        self.assertEqual("321", current.replied_to_user_id)
+        self.assertEqual(1, len(context))
+        self.assertEqual("原消息", context[0].text)
+        self.assertEqual("321", context[0].user_id)
+        self.assertEqual("111", context[0].message_id)
+
+    async def test_current_member_profile_is_requested_before_context_members(self):
+        history = [
+            ContextMessage("旧成员", "旧话", message_id="1", user_id="111"),
+            ContextMessage("近成员", "近话", message_id="2", user_id="222"),
+        ]
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=history
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ) as load, patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ), patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            await send_random_reply(AsyncMock(), _event(), "当前消息")
+
+        requested = list(load.call_args.kwargs["user_ids"])
+        self.assertEqual("123", requested[0])
+        self.assertEqual(["222", "111"], requested[1:])
 
     async def test_group_chat_passes_only_current_members_relationship_state(self):
         relationship = SimpleNamespace(
@@ -621,6 +1095,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_text_still_sends_when_no_sticker_is_selected(self):
         bot = AsyncMock()
+        bot.send_group_msg.return_value = {"message_id": 7001}
         with patch(
             "plugins.random_chat.matcher.recent_text_context", return_value=[]
         ), patch(
@@ -632,11 +1107,65 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value="自然回复"),
         ), patch(
             "plugins.random_chat.matcher.choose_sticker", return_value=None
-        ):
+        ), patch(
+            "plugins.random_chat.matcher.archive_payload", return_value=True
+        ) as archive:
             sent = await send_random_reply(bot, _event(), "当前消息")
 
         self.assertTrue(sent)
         self.assertEqual("自然回复", bot.send_group_msg.await_args.kwargs["message"])
+        payload = archive.call_args.args[2]
+        self.assertEqual("999", payload["user_id"])
+        self.assertEqual("自然回复", payload["plaintext"])
+        self.assertEqual("机器人自己", payload["sender"]["nickname"])
+        self.assertEqual("456", payload["reply_message_id"])
+
+    async def test_archives_reply_when_adapter_returns_typed_message_id(self):
+        bot = AsyncMock()
+        bot.send_group_msg.return_value = SimpleNamespace(message_id=7003)
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="自然回复"),
+        ), patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.archive_payload", return_value=True
+        ) as archive:
+            sent = await send_random_reply(bot, _event(), "当前消息")
+
+        self.assertTrue(sent)
+        self.assertEqual("7003", archive.call_args.args[2]["message_id"])
+
+    async def test_bot_reply_archive_failure_does_not_stop_remaining_replies(self):
+        bot = AsyncMock()
+        bot.send_group_msg.return_value = {"message_id": 7002}
+        with patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value=("第一句", "第二句")),
+        ), patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.archive_payload",
+            side_effect=OSError("archive failed"),
+        ):
+            sent = await send_random_reply(
+                bot, _event(), "当前消息", addressed=True
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(2, bot.send_group_msg.await_count)
 
     async def test_passes_current_and_unexpired_quoted_originals_to_ai(self):
         with tempfile.TemporaryDirectory() as directory:

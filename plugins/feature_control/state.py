@@ -18,6 +18,7 @@ SWITCH_NAMES = {
     "memory_governance_enabled",
     "llm_gateway_enabled",
     "prompt_builder_enabled",
+    "web_search_enabled",
     "llm_gateway_vision_enabled",
     "llm_gateway_private_memory_enabled",
     "llm_gateway_member_memory_enabled",
@@ -52,6 +53,7 @@ class FeatureState:
     llm_gateway_member_memory_enabled: bool = False
     llm_gateway_chat_enabled: bool = False
     llm_gateway_business_enabled: bool = False
+    web_search_enabled: bool = False
     updated_at: str = ""
     updated_by: str = ""
 
@@ -255,6 +257,9 @@ class FeatureController:
                 ),
                 llm_gateway_business_enabled=cls._strict_bool(
                     raw.get("llm_gateway_business_enabled", False)
+                ),
+                web_search_enabled=cls._strict_bool(
+                    raw.get("web_search_enabled", False)
                 ),
                 group_chat_allowed_group_ids=cls._load_allowlist(
                     "group_chat", raw["group_chat_allowed_group_ids"]

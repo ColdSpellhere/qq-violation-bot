@@ -160,7 +160,7 @@ class MemoryGovernanceServiceTests(unittest.TestCase):
     def test_clear_private_layers_is_exact_and_preview_contains_counts(self):
         with sqlite3.connect(self.db) as connection:
             connection.execute(
-                "INSERT INTO private_chat_messages(user_id,message_id,direction,text,content_hash,event_time,created_at,expires_at,source_kind) VALUES('200','m1','user','秘密','hash',1,'old','future','text')"
+                "INSERT INTO private_chat_messages(user_id,message_id,direction,text,content_hash,event_time,created_at,expires_at,source_kind,image_descriptions_json) VALUES('200','m1','user','秘密','hash',1,'old','future','text_image','[\"一张私人图片\"]')"
             )
             connection.execute(
                 "INSERT INTO private_conversation_summaries VALUES('200','摘要',1,1,1,1,'old','old')"
@@ -178,13 +178,16 @@ class MemoryGovernanceServiceTests(unittest.TestCase):
         self.assertIn("1", preview.preview_text)
         self.assertTrue(self.confirm(preview.token).success)
         with sqlite3.connect(self.db) as connection:
-            message = connection.execute("SELECT text,purged_at FROM private_chat_messages").fetchone()
+            message = connection.execute(
+                "SELECT text,image_descriptions_json,purged_at FROM private_chat_messages"
+            ).fetchone()
             summary = connection.execute("SELECT summary_text FROM private_conversation_summaries").fetchone()[0]
             relation = connection.execute("SELECT state_text,open_topics_json FROM relationship_states").fetchone()
             fact = connection.execute("SELECT fact_text,status FROM private_memory_facts").fetchone()
             job = connection.execute("SELECT status FROM memory_jobs").fetchone()[0]
         self.assertEqual("", message[0])
-        self.assertIsNotNone(message[1])
+        self.assertEqual("[]", message[1])
+        self.assertIsNotNone(message[2])
         self.assertEqual("", summary)
         self.assertEqual(("关系保留", "[]"), relation)
         self.assertEqual(("长期事实", "active"), fact)

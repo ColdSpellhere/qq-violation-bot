@@ -11,7 +11,7 @@ from pathlib import Path
 from .models import MigrationReport
 
 
-PRIVATE_MEMORY_SCHEMA_VERSION = 2
+PRIVATE_MEMORY_SCHEMA_VERSION = 3
 _MANAGED_PRIVATE_MEMORY_BACKUP_RE = re.compile(
     r"(?:chat_archive_before_private_memory_\d{8}T\d{12}Z"
     r"|[^/]+-pre-private-memory-\d{8}T\d{12}Z-\d+)\.sqlite3\Z"
@@ -32,6 +32,7 @@ _TABLE_STATEMENTS = (
         purged_at TEXT,
         source_kind TEXT NOT NULL,
         source_message_id TEXT,
+        image_descriptions_json TEXT NOT NULL DEFAULT '[]',
         UNIQUE(user_id,direction,message_id)
     )
     """,
@@ -218,6 +219,10 @@ _MEMBER_FACT_COLUMNS = (
     ("deleted_at", "TEXT"),
 )
 
+_PRIVATE_CHAT_MESSAGE_COLUMNS = (
+    ("image_descriptions_json", "TEXT NOT NULL DEFAULT '[]'"),
+)
+
 
 def quick_check(path: Path) -> str:
     path = Path(path)
@@ -344,6 +349,19 @@ def migrate(path: Path) -> MigrationReport:
             connection.execute("BEGIN IMMEDIATE")
             for statement in _TABLE_STATEMENTS:
                 connection.execute(statement)
+
+            private_message_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(private_chat_messages)"
+                )
+            }
+            for name, definition in _PRIVATE_CHAT_MESSAGE_COLUMNS:
+                if name not in private_message_columns:
+                    connection.execute(
+                        f"ALTER TABLE private_chat_messages ADD COLUMN {name} {definition}"
+                    )
+                    columns_added += 1
 
             member_facts_exists = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='member_memory_facts'"

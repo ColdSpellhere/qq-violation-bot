@@ -5,10 +5,20 @@ import httpx
 
 from plugins.feature_control.runtime import FEATURES
 from plugins.llm_gateway import get_gateway
+from plugins.llm_gateway.errors import GatewayPaymentRequiredError
 
 
 class ChatVisionAIError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        error_class: str,
+        *,
+        code: str | None = None,
+        retryable: bool = True,
+    ) -> None:
+        super().__init__(error_class)
+        self.code = code or error_class
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -66,6 +76,8 @@ async def _legacy_describe_image(
             },
             json=payload,
         )
+        if getattr(response, "status_code", None) == 402:
+            raise GatewayPaymentRequiredError(status_code=402)
         response.raise_for_status()
         result = response.json()
     if not isinstance(result, dict):
@@ -112,5 +124,11 @@ async def describe_image(
             model=model,
             timeout=timeout,
         )
+    except GatewayPaymentRequiredError as exc:
+        raise ChatVisionAIError(
+            type(exc).__name__,
+            code="payment_required",
+            retryable=False,
+        ) from None
     except Exception as exc:
         raise ChatVisionAIError(type(exc).__name__) from None

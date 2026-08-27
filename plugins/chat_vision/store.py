@@ -52,6 +52,11 @@ _SELECT_FIELDS = (
     "created_at,updated_at"
 )
 
+_NONRETRYABLE_ERROR_TYPES = (
+    "payment_required",
+    "GatewayPaymentRequiredError",
+)
+
 
 @dataclass(frozen=True)
 class ChatImageAsset:
@@ -267,6 +272,8 @@ class ChatVisionStore:
     def ensure_pending(
         self, group_id: int, message_id: str, ordinal: int, source_url: str, event_time: int
     ) -> ChatImageAsset:
+        if group_id <= 0:
+            raise ValueError("group_id must be positive")
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO chat_image_assets("
@@ -288,8 +295,9 @@ class ChatVisionStore:
             cursor = conn.execute(
                 "UPDATE chat_image_assets SET status='processing',attempts=attempts+1,"
                 "updated_at=strftime('%Y-%m-%d %H:%M:%f','now') "
-                "WHERE id=? AND status IN ('pending','failed') AND attempts<?",
-                (asset_id, max_retries),
+                "WHERE id=? AND group_id>0 AND status IN ('pending','failed') "
+                "AND attempts<? AND (error_type IS NULL OR error_type NOT IN (?,?))",
+                (asset_id, max_retries, *_NONRETRYABLE_ERROR_TYPES),
             )
             if cursor.rowcount != 1:
                 return None
@@ -351,15 +359,26 @@ class ChatVisionStore:
         *,
         after_id: int = 0,
         limit: int = 100,
+        min_event_time: int | None = None,
     ) -> list[ChatImageAsset]:
         if limit <= 0:
             return []
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT {_SELECT_FIELDS} FROM chat_image_assets "
-                "WHERE status IN ('pending','failed') "
-                "AND attempts<? AND id>? ORDER BY id LIMIT ?",
-                (max_retries, after_id, limit),
+                "WHERE group_id>0 AND status IN ('pending','failed') "
+                "AND attempts<? AND id>? "
+                "AND (? IS NULL OR event_time>=?) "
+                "AND (error_type IS NULL OR error_type NOT IN (?,?)) "
+                "ORDER BY id LIMIT ?",
+                (
+                    max_retries,
+                    after_id,
+                    min_event_time,
+                    min_event_time,
+                    *_NONRETRYABLE_ERROR_TYPES,
+                    limit,
+                ),
             ).fetchall()
         return [_asset(row) for row in rows]
 

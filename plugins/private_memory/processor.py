@@ -106,9 +106,10 @@ class PrivateMemoryProcessor:
             or job.input_through_id <= previous_through
         ):
             return False
-        if not self._private_interval_is_live(
+        live_ids = self._private_live_interval_ids(
             job.scope, after=previous_through, through=job.input_through_id
-        ):
+        )
+        if not live_ids:
             return False
         expected_version = current_version
         messages = self._private_messages(
@@ -122,8 +123,8 @@ class PrivateMemoryProcessor:
         return self.store.commit_summary(
             user_id=job.scope.user_id,
             summary_text=summary,
-            source_start_id=messages[0].id,
-            source_end_id=messages[-1].id,
+            source_start_id=live_ids[0],
+            source_end_id=job.input_through_id,
             expected_through_id=previous_through,
             expected_version=expected_version,
         )
@@ -230,16 +231,32 @@ class PrivateMemoryProcessor:
         through: int,
         user_only: bool = False,
     ) -> tuple[PrivateMessage, ...]:
-        direction = " AND direction='user'" if user_only else ""
+        direction = " AND message.direction='user'" if user_only else ""
         with closing(sqlite3.connect(self.store.path)) as connection:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 """
-                SELECT id,user_id,message_id,direction,text,content_hash,event_time,
-                       created_at,expires_at,purged_at,source_kind,source_message_id
-                FROM private_chat_messages
-                WHERE user_id=? AND purged_at IS NULL AND id>? AND id<=?
-                """ + direction + " ORDER BY id",
+                SELECT message.id,message.user_id,message.message_id,message.direction,
+                       message.text,message.content_hash,message.event_time,
+                       message.created_at,message.expires_at,message.purged_at,
+                       message.source_kind,message.source_message_id,
+                       source.source_kind AS source_user_kind
+                FROM private_chat_messages AS message
+                LEFT JOIN private_chat_messages AS source
+                  ON message.direction='assistant'
+                 AND source.user_id=message.user_id
+                 AND source.direction='user'
+                 AND source.message_id=message.source_message_id
+                WHERE message.user_id=? AND message.purged_at IS NULL
+                  AND message.id>? AND message.id<=?
+                  AND NOT (
+                      message.direction='user' AND message.source_kind='image'
+                  )
+                  AND NOT (
+                      message.direction='assistant'
+                      AND source.source_kind IN ('image','text_image')
+                  )
+                """ + direction + " ORDER BY message.id",
                 (scope.user_id, after, through),
             ).fetchall()
         return tuple(
@@ -258,9 +275,9 @@ class PrivateMemoryProcessor:
             for row in rows
         )
 
-    def _private_interval_is_live(
+    def _private_live_interval_ids(
         self, scope: ConversationScope, *, after: int, through: int
-    ) -> bool:
+    ) -> tuple[int, ...]:
         with closing(sqlite3.connect(self.store.path)) as connection:
             rows = connection.execute(
                 """
@@ -269,11 +286,13 @@ class PrivateMemoryProcessor:
                 """,
                 (scope.user_id, after, through),
             ).fetchall()
-        return bool(
-            rows
-            and int(rows[-1][0]) == through
-            and all(row[1] is None for row in rows)
-        )
+        if (
+            not rows
+            or int(rows[-1][0]) != through
+            or any(row[1] is not None for row in rows)
+        ):
+            return ()
+        return tuple(int(row[0]) for row in rows)
 
     def _group_messages(
         self, scope: ConversationScope, *, after: int, through: int

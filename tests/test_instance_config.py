@@ -26,6 +26,9 @@ class InstanceConfigTests(unittest.TestCase):
             {
                 "BOT_INSTANCE_ROOT": str(instance_root),
                 "TARGET_GROUP_ID": str(10**8 + 73_185_296),
+                "CHAT_CONTEXT_MESSAGES": "40",
+                "CHAT_CONTEXT_MINUTES": "90",
+                "CHAT_CONTEXT_SELF_MESSAGES": "3",
                 "PYTHONPATH": str(PROJECT_ROOT),
             }
         )
@@ -43,6 +46,9 @@ print(json.dumps({
     "chat_archive_path": str(config.CONFIG.chat_archive_path),
     "runtime_features_path": str(config.CONFIG.runtime_features_path),
     "sticker_root": str(config.CONFIG.random_chat_sticker_root),
+    "chat_context_messages": config.CONFIG.chat_context_messages,
+    "chat_context_minutes": config.CONFIG.chat_context_minutes,
+    "chat_context_self_messages": config.CONFIG.chat_context_self_messages,
     "mutable_paths": [
         str(config.CONFIG.database_path),
         str(config.CONFIG.chat_archive_path),
@@ -77,6 +83,9 @@ print(json.dumps({
             self.assertEqual(str(root / "data"), payload["data_dir"])
             self.assertEqual(str(root / "backups"), payload["backup_dir"])
             self.assertEqual(str(root / "character.md"), payload["character_file"])
+            self.assertEqual(40, payload["chat_context_messages"])
+            self.assertEqual(90, payload["chat_context_minutes"])
+            self.assertEqual(3, payload["chat_context_self_messages"])
             self.assertEqual(
                 str(root / "character.md"), payload["config_character_file"]
             )
