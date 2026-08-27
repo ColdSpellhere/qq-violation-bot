@@ -594,10 +594,14 @@ class PrivateMemorySchemaTests(unittest.TestCase):
                     retention_days=30,
                 )
 
-    def test_documented_shell_pattern_exports_dotenv_to_migration_subprocess(self) -> None:
+    def test_migration_cli_loads_shell_hostile_instance_dotenv_without_sourcing(self) -> None:
         env_file = self.root / ".env"
         synthetic_id = "".join(("246", "813", "579"))
-        env_file.write_text(f"TARGET_GROUP_ID={synthetic_id}\n", encoding="utf-8")
+        env_file.write_text(
+            f"TARGET_GROUP_ID={synthetic_id}\n"
+            "SHELL_HOSTILE_VALUE=[one, two]\n",
+            encoding="utf-8",
+        )
         database = self.root / "data" / "chat_archive.db"
         database.parent.mkdir()
         with closing(sqlite3.connect(database)) as connection:
@@ -607,22 +611,17 @@ class PrivateMemorySchemaTests(unittest.TestCase):
         backup_dir.mkdir(parents=True, mode=0o700)
         environment = os.environ.copy()
         environment.pop("TARGET_GROUP_ID", None)
-        environment.update(
-            {
-                "PYTHON_BIN": sys.executable,
-                "MIGRATION_SCRIPT": str(PROJECT_ROOT / "scripts/migrate_private_memory.py"),
-            }
-        )
+        environment["BOT_INSTANCE_ROOT"] = str(self.root)
         result = subprocess.run(
             [
-                "/bin/sh",
-                "-c",
-                'PROJECT_ROOT="$(pwd -P)"\nset -a\n. ./.env\nset +a\n'
-                'exec "$PYTHON_BIN" "$MIGRATION_SCRIPT" '
-                '--database "$PROJECT_ROOT/data/chat_archive.db" '
-                '--backup-dir "$PROJECT_ROOT/backups/private_memory"',
+                sys.executable,
+                str(PROJECT_ROOT / "scripts/migrate_private_memory.py"),
+                "--database",
+                str(database),
+                "--backup-dir",
+                str(backup_dir),
             ],
-            cwd=self.root,
+            cwd=PROJECT_ROOT,
             env=environment,
             capture_output=True,
             text=True,

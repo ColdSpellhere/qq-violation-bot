@@ -7,4 +7,4 @@ case "$instance" in
 esac
 instance_root="/opt/qq-bots/instances/$instance"
 cd "$instance_root/current"
-exec .venv/bin/python bot.py
+exec .venv/bin/python -B bot.py

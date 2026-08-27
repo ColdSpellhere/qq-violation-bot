@@ -370,25 +370,23 @@ systemctl is-active --quiet qq-violation-bot.service
 
 #### 迁移、启用与回滚
 
-迁移现有 `chat_archive.db` 前先保持 `/私聊记忆`、`/关系状态`、`/记忆治理` 为关闭，确认数据库路径，并创建权限为 `0700` 的备份目录。以下命令必须从项目根目录执行，并用 `pwd -P` 取得不含符号链接的物理绝对根路径；数据库、备份目录或任一祖先符号链接以及其他非 canonical 路径都会在 preflight 和 `--apply` 写入前被同样拒绝。生产已有 `.env` 时先由 shell 安全加载并导出其中的现有配置，使 `TARGET_GROUP_ID` 等必需配置可供迁移子进程使用，命令不会输出这些值。无 `--apply` 是只读预检；`--apply` 会清理 `backups/private_memory/` 中超过 `PRIVATE_MEMORY_RETENTION_DAYS` 的精确命名旧备份，再为现有数据库创建并校验在线备份，最后做迁移和 `quick_check`。不要删除或复制正在使用的 `-wal`/`-shm` 文件代替在线备份。
+迁移现有 `chat_archive.db` 前先保持 `/私聊记忆`、`/关系状态`、`/记忆治理` 为关闭，确认数据库路径，并创建权限为 `0700` 的备份目录。以下命令使用不含符号链接的物理绝对路径；数据库、备份目录或任一祖先符号链接以及其他非 canonical 路径都会在 preflight 和 `--apply` 写入前被同样拒绝。迁移工具会通过 `BOT_INSTANCE_ROOT` 直接读取实例 `.env`，不要用 shell `source`（dotenv 值不保证是合法 shell 语法），也不会输出其中的配置值。无 `--apply` 是只读预检；`--apply` 会清理 `backups/private_memory/` 中超过 `PRIVATE_MEMORY_RETENTION_DAYS` 的精确命名旧备份，再为现有数据库创建并校验在线备份，最后做迁移和 `quick_check`。不要删除或复制正在使用的 `-wal`/`-shm` 文件代替在线备份。
 
 ```bash
-cd /opt/qq-violation-bot
-PROJECT_ROOT="$(pwd -P)"
-set -a
-. ./.env
-set +a
-install -d -m 0700 "$PROJECT_ROOT/backups/private_memory"
-.venv/bin/python scripts/migrate_private_memory.py \
-  --database "$PROJECT_ROOT/data/chat_archive.db" \
-  --backup-dir "$PROJECT_ROOT/backups/private_memory"
-.venv/bin/python scripts/migrate_private_memory.py \
-  --database "$PROJECT_ROOT/data/chat_archive.db" \
-  --backup-dir "$PROJECT_ROOT/backups/private_memory" \
+INSTANCE_ROOT="$(cd /opt/qq-bots/instances/carrot && pwd -P)"
+RELEASE_ROOT="$(readlink -f "$INSTANCE_ROOT/current")"
+export BOT_INSTANCE_ROOT="$INSTANCE_ROOT"
+install -d -m 0700 "$INSTANCE_ROOT/backups/private_memory"
+"$RELEASE_ROOT/.venv/bin/python" -B "$RELEASE_ROOT/scripts/migrate_private_memory.py" \
+  --database "$INSTANCE_ROOT/data/chat_archive.db" \
+  --backup-dir "$INSTANCE_ROOT/backups/private_memory"
+"$RELEASE_ROOT/.venv/bin/python" -B "$RELEASE_ROOT/scripts/migrate_private_memory.py" \
+  --database "$INSTANCE_ROOT/data/chat_archive.db" \
+  --backup-dir "$INSTANCE_ROOT/backups/private_memory" \
   --apply
-.venv/bin/python scripts/migrate_private_memory.py \
-  --database "$PROJECT_ROOT/data/chat_archive.db" \
-  --backup-dir "$PROJECT_ROOT/backups/private_memory"
+"$RELEASE_ROOT/.venv/bin/python" -B "$RELEASE_ROOT/scripts/migrate_private_memory.py" \
+  --database "$INSTANCE_ROOT/data/chat_archive.db" \
+  --backup-dir "$INSTANCE_ROOT/backups/private_memory"
 ```
 
 在数据库副本或预发布环境再执行一次 `--apply`，验证重复迁移仍成功、schema version 不变、原有业务/聊天记录不变、每个备份文件权限为 `0600`，并用 `PRAGMA quick_check` 验证原库和备份均为 `ok`。全新空库由服务启动时创建 schema；迁移脚本要求目标数据库已存在，不会为了预检凭空创建数据库。
@@ -660,6 +658,8 @@ CArroT 是候选验证实例。开发提交先通过 `scripts/deploy_carrot_cand
 服务器把候选代码对象保存在 `/opt/qq-bots/repository.git` 裸仓库，稳定部署入口保存在 `/opt/qq-bots/bin/`。部署入口不依赖某个发布目录，因此即使当前版本健康检查失败并回滚，也不会丢失下一次部署能力。kona 晋级时先从公开 GitHub `main` 获取已批准的精确提交，再只切换 kona。
 
 每个新发布目录都必须包含由部署工具生成的 `.release-manifest.json`，记录真实 commit、Git tree 和公开源码摘要。已有同名 SHA 目录只有在仓库 commit、清单和全部受跟踪源码完全一致且没有额外源码文件时才能复用；目录名像 SHA 但不是仓库 commit、清单缺失、源码被修改或被加塞都会拒绝部署。实例健康检查会再次验证该清单。成功切换后，实例自己的 `previous` 指针原子指向切换前版本；同 SHA 幂等重试和失败回滚都不会覆盖既有 `previous`。发布切换与旧版本清理共用同一把排他锁，清理同时保护所有实例的 `current` 和 `previous`。首次从旧式无清单 release 升级时仍须额外保留旧目录和数据库在线备份；旧目录不会因“回滚”需求而绕过 Git/清单校验。
+
+生产启动入口和从发布目录执行的受管迁移统一使用 Python `-B`，禁止在只读源码树内生成 `__pycache__`/`.pyc`。发布清单不会忽略这类未跟踪字节码；发现它们时必须停止切换并重新生成干净发布目录，不能通过放宽源码校验来绕过。
 
 群内模块管理与记忆治理命令必须以目标机器人的真实 @ 开头；私聊管理命令不需要 @。因此两个机器人在同一群时，只会由明确被 @ 的实例执行命令。
 

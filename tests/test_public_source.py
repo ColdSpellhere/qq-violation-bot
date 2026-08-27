@@ -118,17 +118,19 @@ class PublicSourceBoundaryTests(unittest.TestCase):
             key: values.get(key) for key in CHAT_VISION_EXAMPLE_DEFAULTS
         })
 
-    def test_private_memory_migration_docs_export_project_dotenv(self) -> None:
+    def test_private_memory_migration_docs_load_instance_dotenv_without_shell(self) -> None:
         text = (ROOT / "README.md").read_text(encoding="utf-8")
         migration = text[text.index("#### 迁移、启用与回滚"):]
-        self.assertIn("必须从项目根目录执行", migration)
-        self.assertIn("set -a\n. ./.env\nset +a", migration)
-        self.assertIn('PROJECT_ROOT="$(pwd -P)"', migration)
-        self.assertIn('"$PROJECT_ROOT/backups/private_memory"', migration)
-        self.assertIn('"$PROJECT_ROOT/data/chat_archive.db"', migration)
+        self.assertIn("不要用 shell `source`", migration)
+        self.assertNotIn("set -a\n. ./.env\nset +a", migration)
+        self.assertIn('export BOT_INSTANCE_ROOT="$INSTANCE_ROOT"', migration)
+        self.assertIn('RELEASE_ROOT="$(readlink -f "$INSTANCE_ROOT/current")"', migration)
+        self.assertIn('"$INSTANCE_ROOT/backups/private_memory"', migration)
+        self.assertIn('"$INSTANCE_ROOT/data/chat_archive.db"', migration)
+        self.assertIn('"$RELEASE_ROOT/.venv/bin/python" -B', migration)
         self.assertNotIn("backups/private-memory-migration", migration)
         self.assertIn("任一祖先符号链接", migration)
-        self.assertIn("TARGET_GROUP_ID", migration)
+        self.assertIn("实例 `.env`", migration)
 
     def test_private_memory_changelog_distinguishes_checkpoint_outcomes(self) -> None:
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")

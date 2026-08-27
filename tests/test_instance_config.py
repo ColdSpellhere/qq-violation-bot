@@ -13,6 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstanceConfigTests(unittest.TestCase):
+    def test_production_entrypoint_disables_source_bytecode_writes(self) -> None:
+        script = (PROJECT_ROOT / "scripts" / "start_bot.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("exec .venv/bin/python -B bot.py", script)
+
     def _probe(self, instance_root: Path) -> dict[str, object]:
         environment = os.environ.copy()
         for name in (
