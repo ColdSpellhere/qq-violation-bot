@@ -1482,6 +1482,132 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((), generate.await_args.kwargs["current"].image_descriptions)
 
+    async def test_economy_mode_never_reads_or_attaches_current_image(self):
+        message = Message(
+            [
+                MessageSegment.image("https://example.invalid/current.jpg"),
+                MessageSegment.text("只回答这句话"),
+            ]
+        )
+        features = SimpleNamespace(
+            image_understanding_allowed=lambda: False,
+            snapshot=lambda: SimpleNamespace(
+                relationship_state_enabled=False,
+                prompt_builder_enabled=False,
+            ),
+        )
+        with patch(
+            "plugins.random_chat.matcher.FEATURES", features
+        ), patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.archived_message_author", return_value=None
+        ), patch(
+            "plugins.random_chat.matcher.load_profiles", return_value=[]
+        ), patch(
+            "plugins.chat_vision.store.ChatVisionStore",
+            side_effect=AssertionError("economy mode read image store"),
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="文字回复"),
+        ) as generate, patch(
+            "plugins.random_chat.matcher.choose_sticker", return_value=None
+        ):
+            sent = await send_random_reply(
+                AsyncMock(), _event(message), "只回答这句话"
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual((), tuple(generate.await_args.kwargs["images"]))
+        self.assertEqual((), generate.await_args.kwargs["current"].image_descriptions)
+        self.assertEqual("只回答这句话", generate.await_args.args[0])
+
+    async def test_economy_mode_ignores_addressed_pure_quoted_image(self):
+        message = Message([MessageSegment.reply(111), MessageSegment.at(999)])
+        quoted = _reply(111)
+        quoted["message"] = Message(
+            [MessageSegment.image("https://example.invalid/quoted.jpg")]
+        )
+        features = SimpleNamespace(
+            image_understanding_allowed=lambda: False,
+            snapshot=lambda: SimpleNamespace(
+                relationship_state_enabled=False,
+                prompt_builder_enabled=False,
+            ),
+        )
+        with patch(
+            "plugins.random_chat.matcher.FEATURES", features
+        ), patch(
+            "plugins.random_chat.matcher.recent_text_context", return_value=[]
+        ), patch(
+            "plugins.random_chat.matcher.generate_reply",
+            new=AsyncMock(return_value="不应调用"),
+        ) as generate, patch(
+            "plugins.chat_vision.store.ChatVisionStore",
+            side_effect=AssertionError("economy mode read image store"),
+        ):
+            sent = await send_random_reply(
+                AsyncMock(),
+                _event(message, reply=quoted),
+                "",
+                addressed=True,
+            )
+
+        self.assertFalse(sent)
+        generate.assert_not_awaited()
+
+    async def test_mode_switch_after_reading_current_image_still_silences_pure_image(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "data" / "chat_vision" / "images"
+            root.mkdir(parents=True)
+            database = Path(directory) / "chat.db"
+            store = ChatVisionStore(database)
+            self._stored_image(
+                store,
+                root,
+                message_id="456",
+                ordinal=1,
+                content=b"current-raw",
+                description="当前图片是一朵花",
+            )
+            checks = 0
+
+            def image_understanding_allowed() -> bool:
+                nonlocal checks
+                checks += 1
+                return checks == 1
+
+            features = SimpleNamespace(
+                image_understanding_allowed=image_understanding_allowed,
+                snapshot=lambda: SimpleNamespace(
+                    relationship_state_enabled=False,
+                    prompt_builder_enabled=False,
+                    economy_mode_enabled=True,
+                ),
+            )
+            message = Message(
+                [MessageSegment.image("https://example.invalid/current.jpg")]
+            )
+            with patch(
+                "plugins.random_chat.matcher.FEATURES", features
+            ), patch(
+                "plugins.random_chat.matcher.CONFIG",
+                self._vision_config(database, root),
+            ), patch(
+                "plugins.random_chat.matcher.recent_text_context", return_value=[]
+            ), patch(
+                "plugins.random_chat.matcher.generate_reply",
+                new=AsyncMock(return_value="不应调用"),
+            ) as generate:
+                sent = await send_random_reply(
+                    AsyncMock(), _event(message), "", addressed=True
+                )
+
+        self.assertFalse(sent)
+        generate.assert_not_awaited()
+
     async def test_empty_text_without_image_does_not_use_image_placeholder(self):
         message = Message([MessageSegment.at(999)])
         with patch(

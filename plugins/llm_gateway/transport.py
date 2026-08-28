@@ -12,7 +12,13 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .contracts import GatewayCompletion, GatewayRequest, LLMTask, TokenUsage
+from .contracts import (
+    GatewayCompletion,
+    GatewayRequest,
+    LLMProvider,
+    LLMTask,
+    TokenUsage,
+)
 from .errors import (
     GatewayAuthenticationError,
     GatewayClientError,
@@ -95,15 +101,25 @@ class LLMTransport:
             raise GatewayConfigurationError()
         candidate = value.strip().rstrip("/")
         parsed = urlsplit(candidate)
-        if (
+        common_invalid = (
             parsed.scheme not in {"http", "https"}
             or not parsed.netloc
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
-            or parsed.path not in {"", "/v1"}
-        ):
+        )
+        if common_invalid:
+            raise GatewayConfigurationError()
+        if parsed.path == "/api/paas/v4":
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname != "open.bigmodel.cn"
+                or parsed.port not in {None, 443}
+            ):
+                raise GatewayConfigurationError()
+            return candidate
+        if parsed.path not in {"", "/v1"}:
             raise GatewayConfigurationError()
         return candidate if parsed.path == "/v1" else f"{candidate}/v1"
 
@@ -191,12 +207,36 @@ class LLMTransport:
         if status == 408:
             return GatewayTimeout(**kwargs)
         if status == 429:
+            if request.provider is LLMProvider.ECONOMY:
+                code = LLMTransport._provider_error_code(response)
+                if code == "1113":
+                    return GatewayPaymentRequiredError(**kwargs)
+                if code not in {"1302", "1305"}:
+                    return GatewayClientError(**kwargs)
             return GatewayRateLimitError(**kwargs)
         if 500 <= status < 600:
             return GatewayServerError(**kwargs)
         if 400 <= status < 500:
             return GatewayClientError(**kwargs)
         return GatewayClientError(**kwargs)
+
+    @staticmethod
+    def _provider_error_code(response: httpx.Response) -> str | None:
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        error = payload.get("error")
+        if not isinstance(error, Mapping):
+            return None
+        code = error.get("code")
+        if type(code) is int:
+            return str(code)
+        if type(code) is str and code.strip():
+            return code.strip()
+        return None
 
     @staticmethod
     def _parse_completion(
@@ -218,7 +258,19 @@ class LLMTransport:
             raise GatewayContractError(task=request.task)
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
             raise GatewayContractError(task=request.task)
-        message = choices[0].get("message")
+        choice = choices[0]
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None and type(finish_reason) is not str:
+            raise GatewayContractError(task=request.task)
+        if finish_reason == "network_error":
+            raise GatewayTransportError(task=request.task)
+        if finish_reason in {
+            "length",
+            "sensitive",
+            "model_context_window_exceeded",
+        }:
+            raise GatewayContractError(task=request.task)
+        message = choice.get("message")
         if not isinstance(message, Mapping) or "content" not in message:
             raise GatewayContractError(task=request.task)
         content = message["content"]

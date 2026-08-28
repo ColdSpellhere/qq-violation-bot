@@ -24,6 +24,7 @@ SWITCH_NAMES = {
     "llm_gateway_member_memory_enabled",
     "llm_gateway_chat_enabled",
     "llm_gateway_business_enabled",
+    "economy_mode_enabled",
 }
 ALLOWLIST_KINDS = {"group_chat", "private_chat"}
 GATEWAY_DOMAIN_SWITCHES = {
@@ -54,6 +55,7 @@ class FeatureState:
     llm_gateway_chat_enabled: bool = False
     llm_gateway_business_enabled: bool = False
     web_search_enabled: bool = False
+    economy_mode_enabled: bool = False
     updated_at: str = ""
     updated_by: str = ""
 
@@ -65,26 +67,36 @@ class FeatureController:
         defaults: FeatureState,
         *,
         business_capable: bool = True,
+        economy_provider_available: bool = True,
+        primary_provider_available: bool = True,
     ):
         self._path = Path(path)
         self._lock = RLock()
         self._business_capable = bool(business_capable)
+        self._economy_provider_available = bool(economy_provider_available)
+        self._primary_provider_available = bool(primary_provider_available)
         loaded = self._load_state(self._path, defaults) or self._load_state(
             self._backup_path, defaults
         ) or defaults
-        self._state = (
-            loaded
-            if self._business_capable
-            else replace(
-                loaded,
+        unavailable_changes: dict[str, bool] = {}
+        if not self._business_capable:
+            unavailable_changes.update(
                 business_enabled=False,
                 llm_gateway_business_enabled=False,
             )
-        )
+        self._state = replace(loaded, **unavailable_changes) if unavailable_changes else loaded
 
     @property
     def business_capable(self) -> bool:
         return self._business_capable
+
+    @property
+    def economy_provider_available(self) -> bool:
+        return self._economy_provider_available
+
+    @property
+    def primary_provider_available(self) -> bool:
+        return self._primary_provider_available
 
     @property
     def _backup_path(self) -> Path:
@@ -95,6 +107,26 @@ class FeatureController:
             return self._state
 
     def set_switch(self, name: str, enabled: bool, actor: str) -> FeatureState:
+        return self.set_switches({name: enabled}, actor)
+
+    def set_switches(
+        self, changes: dict[str, bool], actor: str
+    ) -> FeatureState:
+        if not changes:
+            raise ValueError("feature switch changes must not be empty")
+        for name, enabled in changes.items():
+            self._validate_switch(name, enabled)
+        with self._lock:
+            if (
+                changes.get("economy_mode_enabled") is False
+                and self._state.economy_mode_enabled
+                and not self._primary_provider_available
+                and changes.get("llm_gateway_enabled") is not False
+            ):
+                raise ValueError("primary provider is unavailable")
+            return self._replace_state(**changes, updated_by=str(actor))
+
+    def _validate_switch(self, name: str, enabled: bool) -> None:
         if name not in SWITCH_NAMES:
             raise ValueError(f"unknown feature switch: {name}")
         if not isinstance(enabled, bool):
@@ -105,9 +137,8 @@ class FeatureController:
             and name in {"business_enabled", "llm_gateway_business_enabled"}
         ):
             raise ValueError("business capability is unavailable in chat-only mode")
-
-        with self._lock:
-            return self._replace_state(**{name: enabled}, updated_by=str(actor))
+        if name == "economy_mode_enabled" and enabled and not self._economy_provider_available:
+            raise ValueError("economy provider is unavailable")
 
     def add_allowed(self, kind: str, value: str, actor: str) -> FeatureState:
         normalized = self._validate_allowed_value(kind, value)
@@ -165,7 +196,12 @@ class FeatureController:
         if domain == "business" and not self._business_capable:
             return False
         state = self.snapshot()
+        if state.economy_mode_enabled:
+            return domain != "vision"
         return state.llm_gateway_enabled and getattr(state, field_name)
+
+    def image_understanding_allowed(self) -> bool:
+        return not self.snapshot().economy_mode_enabled
 
     def _replace_state(self, **changes: Any) -> FeatureState:
         candidate = replace(
@@ -260,6 +296,9 @@ class FeatureController:
                 ),
                 web_search_enabled=cls._strict_bool(
                     raw.get("web_search_enabled", False)
+                ),
+                economy_mode_enabled=cls._strict_bool(
+                    raw.get("economy_mode_enabled", False)
                 ),
                 group_chat_allowed_group_ids=cls._load_allowlist(
                     "group_chat", raw["group_chat_allowed_group_ids"]

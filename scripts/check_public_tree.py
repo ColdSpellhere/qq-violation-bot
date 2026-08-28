@@ -17,6 +17,8 @@ SENSITIVE_KEYS = (
     "BOT_SELF_ID",
     "NAPCAT_ACCESS_TOKEN",
     "AI_API_KEY",
+    "GLM_API_KEY",
+    "TAVILY_API_KEY",
     "ADMIN_SEED",
     "SUPERUSERS",
     "GROUP_CHAT_ALLOWED_GROUP_IDS",
@@ -24,8 +26,12 @@ SENSITIVE_KEYS = (
     "PRIVATE_CHAT_ALLOWED_USER_ID",
 )
 TOKEN_RE = re.compile(r"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})")
+GLM_TOKEN_RE = re.compile(r"[A-Fa-f0-9]{32}\.[A-Za-z0-9_-]{16,}")
+TAVILY_TOKEN_RE = re.compile(r"tvly-(?:dev|prod)-[A-Za-z0-9_-]{20,}")
 PRIVATE_KEY_RE = re.compile(r"BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY")
 TOKEN_BYTES_RE = re.compile(rb"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})")
+GLM_TOKEN_BYTES_RE = re.compile(rb"[A-Fa-f0-9]{32}\.[A-Za-z0-9_-]{16,}")
+TAVILY_TOKEN_BYTES_RE = re.compile(rb"tvly-(?:dev|prod)-[A-Za-z0-9_-]{20,}")
 PRIVATE_KEY_BYTES_RE = re.compile(rb"BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY")
 MAX_SCAN_BYTES = 20 * 1024 * 1024
 _DATABASE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
@@ -66,6 +72,10 @@ def generic_findings(path: str, text: str) -> list[str]:
     findings: list[str] = []
     if TOKEN_RE.search(text):
         findings.append(f"{path}: generic API token")
+    if GLM_TOKEN_RE.search(text):
+        findings.append(f"{path}: GLM API token")
+    if TAVILY_TOKEN_RE.search(text):
+        findings.append(f"{path}: Tavily API token")
     if PRIVATE_KEY_RE.search(text):
         findings.append(f"{path}: private key material")
     return findings
@@ -147,6 +157,10 @@ def scan_bytes(
     findings: list[str] = []
     if TOKEN_BYTES_RE.search(raw):
         findings.append(f"{path}: generic API token")
+    if GLM_TOKEN_BYTES_RE.search(raw):
+        findings.append(f"{path}: GLM API token")
+    if TAVILY_TOKEN_BYTES_RE.search(raw):
+        findings.append(f"{path}: Tavily API token")
     if PRIVATE_KEY_BYTES_RE.search(raw):
         findings.append(f"{path}: private key material")
     findings.extend(

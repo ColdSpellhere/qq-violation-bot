@@ -7,6 +7,7 @@ from functools import partial
 
 from nonebot import get_driver, logger
 
+from plugins.feature_control.runtime import FEATURES
 from plugins.violation_record.config import CONFIG
 
 from .service import (
@@ -62,7 +63,7 @@ def setup_lifecycle() -> None:
         store = _store
         set_store(store)
 
-        if CONFIG.chat_vision_enabled:
+        if CONFIG.chat_vision_enabled and FEATURES.image_understanding_allowed():
             store.recover_interrupted_claims()
             await recover_pending(
                 store,

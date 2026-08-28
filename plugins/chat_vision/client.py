@@ -105,14 +105,37 @@ async def describe_image(
     api_key: str,
     model: str,
     timeout: float,
+    allow_in_flight: bool = False,
+    use_gateway: bool | None = None,
 ) -> str:
     try:
+        if type(allow_in_flight) is not bool:
+            raise ValueError("allow_in_flight must be boolean")
+        if allow_in_flight != (use_gateway is not None) or (
+            use_gateway is not None and type(use_gateway) is not bool
+        ):
+            raise ValueError("in-flight provider policy is invalid")
+        image_allowed = getattr(FEATURES, "image_understanding_allowed", lambda: True)
+        if not allow_in_flight and not bool(image_allowed()):
+            raise ChatVisionAIError(
+                "EconomyModeEnabled",
+                code="economy_mode",
+                retryable=False,
+            )
         if not api_key:
             raise ValueError("missing API key")
         messages = _vision_messages(content, mime_type)
-        if FEATURES.llm_gateway_allowed("vision"):
+        gateway_allowed = (
+            use_gateway
+            if use_gateway is not None
+            else FEATURES.llm_gateway_allowed("vision")
+        )
+        if gateway_allowed:
             gateway = await get_gateway()
-            description = await gateway.describe_image(messages)
+            description = await gateway.describe_image(
+                messages,
+                economy_mode=False if allow_in_flight else None,
+            )
             description = description.strip()
             if not description:
                 raise ValueError("empty response content")
@@ -124,6 +147,8 @@ async def describe_image(
             model=model,
             timeout=timeout,
         )
+    except ChatVisionAIError:
+        raise
     except GatewayPaymentRequiredError as exc:
         raise ChatVisionAIError(
             type(exc).__name__,

@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import httpx
 
+from plugins.chat_vision import client as vision_client
 from plugins.chat_vision.client import ChatVisionAIError, describe_image, image_data_url
 
 
@@ -195,6 +196,50 @@ class ChatVisionClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(_Client.posted)
         self._assert_redacted(raised.exception)
+
+    async def test_economy_mode_rejects_before_building_or_sending_image_payload(self):
+        features = type(
+            "Features",
+            (),
+            {"image_understanding_allowed": staticmethod(lambda: False)},
+        )()
+        with (
+            patch.object(vision_client, "FEATURES", features),
+            patch("plugins.chat_vision.client.httpx.AsyncClient", _Client),
+            self.assertRaisesRegex(ChatVisionAIError, "^EconomyModeEnabled$") as raised,
+        ):
+            await self._call()
+
+        self.assertEqual("economy_mode", raised.exception.code)
+        self.assertFalse(raised.exception.retryable)
+        self.assertIsNone(_Client.posted)
+
+    async def test_already_claimed_image_can_finish_after_mode_turns_on(self):
+        features = type(
+            "Features",
+            (),
+            {
+                "image_understanding_allowed": staticmethod(lambda: False),
+                "llm_gateway_allowed": staticmethod(lambda _domain: False),
+            },
+        )()
+        with (
+            patch.object(vision_client, "FEATURES", features),
+            patch("plugins.chat_vision.client.httpx.AsyncClient", _Client),
+        ):
+            description = await describe_image(
+                self.content,
+                self.mime_type,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                model=self.model,
+                timeout=self.timeout,
+                allow_in_flight=True,
+                use_gateway=False,
+            )
+
+        self.assertEqual("一名粉发小精灵在飞。", description)
+        self.assertIsNotNone(_Client.posted)
 
     async def test_transport_error_raises_only_exception_type(self):
         _Client.error = httpx.ConnectError(

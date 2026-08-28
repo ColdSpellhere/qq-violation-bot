@@ -28,10 +28,27 @@ class PublicScannerTests(unittest.TestCase):
         self.assertEqual([], path_findings("tests/test_image_contract.py"))
 
     def test_generic_token_and_private_key_are_detected(self) -> None:
-        text = "API_KEY=" + "sk-" + ("a" * 26) + "\nBEGIN " + "OPENSSH PRIVATE KEY"
+        glm_key = ("a" * 32) + "." + ("B" * 16)
+        tavily_key = "tvly-" + "dev-" + ("C" * 24)
+        text = (
+            "API_KEY="
+            + "sk-"
+            + ("a" * 26)
+            + "\nGLM_API_KEY="
+            + glm_key
+            + "\nTAVILY_API_KEY="
+            + tavily_key
+            + "\nBEGIN "
+            + "OPENSSH PRIVATE KEY"
+        )
         findings = generic_findings("fixture.txt", text)
         self.assertEqual(
-            ["fixture.txt: generic API token", "fixture.txt: private key material"],
+            [
+                "fixture.txt: generic API token",
+                "fixture.txt: GLM API token",
+                "fixture.txt: Tavily API token",
+                "fixture.txt: private key material",
+            ],
             findings,
         )
 
@@ -94,9 +111,16 @@ class PublicScannerTests(unittest.TestCase):
             git("config", "user.name", "Scanner Test")
             git("config", "user.email", "scanner@example.invalid")
             token = b"sk-" + (b"a" * 26)
+            tavily_token = b"tvly-" + b"prod-" + (b"b" * 24)
             private_key = b"BEGIN " + b"OPENSSH PRIVATE KEY"
             (root / "binary.dat").write_bytes(
-                b"prefix\x00API_KEY=" + token + b"\x00" + private_key + b"\x00"
+                b"prefix\x00API_KEY="
+                + token
+                + b"\x00"
+                + tavily_token
+                + b"\x00"
+                + private_key
+                + b"\x00"
             )
             git("add", "binary.dat")
             git("commit", "-qm", "add binary fixture")
@@ -105,6 +129,7 @@ class PublicScannerTests(unittest.TestCase):
                 self.assertEqual(
                     [
                         "binary.dat: generic API token",
+                        "binary.dat: Tavily API token",
                         "binary.dat: private key material",
                     ],
                     scanner.scan_ref(None, {}),
@@ -128,6 +153,7 @@ class PublicScannerTests(unittest.TestCase):
 
             self.assertTrue(any("binary.dat: generic API token" in item for item in history))
             self.assertTrue(any("renamed.bin: generic API token" in item for item in history))
+            self.assertTrue(any("Tavily API token" in item for item in history))
             self.assertTrue(any("private key material" in item for item in history))
 
     def test_oversized_binary_fails_closed_without_decoding(self) -> None:

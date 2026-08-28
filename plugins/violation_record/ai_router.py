@@ -51,10 +51,24 @@ class AIRouterError(Exception):
     pass
 
 
-def _gateway_enabled() -> bool:
+def _gateway_enabled(state: object | None = None) -> bool:
     from plugins.feature_control.runtime import FEATURES
 
-    return FEATURES.llm_gateway_allowed("business")
+    if state is None:
+        state = FEATURES.snapshot()
+    if bool(getattr(state, "economy_mode_enabled", False)):
+        return True
+    return bool(
+        getattr(FEATURES, "business_capable", True)
+        and getattr(state, "llm_gateway_enabled", False)
+        and getattr(state, "llm_gateway_business_enabled", False)
+    )
+
+
+def _text_api_available(*, economy_mode: bool) -> bool:
+    if economy_mode:
+        return bool(getattr(CONFIG, "glm_api_key", ""))
+    return bool(CONFIG.ai_api_key)
 
 
 _MEMBER_QUERY_RE = re.compile(
@@ -222,13 +236,20 @@ async def parse_intent(message: str, referenced_time: str | None = None) -> dict
     shortcut = _keyword_shortcut(message)
     if shortcut:
         return shortcut
-    if not CONFIG.ai_api_key:
-        raise AIRouterError("AI 未启用或缺少 AI_API_KEY，无法进行自然语言解析。")
+    from plugins.feature_control.runtime import FEATURES
+
+    state = FEATURES.snapshot()
+    economy_mode = bool(getattr(state, "economy_mode_enabled", False))
+    use_gateway = _gateway_enabled(state)
+    if not _text_api_available(economy_mode=economy_mode):
+        raise AIRouterError("AI 未启用或缺少当前文字模型密钥，无法进行自然语言解析。")
     messages = _intent_messages(message, referenced_time=referenced_time)
     try:
-        if _gateway_enabled():
+        if use_gateway:
             gateway = await get_gateway()
-            content = await gateway.parse_business_intent(messages)
+            content = await gateway.parse_business_intent(
+                messages, economy_mode=economy_mode
+            )
         else:
             content = await _legacy_complete(messages)
     except GatewayError as exc:

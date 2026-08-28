@@ -22,6 +22,7 @@ SENSITIVE_KEYS = (
     "BOT_SELF_ID",
     "NAPCAT_ACCESS_TOKEN",
     "AI_API_KEY",
+    "GLM_API_KEY",
     "TAVILY_API_KEY",
     "ADMIN_SEED",
     "SUPERUSERS",
@@ -155,7 +156,7 @@ class PublicSourceBoundaryTests(unittest.TestCase):
             readme.index("## 模块化运行时功能控制")
         ]
         for required in (
-            "共享一套异步连接池",
+            "为每个供应商复用持久异步连接池",
             "总并发",
             "错误只按类别",
             "llm_usage_events",
@@ -170,6 +171,7 @@ class PublicSourceBoundaryTests(unittest.TestCase):
         values = dotenv_values(ROOT / ".env.example")
         for key in (
             "LLM_GATEWAY_ENABLED",
+            "ECONOMY_MODE_ENABLED",
             "PROMPT_BUILDER_ENABLED",
             "LLM_GATEWAY_VISION_ENABLED",
             "LLM_GATEWAY_PRIVATE_MEMORY_ENABLED",
@@ -178,6 +180,11 @@ class PublicSourceBoundaryTests(unittest.TestCase):
             "LLM_GATEWAY_BUSINESS_ENABLED",
         ):
             self.assertEqual("false", values.get(key), key)
+        self.assertEqual(
+            "https://open.bigmodel.cn/api/paas/v4", values.get("GLM_BASE_URL")
+        )
+        self.assertEqual("glm-4.7-flash", values.get("GLM_MODEL"))
+        self.assertEqual("", values.get("GLM_API_KEY"))
 
 
 if __name__ == "__main__":

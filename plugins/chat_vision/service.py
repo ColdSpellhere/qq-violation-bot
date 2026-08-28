@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
+from plugins.feature_control.runtime import FEATURES
 from plugins.violation_record.config import CONFIG
 
 from .client import describe_image
@@ -199,7 +200,12 @@ def _read_valid_stored_file(asset: ChatImageAsset) -> bytes | None:
     return content
 
 
-async def _finish_claim(store: ChatVisionStore, asset: ChatImageAsset) -> None:
+async def _finish_claim(
+    store: ChatVisionStore,
+    asset: ChatImageAsset,
+    *,
+    use_gateway: bool,
+) -> None:
     try:
         content = _read_valid_stored_file(asset)
         mime_type = asset.mime_type
@@ -239,6 +245,8 @@ async def _finish_claim(store: ChatVisionStore, asset: ChatImageAsset) -> None:
             api_key=CONFIG.ai_api_key,
             model=CONFIG.chat_vision_model,
             timeout=CONFIG.chat_vision_timeout,
+            allow_in_flight=True,
+            use_gateway=use_gateway,
         )
         store.mark_ready(asset.id, description)
     except Exception as exc:
@@ -266,9 +274,17 @@ async def process_pending_asset(
     asset: ChatImageAsset, *, store: ChatVisionStore | None = None
 ) -> None:
     active_store = store or _active_store()
+    if not FEATURES.image_understanding_allowed():
+        return
+    gateway_allowed = getattr(FEATURES, "llm_gateway_allowed", lambda _domain: False)
+    use_gateway = bool(gateway_allowed("vision"))
     claimed = active_store.claim(asset.id, CONFIG.chat_vision_max_retries)
     if claimed is not None:
-        await _finish_claim(active_store, claimed)
+        await _finish_claim(
+            active_store,
+            claimed,
+            use_gateway=use_gateway,
+        )
 
 
 async def process_image_event(event: GroupMessageEvent) -> list[ChatImageAsset]:
@@ -277,6 +293,8 @@ async def process_image_event(event: GroupMessageEvent) -> list[ChatImageAsset]:
     group_id = int(event.group_id)
     message_id = str(event.message_id)
     event_time = int(event.time)
+    if not FEATURES.image_understanding_allowed():
+        return store.for_message(group_id, message_id)
     if not live_event_time_allowed(event_time):
         logger.warning(
             "群聊图片事件时间超出实时处理窗口 "

@@ -4,6 +4,7 @@ import json
 import unittest
 from dataclasses import replace
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from plugins.llm_gateway.errors import GatewayAuthenticationError
@@ -16,6 +17,27 @@ class _Gateway:
         self.generate_chat_reply = AsyncMock(
             side_effect=AssertionError("chat model must not parse business intent")
         )
+
+
+class _Features:
+    def __init__(
+        self, *, enabled: bool, economy: bool, business_capable: bool = True
+    ) -> None:
+        self.enabled = enabled
+        self.economy = economy
+        self.business_capable = business_capable
+
+    def snapshot(self):
+        return SimpleNamespace(
+            economy_mode_enabled=self.economy,
+            llm_gateway_enabled=self.enabled,
+            llm_gateway_business_enabled=self.enabled,
+        )
+
+    def llm_gateway_allowed(self, domain: str) -> bool:
+        if domain != "business":
+            raise AssertionError(domain)
+        return self.economy or self.enabled
 
 
 class _FixedDateTime(datetime):
@@ -32,6 +54,66 @@ def _output(intent: str, **overrides: object) -> str:
 
 
 class BusinessGatewayMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_only_economy_mode_never_falls_back_to_primary_legacy(
+        self,
+    ) -> None:
+        features = _Features(
+            enabled=False,
+            economy=True,
+            business_capable=False,
+        )
+        gateway = _Gateway(_output("unknown"))
+        legacy = AsyncMock(return_value=_output("unknown"))
+        config = replace(
+            ai_router.CONFIG,
+            ai_api_key="synthetic-primary-key",
+            glm_api_key="synthetic-economy-key",
+        )
+
+        with (
+            patch.object(ai_router, "CONFIG", config),
+            patch("plugins.feature_control.runtime.FEATURES", features),
+            patch.object(ai_router, "get_gateway", AsyncMock(return_value=gateway)),
+            patch.object(ai_router, "_legacy_complete", legacy),
+        ):
+            await ai_router.parse_intent("请解析这条业务消息")
+
+        legacy.assert_not_awaited()
+        self.assertIs(
+            True,
+            gateway.parse_business_intent.await_args.kwargs["economy_mode"],
+        )
+
+    async def test_business_request_freezes_economy_mode_before_gateway_await(
+        self,
+    ) -> None:
+        features = _Features(enabled=False, economy=True)
+        gateway = _Gateway(_output("unknown"))
+
+        async def delayed_gateway():
+            features.economy = False
+            return gateway
+
+        config = replace(
+            ai_router.CONFIG,
+            ai_api_key="synthetic-primary-key",
+            glm_api_key="synthetic-economy-key",
+        )
+        with (
+            patch.object(ai_router, "CONFIG", config),
+            patch("plugins.feature_control.runtime.FEATURES", features),
+            patch.object(
+                ai_router, "get_gateway", AsyncMock(side_effect=delayed_gateway)
+            ),
+        ):
+            await ai_router.parse_intent("请解析这条业务消息")
+
+        gateway.parse_business_intent.assert_awaited_once()
+        self.assertIs(
+            True,
+            gateway.parse_business_intent.await_args.kwargs["economy_mode"],
+        )
+
     async def test_fixed_business_corpus_is_normalized_identically(self) -> None:
         corpus = (
             ("记录小明刚刚刷屏", _output("create_violation")),

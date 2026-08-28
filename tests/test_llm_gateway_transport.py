@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, call
 
 import httpx
 
-from plugins.llm_gateway.contracts import GatewayRequest, LLMTask
+from plugins.llm_gateway.contracts import GatewayRequest, LLMProvider, LLMTask
 from plugins.llm_gateway.errors import (
     GatewayAuthenticationError,
     GatewayClientError,
@@ -122,6 +122,47 @@ class LLMTransportTests(unittest.IsolatedAsyncioTestCase):
                     ["https://api.deepseek.com/v1/chat/completions"], seen
                 )
 
+    async def test_bigmodel_base_url_uses_exact_secure_api_prefix(self) -> None:
+        seen: list[str] = []
+
+        def handler(http_request: httpx.Request) -> httpx.Response:
+            seen.append(str(http_request.url))
+            return httpx.Response(
+                200,
+                json={"model": "glm-4.7-flash", "choices": [{"message": {"content": "ok"}}]},
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.clients.append(client)
+        transport = LLMTransport(
+            base_url="https://open.bigmodel.cn/api/paas/v4/",
+            api_key="synthetic-key",
+            client=client,
+            total_limit=1,
+            lane_limits={task.value: 1 for task in LLMTask},
+            max_attempts=1,
+        )
+
+        await transport.complete(gateway_request())
+        self.assertEqual(
+            ["https://open.bigmodel.cn/api/paas/v4/chat/completions"], seen
+        )
+
+        for invalid in (
+            "http://open.bigmodel.cn/api/paas/v4",
+            "https://open.bigmodel.cn.evil.invalid/api/paas/v4",
+            "https://open.bigmodel.cn:444/api/paas/v4",
+            "https://open.bigmodel.cn/api/paas/v4/extra",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(GatewayConfigurationError):
+                LLMTransport(
+                    base_url=invalid,
+                    api_key="synthetic-key",
+                    client=client,
+                    total_limit=1,
+                    lane_limits={task.value: 1 for task in LLMTask},
+                )
+
     async def test_configuration_requires_http_url_key_and_complete_lane_limits(self) -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
         self.clients.append(client)
@@ -224,6 +265,83 @@ class LLMTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, completion.retries)
         sleep.assert_awaited_once_with(2.0)
 
+    async def test_bigmodel_429_business_codes_do_not_blindly_retry(self) -> None:
+        request = replace(gateway_request(), provider=LLMProvider.ECONOMY)
+        for code, expected in (
+            ("1113", GatewayPaymentRequiredError),
+            ("1308", GatewayClientError),
+            ("1309", GatewayClientError),
+            ("1321", GatewayClientError),
+        ):
+            attempts = 0
+
+            def handler(_request: httpx.Request) -> httpx.Response:
+                nonlocal attempts
+                attempts += 1
+                return httpx.Response(
+                    429,
+                    json={"error": {"code": code, "message": "sensitive detail"}},
+                )
+
+            with self.subTest(code=code), self.assertRaises(expected) as raised:
+                await self.make_transport(handler).complete(request)
+            self.assertEqual(1, attempts)
+            self.assertEqual(0, raised.exception.retries)
+            self.assertNotIn("sensitive", str(raised.exception))
+
+    async def test_bigmodel_rate_and_busy_codes_retry_without_exposing_body(self) -> None:
+        request = replace(gateway_request(), provider=LLMProvider.ECONOMY)
+        for code in ("1302", "1305"):
+            attempts = 0
+            sleep = AsyncMock()
+
+            def handler(_request: httpx.Request) -> httpx.Response:
+                nonlocal attempts
+                attempts += 1
+                return httpx.Response(
+                    429,
+                    json={"error": {"code": code, "message": "sensitive detail"}},
+                )
+
+            with self.subTest(code=code), self.assertRaises(GatewayRateLimitError):
+                await self.make_transport(handler, sleep=sleep).complete(request)
+            self.assertEqual(3, attempts)
+            self.assertEqual([call(0.5), call(1.0)], sleep.await_args_list)
+
+    async def test_bigmodel_network_finish_reason_retries(self) -> None:
+        attempts = 0
+        sleep = AsyncMock()
+        request = replace(gateway_request(), provider=LLMProvider.ECONOMY)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "model": "glm-4.7-flash",
+                        "choices": [
+                            {
+                                "finish_reason": "network_error",
+                                "message": {"content": "partial"},
+                            }
+                        ],
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "model": "glm-4.7-flash",
+                    "choices": [{"message": {"content": "ok"}}],
+                },
+            )
+
+        completion = await self.make_transport(handler, sleep=sleep).complete(request)
+        self.assertEqual("ok", completion.content)
+        self.assertEqual(1, completion.retries)
+        sleep.assert_awaited_once_with(0.5)
+
     async def test_timeout_and_connect_errors_retry_but_cancellation_escapes(self) -> None:
         for exc, expected in (
             (httpx.ReadTimeout("slow"), GatewayTimeout),
@@ -257,6 +375,21 @@ class LLMTransportTests(unittest.IsolatedAsyncioTestCase):
             (lambda: httpx.Response(200, json={"model": "m", "choices": []}), GatewayContractError),
             (lambda: httpx.Response(200, json={"model": "m", "choices": [{"message": {}}]}), GatewayContractError),
             (lambda: httpx.Response(200, json={"model": "m", "choices": [{"message": {"content": "  "}}]}), GatewayEmptyContentError),
+            (
+                lambda: httpx.Response(
+                    200,
+                    json={
+                        "model": "m",
+                        "choices": [
+                            {
+                                "finish_reason": "length",
+                                "message": {"content": '{"partial":true'},
+                            }
+                        ],
+                    },
+                ),
+                GatewayContractError,
+            ),
         )
         for response_factory, expected in cases:
             attempts = 0

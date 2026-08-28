@@ -84,6 +84,19 @@ class ChatVisionMatcherTests(unittest.TestCase):
         ):
             self.assertFalse(matcher.chat_image_candidate(event))
 
+    def test_candidate_rejects_economy_mode_before_creating_image_work(self) -> None:
+        event = _event(_image("https://cdn.example/one.jpg"))
+        features = SimpleNamespace(
+            group_chat_allowed=lambda group_id: True,
+            image_understanding_allowed=lambda: False,
+        )
+
+        with (
+            patch.object(matcher, "CONFIG", SimpleNamespace(chat_vision_enabled=True)),
+            patch.object(matcher, "FEATURES", features),
+        ):
+            self.assertFalse(matcher.chat_image_candidate(event))
+
     def test_candidate_rejects_group_outside_runtime_allowlist(self) -> None:
         event = _event(_image("https://cdn.example/one.jpg"), group_id=OTHER_GROUP_ID)
         features = SimpleNamespace(group_chat_allowed=lambda group_id: group_id == GROUP_ID)
@@ -477,6 +490,49 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, ready[0].attempts)
         download.assert_awaited_once()
         self.assertEqual(2, describe.await_count)
+
+    async def test_claimed_image_finishes_when_economy_mode_turns_on_mid_task(self) -> None:
+        asset = self.store.ensure_pending(
+            GROUP_ID,
+            "456",
+            1,
+            "https://cdn.example/in-flight.jpg",
+            int(time.time()),
+        )
+        checks = 0
+
+        def image_understanding_allowed() -> bool:
+            nonlocal checks
+            checks += 1
+            return checks == 1
+
+        features = SimpleNamespace(
+            image_understanding_allowed=image_understanding_allowed
+        )
+        describe = AsyncMock(return_value="切换前已开始的图片")
+        with (
+            patch.object(service, "FEATURES", features),
+            patch.object(service, "CONFIG", self.config),
+            patch.object(
+                service,
+                "download_chat_image",
+                new=AsyncMock(
+                    return_value=DownloadedChatImage(
+                        JPEG_ONE,
+                        "image/jpeg",
+                        "jpg",
+                    )
+                ),
+            ),
+            patch.object(service, "describe_image", new=describe),
+        ):
+            await service.process_pending_asset(asset, store=self.store)
+
+        stored = self.store.for_message(GROUP_ID, "456")[0]
+        self.assertEqual("ready", stored.status)
+        self.assertEqual("切换前已开始的图片", stored.description)
+        self.assertEqual(1, stored.attempts)
+        self.assertTrue(describe.await_args.kwargs["allow_in_flight"])
 
     async def test_mark_downloaded_failure_removes_the_just_written_file(self) -> None:
         event = _event(_image("https://cdn.example/one.jpg"))

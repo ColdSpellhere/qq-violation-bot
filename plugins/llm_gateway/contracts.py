@@ -14,8 +14,14 @@ class LLMTask(str, Enum):
     MEMBER_EXTRACTION = "member_extraction"
     MEMBER_SUMMARY = "member_summary"
     PRIVATE_SUMMARY = "private_summary"
+    PRIVATE_FACT_EXTRACTION = "private_fact_extraction"
     RELATIONSHIP_UPDATE = "relationship_update"
     IMAGE_DESCRIPTION = "image_description"
+
+
+class LLMProvider(str, Enum):
+    PRIMARY = "primary"
+    ECONOMY = "economy"
 
 
 def _freeze_json(value: Any) -> Any:
@@ -140,10 +146,13 @@ class GatewayRequest:
     temperature: float | None = None
     response_format: Mapping[str, object] | None = None
     thinking_disabled: bool = False
+    provider: LLMProvider = LLMProvider.PRIMARY
 
     def __post_init__(self) -> None:
         if not isinstance(self.task, LLMTask):
             raise ValueError("task must be an LLMTask")
+        if not isinstance(self.provider, LLMProvider):
+            raise ValueError("provider must be an LLMProvider")
         if not isinstance(self.messages, tuple):
             raise ValueError("messages must be a tuple")
         if not self.messages:

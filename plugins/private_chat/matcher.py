@@ -191,9 +191,10 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
     if text is None:
         return
     real_text = plain_text.strip()
+    image_allowed = getattr(FEATURES, "image_understanding_allowed", lambda: True)
     vision_enabled = has_image and bool(
         getattr(CONFIG, "chat_vision_enabled", False)
-    )
+    ) and bool(image_allowed())
     if has_image and not real_text and not vision_enabled:
         return
 
@@ -333,6 +334,8 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             return
         if not current_event_is_live():
             return
+        if has_image and not real_text and not bool(image_allowed()):
+            return
 
         profiles: tuple[MemberProfile, ...] = ()
         relationship = None
@@ -389,6 +392,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                 legacy_profiles=legacy_profiles,
                 max_messages=3,
                 images=images,
+                real_text_present=bool(real_text),
             )
         except RandomChatAIError as exc:
             logger.warning(f"私聊 AI 回复失败：{type(exc).__name__}")

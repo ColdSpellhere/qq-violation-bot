@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 import json
 import logging
@@ -90,14 +91,41 @@ async def generate_replies(
     open_topics: tuple[str, ...] = (),
     legacy_profiles: Sequence[MemberProfile] | None = None,
     max_messages: int | None = None,
+    real_text_present: bool | None = None,
 ) -> tuple[str, ...]:
-    if not CONFIG.ai_api_key:
+    if real_text_present is not None and type(real_text_present) is not bool:
+        raise ValueError("real_text_present must be boolean")
+    feature_state = FEATURES.snapshot()
+    economy_mode = bool(getattr(feature_state, "economy_mode_enabled", False))
+    if economy_mode and real_text_present is False:
         return ()
+    gateway_allowed = economy_mode or (
+        bool(getattr(feature_state, "llm_gateway_enabled", False))
+        and bool(getattr(feature_state, "llm_gateway_chat_enabled", False))
+    )
+    if economy_mode:
+        if not getattr(CONFIG, "glm_api_key", ""):
+            return ()
+        context = tuple(
+            replace(item, image_descriptions=()) for item in context
+        )
+        if current is not None:
+            current = replace(current, image_descriptions=())
+        images = ()
+    elif not CONFIG.ai_api_key:
+        return ()
+    gateway = None
+    if gateway_allowed:
+        try:
+            gateway = await get_gateway()
+        except GatewayError as exc:
+            raise RandomChatAIError(type(exc).__name__) from None
+        except Exception as exc:
+            raise RandomChatAIError(str(exc)) from exc
     reply_limit = max_messages or (
         3 if chat_mode == "private" or addressed or required_reply else 1
     )
     reply_limit = max(1, min(3, reply_limit))
-    feature_state = FEATURES.snapshot()
     if not feature_state.relationship_state_enabled:
         relationship = None
         open_topics = ()
@@ -205,9 +233,12 @@ async def generate_replies(
     messages = _with_reply_contract(messages, max_messages=reply_limit)
     messages = _attach_images(messages, images)
     try:
-        if FEATURES.llm_gateway_allowed("chat"):
-            gateway = await get_gateway()
-            content = await gateway.generate_chat_reply(messages, images=bool(images))
+        if gateway is not None:
+            content = await gateway.generate_chat_reply(
+                messages,
+                images=bool(images),
+                economy_mode=economy_mode,
+            )
         else:
             content = await _legacy_complete(messages, images=bool(images))
     except GatewayError as exc:

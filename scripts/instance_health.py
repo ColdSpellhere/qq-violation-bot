@@ -2,11 +2,19 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import re
 import subprocess
+import sys
+from collections.abc import Mapping
 from typing import Callable
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from plugins.feature_control.state import FeatureController, FeatureState
 
 try:
     from scripts.deploy_instance import DeploymentError, verify_release
@@ -17,20 +25,62 @@ except ImportError:
 INSTANCES = frozenset({"carrot", "kona"})
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 DEFAULT_REPOSITORY = Path("/opt/qq-bots/repository.git")
+_HEALTH_FEATURE_DEFAULTS = FeatureState(
+    business_enabled=False,
+    chat_enabled=False,
+    group_chat_enabled=False,
+    private_chat_enabled=False,
+    group_chat_allowed_group_ids=(),
+    private_chat_allowed_user_ids=(),
+)
 
 
-def validate_runtime_state(instance: str, path: Path) -> None:
-    try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return
-    if not isinstance(raw, dict):
-        raise ValueError("runtime feature state must be an object")
-    if instance == "kona" and (
-        raw.get("business_enabled") is not False
-        or raw.get("llm_gateway_business_enabled") is not False
-    ):
-        raise ValueError("kona business capability must remain disabled")
+def validate_runtime_state(
+    instance: str,
+    path: Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> None:
+    path = Path(path)
+    state = FeatureController._load_state(path, _HEALTH_FEATURE_DEFAULTS)
+    if state is None:
+        state = FeatureController._load_state(
+            path.with_suffix(path.suffix + ".bak"),
+            _HEALTH_FEATURE_DEFAULTS,
+        )
+    state_found = state is not None
+    values = environment or {}
+    if instance == "kona":
+        if values.get("BOT_MODE", "").strip().lower() != "chat_only":
+            raise ValueError("kona must remain a chat-only instance")
+        truthy = {"1", "true", "yes", "on"}
+        if any(
+            values.get(name, "").strip().lower() in truthy
+            for name in ("BUSINESS_ENABLED", "LLM_GATEWAY_BUSINESS_ENABLED")
+        ):
+            raise ValueError("kona chat-only environment cannot enable business")
+        if state is not None and (
+            state.business_enabled is not False
+            or state.llm_gateway_business_enabled is not False
+        ):
+            raise ValueError("kona business capability must remain disabled")
+    persisted_economy = state.economy_mode_enabled if state is not None else False
+    requested_economy = persisted_economy if state_found else (
+        values.get("ECONOMY_MODE_ENABLED", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if requested_economy:
+        valid_economy = (
+            values.get(
+                "GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"
+            ).strip().rstrip("/")
+            == "https://open.bigmodel.cn/api/paas/v4"
+            and values.get("GLM_MODEL", "glm-4.7-flash").strip()
+            == "glm-4.7-flash"
+            and bool(values.get("GLM_API_KEY", "").strip())
+        )
+        if not valid_economy:
+            raise ValueError("economy mode provider configuration is unavailable")
 
 
 def _run(*args: str) -> str:
@@ -88,7 +138,11 @@ def verify(
     logs = current_invocation_logs(f"qqbot@{instance}.service").lower()
     if "traceback (most recent call last)" in logs or "critical" in logs:
         raise RuntimeError("recent service logs contain a startup failure")
-    validate_runtime_state(instance, instance_root / "data/runtime_features.json")
+    validate_runtime_state(
+        instance,
+        instance_root / "data/runtime_features.json",
+        environment=values,
+    )
 
 
 def main() -> int:

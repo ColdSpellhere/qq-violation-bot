@@ -74,23 +74,52 @@ async def _legacy_complete(messages: tuple[dict[str, object], ...]) -> object:
 
 
 async def _complete(
-    task: str, messages: tuple[dict[str, object], ...]
+    task: str,
+    messages: tuple[dict[str, object], ...],
+    *,
+    use_gateway: bool,
+    economy_mode: bool,
 ) -> object:
-    if not FEATURES.llm_gateway_allowed("member_memory"):
+    if not use_gateway:
         return await _legacy_complete(messages)
     gateway = await get_gateway()
     if task == "extract":
-        return await gateway.extract_member_memories(messages)
+        return await gateway.extract_member_memories(
+            messages, economy_mode=economy_mode
+        )
     if task == "summary":
-        return await gateway.summarize_member_memory(messages)
+        return await gateway.summarize_member_memory(
+            messages, economy_mode=economy_mode
+        )
     raise ValueError("unknown member memory task")
 
 
+def _request_policy() -> tuple[bool, bool]:
+    state = FEATURES.snapshot()
+    economy_mode = bool(getattr(state, "economy_mode_enabled", False))
+    use_gateway = economy_mode or bool(
+        getattr(state, "llm_gateway_enabled", False)
+        and getattr(state, "llm_gateway_member_memory_enabled", False)
+    )
+    return use_gateway, economy_mode
+
+
 async def extract_memory_candidates(context: Sequence[ContextMessage]) -> list[dict[str, object]]:
-    if not CONFIG.ai_api_key or not context:
+    use_gateway, economy_mode = _request_policy()
+    api_available = bool(
+        getattr(CONFIG, "glm_api_key", "") if economy_mode else CONFIG.ai_api_key
+    )
+    if not api_available or not context:
         return []
     try:
-        content = str(await _complete("extract", _extraction_messages(context))).strip()
+        content = str(
+            await _complete(
+                "extract",
+                _extraction_messages(context),
+                use_gateway=use_gateway,
+                economy_mode=economy_mode,
+            )
+        ).strip()
         if content.startswith("```"):
             content = content.strip("`").removeprefix("json").strip()
         parsed = json.loads(content)
@@ -101,10 +130,19 @@ async def extract_memory_candidates(context: Sequence[ContextMessage]) -> list[d
 
 
 async def generate_memory_summary(existing: str, facts: Sequence[MemoryTrait]) -> str | None:
-    if not CONFIG.ai_api_key or not facts:
+    use_gateway, economy_mode = _request_policy()
+    api_available = bool(
+        getattr(CONFIG, "glm_api_key", "") if economy_mode else CONFIG.ai_api_key
+    )
+    if not api_available or not facts:
         return None
     try:
-        content = await _complete("summary", _summary_messages(existing, facts))
+        content = await _complete(
+            "summary",
+            _summary_messages(existing, facts),
+            use_gateway=use_gateway,
+            economy_mode=economy_mode,
+        )
         if not isinstance(content, str):
             return None
         text = content.strip()

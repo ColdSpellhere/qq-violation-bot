@@ -14,6 +14,7 @@ _SWITCH_COMMANDS = {
     "/模型网关": ("llm_gateway_enabled", "模型网关"),
     "/提示构建": ("prompt_builder_enabled", "提示构建"),
     "/联网搜索": ("web_search_enabled", "联网搜索"),
+    "/穷鬼模式": ("economy_mode_enabled", "穷鬼模式"),
 }
 _GATEWAY_DOMAIN_COMMANDS = {
     "视觉": ("llm_gateway_vision_enabled", "模型网关视觉调用"),
@@ -79,6 +80,16 @@ def _status(controller: FeatureController) -> str:
             f"关系状态：{_switch_text(state.relationship_state_enabled)}",
             f"记忆治理：{_switch_text(state.memory_governance_enabled)}",
             f"模型网关：{_switch_text(state.llm_gateway_enabled)}",
+            "穷鬼模式："
+            + (
+                (
+                    "开（文字：glm-4.7-flash；图片理解：关）"
+                    if controller.economy_provider_available
+                    else "开（GLM 配置不可用；文字调用已阻断；图片理解：关）"
+                )
+                if state.economy_mode_enabled
+                else "关"
+            ),
             f"模型网关视觉调用：{_switch_text(state.llm_gateway_vision_enabled)}",
             "模型网关私聊记忆调用："
             f"{_switch_text(state.llm_gateway_private_memory_enabled)}",
@@ -96,6 +107,12 @@ def _set_gateway_switch(
     parts: list[str], controller: FeatureController, actor: str
 ) -> str:
     if len(parts) == 2 and parts[1] in {"开", "关"}:
+        if parts[1] == "关":
+            controller.set_switches(
+                {"llm_gateway_enabled": False, "economy_mode_enabled": False},
+                actor,
+            )
+            return "模型网关已关闭。"
         return _set_switch(parts, controller, actor)
     if (
         len(parts) == 3
@@ -122,6 +139,23 @@ def _set_switch(parts: list[str], controller: FeatureController, actor: str) -> 
     enabled = parts[1] == "开"
     if field_name == "business_enabled" and not controller.business_capable:
         return "业务功能不可用：当前为纯聊天实例。"
+    if field_name == "economy_mode_enabled":
+        if enabled and not controller.economy_provider_available:
+            return "穷鬼模式不可用：当前实例未完整配置 GLM 网关。"
+        if (
+            not enabled
+            and controller.snapshot().economy_mode_enabled
+            and not controller.primary_provider_available
+        ):
+            return (
+                "穷鬼模式无法关闭：当前实例未配置原文字模型；"
+                "请先恢复原模型配置；如需停止当前纯 GLM 实例的模型调用，"
+                "可使用 /模型网关 关。"
+            )
+        controller.set_switch(field_name, enabled, actor)
+        if enabled:
+            return "穷鬼模式已开启：文字模型切换为 glm-4.7-flash，图片理解已停用。"
+        return "穷鬼模式已关闭：已恢复原文字模型和图片理解配置。"
     controller.set_switch(field_name, enabled, actor)
     return f"{label}已{'开启' if enabled else '关闭'}。"
 

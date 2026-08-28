@@ -274,6 +274,7 @@ async def _complete(
     task: str,
     messages: tuple[dict[str, object], dict[str, object]],
     use_gateway: bool,
+    economy_mode: bool,
 ) -> str:
     if not use_gateway:
         return await _legacy_complete(
@@ -282,12 +283,30 @@ async def _complete(
     try:
         gateway = await get_gateway()
         if task == "private_summary":
-            return await gateway.summarize_private_conversation(messages)
+            return await gateway.summarize_private_conversation(
+                messages, economy_mode=economy_mode
+            )
+        if task == "private_facts":
+            return await gateway.extract_private_facts(
+                messages, economy_mode=economy_mode
+            )
         if task == "relationship":
-            return await gateway.update_relationship_state(messages)
+            return await gateway.update_relationship_state(
+                messages, economy_mode=economy_mode
+            )
         raise ValueError("unknown private memory gateway task")
     except GatewayError as exc:
         raise _map_gateway_error(exc) from exc
+
+
+def _request_policy() -> tuple[bool, bool]:
+    state = FEATURES.snapshot()
+    economy_mode = bool(getattr(state, "economy_mode_enabled", False))
+    use_gateway = economy_mode or bool(
+        getattr(state, "llm_gateway_enabled", False)
+        and getattr(state, "llm_gateway_private_memory_enabled", False)
+    )
+    return use_gateway, economy_mode
 
 
 def _summary_messages(
@@ -384,17 +403,36 @@ def _messages_payload(messages: Sequence[PrivateMessage]) -> str:
     )
 
 
+def _fact_messages(
+    messages: Sequence[PrivateMessage],
+) -> tuple[dict[str, object], dict[str, object]]:
+    return (
+        {
+            "role": "system",
+            "content": (
+                "保守提取说话者本人明确表达、未来仍有用的稳定非敏感事实。拒绝推测、情绪、评价、"
+                "密码、令牌、密钥和其他凭据。source_message_id 和 source_quote 必须来自输入。"
+                "只输出严格 JSON：{\"facts\":[{\"fact_text\":\"...\","
+                "\"source_message_id\":\"...\",\"source_quote\":\"...\","
+                "\"certainty\":\"explicit\"}]}。"
+            ),
+        },
+        {"role": "user", "content": _messages_payload(messages)},
+    )
+
+
 async def summarize_private_conversation(
     previous: str, messages: Sequence[PrivateMessage]
 ) -> str | None:
     if not messages:
         return None
     try:
-        use_gateway = FEATURES.llm_gateway_allowed("private_memory")
+        use_gateway, economy_mode = _request_policy()
         content = await _complete(
             task="private_summary",
             messages=_summary_messages(previous, messages),
             use_gateway=use_gateway,
+            economy_mode=economy_mode,
         )
         return _parse_summary(content, gateway_contract=use_gateway)
     except PrivateMemoryAIError as exc:
@@ -409,15 +447,12 @@ async def extract_private_facts(
         return ()
     user_id = messages[0].user_id
     try:
-        content = await _legacy_complete(
-            system=(
-                "保守提取说话者本人明确表达、未来仍有用的稳定非敏感事实。拒绝推测、情绪、评价、"
-                "密码、令牌、密钥和其他凭据。source_message_id 和 source_quote 必须来自输入。"
-                "只输出严格 JSON：{\"facts\":[{\"fact_text\":\"...\","
-                "\"source_message_id\":\"...\",\"source_quote\":\"...\","
-                "\"certainty\":\"explicit\"}]}。"
-            ),
-            user=_messages_payload(messages),
+        use_gateway, economy_mode = _request_policy()
+        content = await _complete(
+            task="private_facts",
+            messages=_fact_messages(messages),
+            use_gateway=use_gateway,
+            economy_mode=economy_mode,
         )
         return _parse_facts(content, user_id=user_id)
     except PrivateMemoryAIError as exc:
@@ -431,13 +466,14 @@ async def generate_relationship_candidate(
     if not messages:
         return None
     try:
-        use_gateway = FEATURES.llm_gateway_allowed("private_memory")
+        use_gateway, economy_mode = _request_policy()
         content = await _complete(
             task="relationship",
             messages=_relationship_messages(
                 current, messages, gateway_contract=use_gateway
             ),
             use_gateway=use_gateway,
+            economy_mode=economy_mode,
         )
         return _parse_relationship(content, gateway_contract=use_gateway)
     except PrivateMemoryAIError as exc:

@@ -70,9 +70,10 @@ def _config(*, vision_enabled: bool = True, max_bytes: int = 10) -> SimpleNamesp
 
 
 class _MutableFeatures:
-    def __init__(self, *, persistent: bool = False) -> None:
+    def __init__(self, *, persistent: bool = False, economy: bool = False) -> None:
         self.allowed = True
         self.persistent = persistent
+        self.economy = economy
 
     def private_chat_allowed(self, user_id: str) -> bool:
         return self.allowed and str(user_id) == "123456"
@@ -81,7 +82,11 @@ class _MutableFeatures:
         return SimpleNamespace(
             private_memory_enabled=self.persistent,
             relationship_state_enabled=False,
+            economy_mode_enabled=self.economy,
         )
+
+    def image_understanding_allowed(self) -> bool:
+        return not self.economy
 
 
 def _vision_result(
@@ -380,6 +385,71 @@ class PrivateVisionMatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("这是什么", generate.await_args.args[0])
         self.assertEqual((image,), generate.await_args.kwargs["images"])
         self.assertEqual("这是什么", generate.await_args.kwargs["current"].text)
+
+    async def test_economy_mode_drops_pure_image_and_degrades_mixed_to_text_only(self) -> None:
+        self.features = _MutableFeatures(economy=True)
+        understand = AsyncMock(return_value=_vision_result())
+        generate = AsyncMock(return_value="只回答文字")
+        pure_bot = AsyncMock()
+        mixed_bot = AsyncMock()
+        with self._runtime(), patch.object(
+            private_matcher,
+            "understand_private_images",
+            new=understand,
+            create=True,
+        ), patch.object(
+            private_matcher, "generate_reply", new=generate
+        ), patch.object(private_matcher, "choose_sticker", return_value=None):
+            await private_matcher.handle_private_message(
+                pure_bot,
+                _private_event(image_urls=("https://images.invalid/pure.png",)),
+            )
+            await private_matcher.handle_private_message(
+                mixed_bot,
+                _private_event(
+                    "只看这句话",
+                    image_urls=("https://images.invalid/mixed.png",),
+                    message_id=457,
+                ),
+            )
+
+        understand.assert_not_awaited()
+        generate.assert_awaited_once()
+        self.assertEqual("只看这句话", generate.await_args.args[0])
+        self.assertEqual((), generate.await_args.kwargs["images"])
+        self.assertEqual((), generate.await_args.kwargs["current"].image_descriptions)
+        pure_bot.send_private_msg.assert_not_awaited()
+        mixed_bot.send_private_msg.assert_awaited_once()
+
+    async def test_mode_switch_during_private_vision_silences_pure_image(self) -> None:
+        image = VisionImage(b"raw", "image/png", "456", 0)
+
+        async def switch_mode(*args, **kwargs):
+            self.features.economy = True
+            return _vision_result(
+                images=(image,),
+                descriptions=("切换前已完成的描述",),
+            )
+
+        understand = AsyncMock(side_effect=switch_mode)
+        generate = AsyncMock(return_value="不应调用")
+        bot = AsyncMock()
+        with self._runtime(), patch.object(
+            private_matcher,
+            "understand_private_images",
+            new=understand,
+            create=True,
+        ), patch.object(
+            private_matcher, "generate_reply", new=generate
+        ):
+            await private_matcher.handle_private_message(
+                bot,
+                _private_event(image_urls=("https://images.invalid/pure.png",)),
+            )
+
+        understand.assert_awaited_once()
+        generate.assert_not_awaited()
+        bot.send_private_msg.assert_not_awaited()
 
     async def test_image_command_is_ignored_before_download(self) -> None:
         understand = AsyncMock(return_value=_vision_result())

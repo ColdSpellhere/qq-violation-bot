@@ -3,6 +3,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from plugins.llm_gateway.errors import (
@@ -67,13 +68,21 @@ def _job(*, watermark: int, expected_version: int = 0) -> MemoryJob:
 
 
 class _Features:
-    def __init__(self, enabled: bool) -> None:
+    def __init__(self, enabled: bool, *, economy: bool = False) -> None:
         self.enabled = enabled
+        self.economy = economy
+
+    def snapshot(self):
+        return SimpleNamespace(
+            economy_mode_enabled=self.economy,
+            llm_gateway_enabled=self.enabled,
+            llm_gateway_private_memory_enabled=self.enabled,
+        )
 
     def llm_gateway_allowed(self, domain: str) -> bool:
         if domain != "private_memory":
             raise AssertionError(domain)
-        return self.enabled
+        return self.economy or self.enabled
 
 
 class _Gateway:
@@ -87,16 +96,31 @@ class _Gateway:
                 '"preferred_address":"小伙伴","communication_style":"轻松"}'
             )
         )
+        self.extract_private_facts = AsyncMock(
+            return_value=(
+                '{"facts":[{"fact_text":"喜欢月季",'
+                '"source_message_id":"p1","source_quote":"以后继续聊花",'
+                '"certainty":"explicit"}]}'
+            )
+        )
 
 
 class _MemberFeatures:
-    def __init__(self, enabled: bool) -> None:
+    def __init__(self, enabled: bool, *, economy: bool = False) -> None:
         self.enabled = enabled
+        self.economy = economy
+
+    def snapshot(self):
+        return SimpleNamespace(
+            economy_mode_enabled=self.economy,
+            llm_gateway_enabled=self.enabled,
+            llm_gateway_member_memory_enabled=self.enabled,
+        )
 
     def llm_gateway_allowed(self, domain: str) -> bool:
         if domain != "member_memory":
             raise AssertionError(domain)
-        return self.enabled
+        return self.economy or self.enabled
 
 
 class _MemberGateway:
@@ -116,6 +140,49 @@ class MemberMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
             ContextMessage(
                 "小园丁", "我喜欢月季", message_id="g1", user_id="200"
             ),
+        )
+
+    async def test_member_tasks_freeze_economy_mode_before_gateway_await(self) -> None:
+        from plugins.member_memory import ai
+
+        features = _MemberFeatures(False, economy=True)
+        gateway = _MemberGateway()
+
+        async def delayed_gateway():
+            features.economy = False
+            return gateway
+
+        with (
+            patch.object(
+                ai,
+                "CONFIG",
+                replace(
+                    ai.CONFIG,
+                    ai_api_key="synthetic-primary-key",
+                    glm_api_key="synthetic-economy-key",
+                ),
+            ),
+            patch.object(ai, "FEATURES", features, create=True),
+            patch.object(
+                ai,
+                "get_gateway",
+                AsyncMock(side_effect=delayed_gateway),
+                create=True,
+            ),
+        ):
+            await ai.extract_memory_candidates(self.context())
+            features.economy = True
+            await ai.generate_memory_summary(
+                "旧摘要", (MemoryTrait("喜欢花", "g1", "now"),)
+            )
+
+        self.assertIs(
+            True,
+            gateway.extract_member_memories.await_args.kwargs["economy_mode"],
+        )
+        self.assertIs(
+            True,
+            gateway.summarize_member_memory.await_args.kwargs["economy_mode"],
         )
 
     async def test_member_prompts_remain_domain_owned_and_gateway_only_transports(self) -> None:
@@ -235,6 +302,44 @@ class MemberMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_tasks_freeze_economy_mode_before_gateway_await(self) -> None:
+        from plugins.private_memory import ai
+
+        features = _Features(False, economy=True)
+        gateway = _Gateway()
+
+        async def delayed_gateway():
+            features.economy = False
+            return gateway
+
+        with (
+            patch.object(ai, "FEATURES", features, create=True),
+            patch.object(
+                ai,
+                "get_gateway",
+                AsyncMock(side_effect=delayed_gateway),
+                create=True,
+            ),
+        ):
+            await ai.summarize_private_conversation("旧摘要", (_message(),))
+            features.economy = True
+            await ai.extract_private_facts((_message(),))
+            features.economy = True
+            await ai.generate_relationship_candidate(None, (_message(),))
+
+        self.assertIs(
+            True,
+            gateway.summarize_private_conversation.await_args.kwargs["economy_mode"],
+        )
+        self.assertIs(
+            True,
+            gateway.extract_private_facts.await_args.kwargs["economy_mode"],
+        )
+        self.assertIs(
+            True,
+            gateway.update_relationship_state.await_args.kwargs["economy_mode"],
+        )
+
     async def test_gateway_relationship_contract_is_exactly_four_data_fields(self) -> None:
         from plugins.private_memory import ai
 
@@ -284,18 +389,22 @@ class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             summary = await ai.summarize_private_conversation("旧摘要", (_message(),))
+            facts = await ai.extract_private_facts((_message(),))
             relationship = await ai.generate_relationship_candidate(None, (_message(),))
 
         self.assertEqual("新的滚动摘要", summary)
+        self.assertEqual("喜欢月季", facts[0].fact_text)
         self.assertEqual("可能更熟悉了", relationship.state_text)
         summary_messages = gateway.summarize_private_conversation.await_args.args[0]
+        fact_messages = gateway.extract_private_facts.await_args.args[0]
         relationship_messages = gateway.update_relationship_state.await_args.args[0]
-        for messages in (summary_messages, relationship_messages):
+        for messages in (summary_messages, fact_messages, relationship_messages):
             self.assertIsInstance(messages, tuple)
             self.assertEqual(("system", "user"), tuple(item["role"] for item in messages))
             self.assertTrue(all(set(item) == {"role", "content"} for item in messages))
         self.assertIn("私聊旧摘要", summary_messages[0]["content"])
         self.assertIn("关系状态", relationship_messages[0]["content"])
+        self.assertIn("稳定非敏感事实", fact_messages[0]["content"])
         self.assertIn("旧摘要", summary_messages[1]["content"])
         self.assertNotIn("旧摘要", relationship_messages[1]["content"])
 
@@ -527,7 +636,7 @@ class PrivateMemoryGatewayCommitBoundaryTests(unittest.IsolatedAsyncioTestCase):
         resume = asyncio.Event()
         gateway = _Gateway()
 
-        async def delayed(_messages):
+        async def delayed(_messages, *, economy_mode=None):
             started.set()
             await resume.wait()
             return gateway.update_relationship_state.return_value

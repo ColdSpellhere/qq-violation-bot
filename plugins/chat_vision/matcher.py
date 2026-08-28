@@ -11,8 +11,10 @@ from .service import live_event_time_allowed, process_image_event
 
 
 def chat_image_candidate(event: Event) -> bool:
+    image_allowed = getattr(FEATURES, "image_understanding_allowed", lambda: True)
     return (
         CONFIG.chat_vision_enabled
+        and bool(image_allowed())
         and isinstance(event, GroupMessageEvent)
         and int(event.user_id) != int(event.self_id)
         and FEATURES.group_chat_allowed(int(event.group_id))

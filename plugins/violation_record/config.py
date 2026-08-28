@@ -1,6 +1,6 @@
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, cast
 
@@ -183,6 +183,15 @@ class AppConfig:
     ai_api_key: str = os.getenv("AI_API_KEY", "")
     ai_model: str = os.getenv("AI_MODEL", "deepseek-chat")
     ai_timeout: int = _int_env("AI_TIMEOUT", 30)
+    glm_base_url: str = os.getenv(
+        "GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"
+    ).rstrip("/")
+    glm_api_key: str = field(
+        default=os.getenv("GLM_API_KEY", "").strip(),
+        repr=False,
+    )
+    glm_model: str = os.getenv("GLM_MODEL", "glm-4.7-flash").strip()
+    glm_timeout: int = _bounded_int_env("GLM_TIMEOUT", 30, 1, 120)
     random_chat_enabled: bool = _bool_env("RANDOM_CHAT_ENABLED", False)
     member_memory_summary_enabled: bool = _bool_env(
         "MEMBER_MEMORY_SUMMARY_ENABLED", False
@@ -248,6 +257,7 @@ class AppConfig:
     )
     memory_governance_enabled: bool = _bool_env("MEMORY_GOVERNANCE_ENABLED", False)
     llm_gateway_enabled: bool = _bool_env("LLM_GATEWAY_ENABLED", False)
+    economy_mode_enabled: bool = _bool_env("ECONOMY_MODE_ENABLED", False)
     prompt_builder_enabled: bool = _bool_env("PROMPT_BUILDER_ENABLED", False)
     web_search_enabled: bool = _bool_env("WEB_SEARCH_ENABLED", False)
     tavily_api_key: str = os.getenv("TAVILY_API_KEY", "").strip()
@@ -303,6 +313,19 @@ class AppConfig:
     )
     runtime_features_path: Path = DATA_DIR / "runtime_features.json"
     admin_seed: str = os.getenv("ADMIN_SEED", "")
+
+    @property
+    def economy_provider_available(self) -> bool:
+        return (
+            type(self.glm_base_url) is str
+            and self.glm_base_url.strip().rstrip("/")
+            == "https://open.bigmodel.cn/api/paas/v4"
+            and type(self.glm_api_key) is str
+            and bool(self.glm_api_key.strip())
+            and type(self.glm_model) is str
+            and self.glm_model.strip() == "glm-4.7-flash"
+            and self.glm_timeout > 0
+        )
 
 
 CONFIG = AppConfig()

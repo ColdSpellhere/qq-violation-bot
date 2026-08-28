@@ -86,6 +86,7 @@ class GatewayContractTests(unittest.TestCase):
                 "member_extraction",
                 "member_summary",
                 "private_summary",
+                "private_fact_extraction",
                 "relationship_update",
                 "image_description",
             },

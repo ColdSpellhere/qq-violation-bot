@@ -157,11 +157,13 @@ async def _send_random_reply_locked(
     stripped_text = text.strip()
     current_has_image = any(segment.type == "image" for segment in event.message)
     current_text = stripped_text or ("[图片]" if current_has_image else "")
+    image_allowed = getattr(FEATURES, "image_understanding_allowed", lambda: True)
+    image_understanding_enabled = bool(image_allowed())
     current_descriptions: tuple[str, ...] = ()
     referenced_descriptions: tuple[str, ...] = ()
     images: list[VisionImage] = []
     raw_budget_exceeded = False
-    if current_has_image or reply_message_id:
+    if image_understanding_enabled and (current_has_image or reply_message_id):
         try:
             from plugins.chat_vision.client import VisionImage
             from plugins.chat_vision.store import ChatVisionStore, read_original_image
@@ -228,6 +230,10 @@ async def _send_random_reply_locked(
         else:
             current_descriptions = ()
             images.clear()
+    if not image_understanding_enabled and not stripped_text:
+        return False
+    if not stripped_text and not bool(image_allowed()):
+        return False
     replied_to_user_id = _reply_sender_user_id(event) or archived_message_author(
         CONFIG.chat_archive_path,
         group_id=int(event.group_id),
@@ -312,6 +318,7 @@ async def _send_random_reply_locked(
             relationship=relationship,
             open_topics=open_topics,
             max_messages=3 if addressed or required else 1,
+            real_text_present=bool(stripped_text),
         )
     except RandomChatAIError as exc:
         logger.warning(f"随机闲聊 AI 回复失败：{exc}")

@@ -13,30 +13,47 @@ from plugins.random_chat.ai import generate_reply
 
 class _Features:
     def __init__(
-        self, *, builder: bool, gateway: bool, relationship: bool = True
+        self,
+        *,
+        builder: bool,
+        gateway: bool,
+        relationship: bool = True,
+        economy: bool = False,
     ) -> None:
         self.builder = builder
         self.gateway = gateway
         self.relationship = relationship
+        self.economy = economy
 
     def snapshot(self):
         return SimpleNamespace(
             prompt_builder_enabled=self.builder,
             relationship_state_enabled=self.relationship,
+            economy_mode_enabled=self.economy,
+            llm_gateway_enabled=self.gateway,
+            llm_gateway_chat_enabled=self.gateway,
         )
 
     def llm_gateway_allowed(self, domain: str) -> bool:
         assert domain == "chat"
-        return self.gateway
+        return self.economy or self.gateway
 
 
 class _Gateway:
     def __init__(self, replies: tuple[str, ...] = ("自然回复",)) -> None:
         self.replies = iter(replies)
         self.calls: list[tuple[tuple[dict[str, object], ...], bool]] = []
+        self.economy_modes: list[bool | None] = []
 
-    async def generate_chat_reply(self, messages, *, images: bool) -> str:
+    async def generate_chat_reply(
+        self,
+        messages,
+        *,
+        images: bool,
+        economy_mode: bool | None = None,
+    ) -> str:
         self.calls.append((tuple(messages), images))
+        self.economy_modes.append(economy_mode)
         return next(self.replies)
 
 
@@ -48,6 +65,7 @@ def _config():
         ai_timeout=12,
         chat_vision_model="vision-model",
         chat_vision_timeout=29,
+        glm_api_key="synthetic-economy-key",
     )
 
 
@@ -68,6 +86,155 @@ def _relationship(user_id: str = "100") -> RelationshipState:
 
 
 class LLMGatewayChatMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_keeps_old_primary_policy_if_mode_turns_on_mid_build(self) -> None:
+        features = _Features(builder=True, gateway=False, economy=False)
+        gateway = _Gateway()
+        legacy = AsyncMock(return_value="旧请求仍由原模型完成")
+
+        def switch_mode() -> str:
+            features.economy = True
+            features.gateway = True
+            return "角色"
+
+        with patch("plugins.random_chat.ai.CONFIG", _config()), patch(
+            "plugins.random_chat.ai.FEATURES", features
+        ), patch(
+            "plugins.random_chat.ai.get_gateway", new=AsyncMock(return_value=gateway)
+        ) as get_gateway, patch(
+            "plugins.random_chat.ai._legacy_complete", new=legacy
+        ), patch(
+            "plugins.random_chat.ai.load_character_prompt", side_effect=switch_mode
+        ):
+            reply = await generate_reply(
+                "继续",
+                context=(
+                    ContextMessage(
+                        "甲",
+                        "旧图",
+                        message_id="m1",
+                        user_id="100",
+                        image_descriptions=("旧请求可见的图片描述",),
+                    ),
+                ),
+            )
+
+        self.assertEqual("旧请求仍由原模型完成", reply)
+        get_gateway.assert_not_awaited()
+        legacy.assert_awaited_once()
+        self.assertIn("旧请求可见的图片描述", str(legacy.await_args.args[0]))
+
+    async def test_request_keeps_economy_policy_if_mode_turns_off_mid_build(self) -> None:
+        features = _Features(builder=True, gateway=False, economy=True)
+        gateway = _Gateway()
+        legacy = AsyncMock(return_value="不应调用")
+
+        def switch_mode() -> str:
+            features.economy = False
+            return "角色"
+
+        with patch("plugins.random_chat.ai.CONFIG", _config()), patch(
+            "plugins.random_chat.ai.FEATURES", features
+        ), patch(
+            "plugins.random_chat.ai.get_gateway", new=AsyncMock(return_value=gateway)
+        ), patch(
+            "plugins.random_chat.ai._legacy_complete", new=legacy
+        ), patch(
+            "plugins.random_chat.ai.load_character_prompt", side_effect=switch_mode
+        ):
+            reply = await generate_reply(
+                "继续",
+                context=(
+                    ContextMessage(
+                        "甲",
+                        "旧图",
+                        message_id="m1",
+                        user_id="100",
+                        image_descriptions=("不得跨供应商发送",),
+                    ),
+                ),
+            )
+
+        self.assertEqual("自然回复", reply)
+        legacy.assert_not_awaited()
+        self.assertEqual([True], gateway.economy_modes)
+        self.assertNotIn("不得跨供应商发送", str(gateway.calls[0][0]))
+
+    async def test_economy_mode_strips_current_and_historical_image_context(self) -> None:
+        for chat_mode in ("group", "private"):
+            gateway = _Gateway()
+            current = ContextMessage(
+                "甲",
+                "只聊文字",
+                message_id="m2",
+                user_id="100",
+                image_descriptions=("当前图片里的私密内容",),
+            )
+            context = (
+                ContextMessage(
+                    "乙",
+                    "之前发过图片",
+                    message_id="m1",
+                    user_id="200" if chat_mode == "group" else "100",
+                    image_descriptions=("历史图片里的私密内容",),
+                ),
+            )
+            with self.subTest(chat_mode=chat_mode), patch(
+                "plugins.random_chat.ai.CONFIG", _config()
+            ), patch(
+                "plugins.random_chat.ai.FEATURES",
+                _Features(builder=True, gateway=True, economy=True),
+            ), patch(
+                "plugins.random_chat.ai.get_gateway",
+                new=AsyncMock(return_value=gateway),
+            ), patch(
+                "plugins.random_chat.ai.load_character_prompt", return_value="角色"
+            ):
+                await generate_reply(
+                    "只聊文字",
+                    context=context,
+                    current=current,
+                    chat_mode=chat_mode,
+                    addressed=chat_mode == "private",
+                    images=(VisionImage(b"image", "image/jpeg", "m2", 0),),
+                )
+
+            messages, has_images = gateway.calls[0]
+            self.assertFalse(has_images)
+            rendered = str(messages)
+            self.assertNotIn("当前图片里的私密内容", rendered)
+            self.assertNotIn("历史图片里的私密内容", rendered)
+            self.assertNotIn("data:image", rendered)
+
+    async def test_economy_policy_silences_pure_image_after_a_midflight_switch(self) -> None:
+        gateway = _Gateway()
+        current = ContextMessage(
+            "甲",
+            "[图片]",
+            message_id="m2",
+            user_id="100",
+            image_descriptions=("切换前生成的描述",),
+        )
+        with patch(
+            "plugins.random_chat.ai.CONFIG", _config()
+        ), patch(
+            "plugins.random_chat.ai.FEATURES",
+            _Features(builder=True, gateway=True, economy=True),
+        ), patch(
+            "plugins.random_chat.ai.get_gateway",
+            new=AsyncMock(return_value=gateway),
+        ) as get_gateway:
+            reply = await generate_reply(
+                "[图片]",
+                current=current,
+                addressed=True,
+                images=(VisionImage(b"image", "image/jpeg", "m2", 0),),
+                real_text_present=False,
+            )
+
+        self.assertIsNone(reply)
+        get_gateway.assert_not_awaited()
+        self.assertEqual([], gateway.calls)
+
     async def test_builder_and_gateway_receive_typed_untrusted_group_context(self) -> None:
         gateway = _Gateway()
         current = ContextMessage(
