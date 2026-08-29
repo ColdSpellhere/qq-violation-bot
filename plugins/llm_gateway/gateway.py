@@ -112,15 +112,10 @@ class Gateway:
             temperature = 0.1
         return LLMProvider.ECONOMY, model.strip(), timeout, temperature, True
 
-    def _vision_allowed(self, *, economy_mode: bool | None = None) -> bool:
-        if economy_mode is not None:
-            if type(economy_mode) is not bool:
-                raise GatewayConfigurationError()
-            return not economy_mode
-        try:
-            return not bool(self._economy_mode_enabled())
-        except Exception as exc:
-            raise GatewayConfigurationError() from exc
+    @staticmethod
+    def _validate_model_selection(economy_mode: bool | None) -> None:
+        if economy_mode is not None and type(economy_mode) is not bool:
+            raise GatewayConfigurationError()
 
     async def parse_business_intent(
         self,
@@ -128,18 +123,15 @@ class Gateway:
         *,
         economy_mode: bool | None = None,
     ) -> str:
-        provider, model, timeout, temperature, thinking_disabled = (
-            self._economy_settings(0, economy_mode=economy_mode)
-        )
+        self._validate_model_selection(economy_mode)
         return await self._run(
             messages,
             task=LLMTask.BUSINESS_INTENT,
-            provider=provider,
-            model=model,
-            timeout=timeout,
-            temperature=temperature,
+            provider=LLMProvider.PRIMARY,
+            model=self._config.ai_model,
+            timeout=self._config.ai_timeout,
+            temperature=0,
             response_format=_JSON_OBJECT,
-            thinking_disabled=thinking_disabled,
         )
 
     async def generate_chat_reply(
@@ -149,9 +141,8 @@ class Gateway:
         images: bool,
         economy_mode: bool | None = None,
     ) -> str:
-        if images and not self._vision_allowed(economy_mode=economy_mode):
-            raise GatewayConfigurationError(task=LLMTask.CHAT_REPLY)
         if images:
+            self._validate_model_selection(economy_mode)
             return await self._run(
                 messages,
                 task=LLMTask.CHAT_REPLY,
@@ -179,20 +170,14 @@ class Gateway:
         *,
         economy_mode: bool | None = None,
     ) -> str:
-        provider, model, timeout, temperature, thinking_disabled = (
-            self._economy_settings(0.1, economy_mode=economy_mode)
-        )
+        self._validate_model_selection(economy_mode)
         return await self._run(
             messages,
             task=LLMTask.MEMBER_EXTRACTION,
-            provider=provider,
-            model=model,
-            timeout=timeout,
-            temperature=temperature,
-            response_format=(
-                _JSON_OBJECT if provider is LLMProvider.ECONOMY else None
-            ),
-            thinking_disabled=thinking_disabled,
+            provider=LLMProvider.PRIMARY,
+            model=self._config.ai_model,
+            timeout=self._config.ai_timeout,
+            temperature=0.1,
         )
 
     async def summarize_member_memory(
@@ -201,17 +186,14 @@ class Gateway:
         *,
         economy_mode: bool | None = None,
     ) -> str:
-        provider, model, timeout, temperature, thinking_disabled = (
-            self._economy_settings(0.1, economy_mode=economy_mode)
-        )
+        self._validate_model_selection(economy_mode)
         return await self._run(
             messages,
             task=LLMTask.MEMBER_SUMMARY,
-            provider=provider,
-            model=model,
-            timeout=timeout,
-            temperature=temperature,
-            thinking_disabled=thinking_disabled,
+            provider=LLMProvider.PRIMARY,
+            model=self._config.ai_model,
+            timeout=self._config.ai_timeout,
+            temperature=0.1,
         )
 
     async def extract_private_facts(
@@ -220,18 +202,15 @@ class Gateway:
         *,
         economy_mode: bool | None = None,
     ) -> str:
-        provider, model, timeout, temperature, thinking_disabled = (
-            self._economy_settings(0.1, economy_mode=economy_mode)
-        )
+        self._validate_model_selection(economy_mode)
         return await self._run(
             messages,
             task=LLMTask.PRIVATE_FACT_EXTRACTION,
-            provider=provider,
-            model=model,
-            timeout=timeout,
-            temperature=temperature,
+            provider=LLMProvider.PRIMARY,
+            model=self._config.ai_model,
+            timeout=self._config.ai_timeout,
+            temperature=0.1,
             response_format=_JSON_OBJECT,
-            thinking_disabled=thinking_disabled,
         )
 
     async def summarize_private_conversation(
@@ -240,18 +219,15 @@ class Gateway:
         *,
         economy_mode: bool | None = None,
     ) -> str:
-        provider, model, timeout, temperature, thinking_disabled = (
-            self._economy_settings(0.1, economy_mode=economy_mode)
-        )
+        self._validate_model_selection(economy_mode)
         return await self._run(
             messages,
             task=LLMTask.PRIVATE_SUMMARY,
-            provider=provider,
-            model=model,
-            timeout=timeout,
-            temperature=temperature,
+            provider=LLMProvider.PRIMARY,
+            model=self._config.ai_model,
+            timeout=self._config.ai_timeout,
+            temperature=0.1,
             response_format=_JSON_OBJECT,
-            thinking_disabled=thinking_disabled,
         )
 
     async def update_relationship_state(
@@ -260,18 +236,15 @@ class Gateway:
         *,
         economy_mode: bool | None = None,
     ) -> str:
-        provider, model, timeout, temperature, thinking_disabled = (
-            self._economy_settings(0.1, economy_mode=economy_mode)
-        )
+        self._validate_model_selection(economy_mode)
         return await self._run(
             messages,
             task=LLMTask.RELATIONSHIP_UPDATE,
-            provider=provider,
-            model=model,
-            timeout=timeout,
-            temperature=temperature,
+            provider=LLMProvider.PRIMARY,
+            model=self._config.ai_model,
+            timeout=self._config.ai_timeout,
+            temperature=0.1,
             response_format=_JSON_OBJECT,
-            thinking_disabled=thinking_disabled,
         )
 
     async def describe_image(
@@ -280,8 +253,7 @@ class Gateway:
         *,
         economy_mode: bool | None = None,
     ) -> str:
-        if not self._vision_allowed(economy_mode=economy_mode):
-            raise GatewayConfigurationError(task=LLMTask.IMAGE_DESCRIPTION)
+        self._validate_model_selection(economy_mode)
         return await self._run(
             messages,
             task=LLMTask.IMAGE_DESCRIPTION,

@@ -86,7 +86,7 @@ class _MutableFeatures:
         )
 
     def image_understanding_allowed(self) -> bool:
-        return not self.economy
+        return True
 
 
 def _vision_result(
@@ -386,10 +386,21 @@ class PrivateVisionMatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((image,), generate.await_args.kwargs["images"])
         self.assertEqual("这是什么", generate.await_args.kwargs["current"].text)
 
-    async def test_economy_mode_drops_pure_image_and_degrades_mixed_to_text_only(self) -> None:
+    async def test_chat_model_switch_keeps_pure_and_mixed_private_images(self) -> None:
         self.features = _MutableFeatures(economy=True)
-        understand = AsyncMock(return_value=_vision_result())
-        generate = AsyncMock(return_value="只回答文字")
+        pure_image = VisionImage(b"pure", "image/png", "456", 0)
+        mixed_image = VisionImage(b"mixed", "image/png", "457", 0)
+        understand = AsyncMock(
+            side_effect=(
+                _vision_result(
+                    images=(pure_image,), descriptions=("纯图里是一朵花",)
+                ),
+                _vision_result(
+                    images=(mixed_image,), descriptions=("图文里是一只猫",)
+                ),
+            )
+        )
+        generate = AsyncMock(side_effect=("看到了花", "看到了猫"))
         pure_bot = AsyncMock()
         mixed_bot = AsyncMock()
         with self._runtime(), patch.object(
@@ -413,15 +424,23 @@ class PrivateVisionMatcherTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
-        understand.assert_not_awaited()
-        generate.assert_awaited_once()
-        self.assertEqual("只看这句话", generate.await_args.args[0])
-        self.assertEqual((), generate.await_args.kwargs["images"])
-        self.assertEqual((), generate.await_args.kwargs["current"].image_descriptions)
-        pure_bot.send_private_msg.assert_not_awaited()
+        self.assertEqual(2, understand.await_count)
+        self.assertEqual(2, generate.await_count)
+        pure_call, mixed_call = generate.await_args_list
+        self.assertEqual("[图片]", pure_call.args[0])
+        self.assertEqual((pure_image,), pure_call.kwargs["images"])
+        self.assertEqual(
+            ("纯图里是一朵花",), pure_call.kwargs["current"].image_descriptions
+        )
+        self.assertEqual("只看这句话", mixed_call.args[0])
+        self.assertEqual((mixed_image,), mixed_call.kwargs["images"])
+        self.assertEqual(
+            ("图文里是一只猫",), mixed_call.kwargs["current"].image_descriptions
+        )
+        pure_bot.send_private_msg.assert_awaited_once()
         mixed_bot.send_private_msg.assert_awaited_once()
 
-    async def test_mode_switch_during_private_vision_silences_pure_image(self) -> None:
+    async def test_mode_switch_during_private_vision_keeps_pure_image_reply(self) -> None:
         image = VisionImage(b"raw", "image/png", "456", 0)
 
         async def switch_mode(*args, **kwargs):
@@ -432,7 +451,7 @@ class PrivateVisionMatcherTests(unittest.IsolatedAsyncioTestCase):
             )
 
         understand = AsyncMock(side_effect=switch_mode)
-        generate = AsyncMock(return_value="不应调用")
+        generate = AsyncMock(return_value="看到了这张图")
         bot = AsyncMock()
         with self._runtime(), patch.object(
             private_matcher,
@@ -448,8 +467,13 @@ class PrivateVisionMatcherTests(unittest.IsolatedAsyncioTestCase):
             )
 
         understand.assert_awaited_once()
-        generate.assert_not_awaited()
-        bot.send_private_msg.assert_not_awaited()
+        generate.assert_awaited_once()
+        self.assertEqual((image,), generate.await_args.kwargs["images"])
+        self.assertEqual(
+            ("切换前已完成的描述",),
+            generate.await_args.kwargs["current"].image_descriptions,
+        )
+        bot.send_private_msg.assert_awaited_once()
 
     async def test_image_command_is_ignored_before_download(self) -> None:
         understand = AsyncMock(return_value=_vision_result())

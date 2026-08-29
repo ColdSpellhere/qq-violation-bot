@@ -84,18 +84,19 @@ class ChatVisionMatcherTests(unittest.TestCase):
         ):
             self.assertFalse(matcher.chat_image_candidate(event))
 
-    def test_candidate_rejects_economy_mode_before_creating_image_work(self) -> None:
+    def test_candidate_accepts_during_chat_model_switch(self) -> None:
         event = _event(_image("https://cdn.example/one.jpg"))
         features = SimpleNamespace(
             group_chat_allowed=lambda group_id: True,
-            image_understanding_allowed=lambda: False,
+            image_understanding_allowed=lambda: True,
+            snapshot=lambda: SimpleNamespace(economy_mode_enabled=True),
         )
 
         with (
             patch.object(matcher, "CONFIG", SimpleNamespace(chat_vision_enabled=True)),
             patch.object(matcher, "FEATURES", features),
         ):
-            self.assertFalse(matcher.chat_image_candidate(event))
+            self.assertTrue(matcher.chat_image_candidate(event))
 
     def test_candidate_rejects_group_outside_runtime_allowlist(self) -> None:
         event = _event(_image("https://cdn.example/one.jpg"), group_id=OTHER_GROUP_ID)
@@ -491,7 +492,7 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
         download.assert_awaited_once()
         self.assertEqual(2, describe.await_count)
 
-    async def test_claimed_image_finishes_when_economy_mode_turns_on_mid_task(self) -> None:
+    async def test_claimed_image_uses_primary_vision_during_chat_model_switch(self) -> None:
         asset = self.store.ensure_pending(
             GROUP_ID,
             "456",
@@ -499,15 +500,10 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
             "https://cdn.example/in-flight.jpg",
             int(time.time()),
         )
-        checks = 0
-
-        def image_understanding_allowed() -> bool:
-            nonlocal checks
-            checks += 1
-            return checks == 1
-
         features = SimpleNamespace(
-            image_understanding_allowed=image_understanding_allowed
+            image_understanding_allowed=lambda: True,
+            llm_gateway_allowed=lambda domain: False,
+            snapshot=lambda: SimpleNamespace(economy_mode_enabled=True),
         )
         describe = AsyncMock(return_value="切换前已开始的图片")
         with (
@@ -533,6 +529,10 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("切换前已开始的图片", stored.description)
         self.assertEqual(1, stored.attempts)
         self.assertTrue(describe.await_args.kwargs["allow_in_flight"])
+        self.assertFalse(describe.await_args.kwargs["use_gateway"])
+        self.assertEqual(
+            "vision-test-model", describe.await_args.kwargs["model"]
+        )
 
     async def test_mark_downloaded_failure_removes_the_just_written_file(self) -> None:
         event = _event(_image("https://cdn.example/one.jpg"))

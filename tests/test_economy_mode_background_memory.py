@@ -83,7 +83,7 @@ def _private_event(*, message_id: int) -> PrivateMessageEvent:
 
 
 class EconomyModeGroupBackgroundTests(unittest.IsolatedAsyncioTestCase):
-    async def test_group_archive_survives_but_new_memory_work_waits_until_mode_is_off(
+    async def test_group_archive_and_memory_work_continue_during_model_switch(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -109,8 +109,6 @@ class EconomyModeGroupBackgroundTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await archive_matcher.archive_chat_message(event)
                 await member_matcher.collect_member_memory(event)
-                features.set_switch("economy_mode_enabled", False, "admin")
-                await member_matcher.collect_member_memory(event)
 
             with closing(sqlite3.connect(database)) as connection:
                 archived = connection.execute(
@@ -122,7 +120,7 @@ class EconomyModeGroupBackgroundTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, add.call_count)
             self.assertEqual(1, enqueue.call_count)
 
-    async def test_batch_queued_before_economy_mode_does_not_start_member_llm(
+    async def test_queued_member_batch_runs_during_model_switch(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -156,8 +154,6 @@ class EconomyModeGroupBackgroundTests(unittest.IsolatedAsyncioTestCase):
                 ) as apply,
             ):
                 await member_matcher.analyze_member_memory(123, "456791", 2_000)
-                features.set_switch("economy_mode_enabled", False, "admin")
-                await member_matcher.analyze_member_memory(123, "456791", 2_000)
 
             recent.assert_called_once()
             extract.assert_awaited_once_with(context)
@@ -165,7 +161,7 @@ class EconomyModeGroupBackgroundTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EconomyModePrivateBackgroundTests(unittest.IsolatedAsyncioTestCase):
-    async def test_private_raw_turn_is_persisted_without_memory_jobs_until_mode_is_off(
+    async def test_private_raw_turn_and_memory_jobs_continue_during_model_switch(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -200,40 +196,30 @@ class EconomyModePrivateBackgroundTests(unittest.IsolatedAsyncioTestCase):
                 await private_matcher.handle_private_message(
                     bot, _private_event(message_id=456)
                 )
-                with closing(sqlite3.connect(database)) as connection:
-                    economy_raw = connection.execute(
-                        "SELECT text FROM private_chat_messages "
-                        "WHERE user_id='200' AND direction='user' AND message_id='456'"
-                    ).fetchone()
-                    economy_jobs = connection.execute(
-                        "SELECT job_type FROM memory_jobs ORDER BY id"
-                    ).fetchall()
-
-                features.set_switch("economy_mode_enabled", False, "admin")
-                await private_matcher.handle_private_message(
-                    bot, _private_event(message_id=457)
-                )
 
             with closing(sqlite3.connect(database)) as connection:
-                normal_source = connection.execute(
+                source = connection.execute(
                     "SELECT id FROM private_chat_messages "
-                    "WHERE user_id='200' AND direction='user' AND message_id='457'"
+                    "WHERE user_id='200' AND direction='user' AND message_id='456'"
                 ).fetchone()
-                normal_jobs = connection.execute(
+                jobs = connection.execute(
                     "SELECT job_type FROM memory_jobs WHERE input_through_id=? ORDER BY id",
-                    (int(normal_source[0]),),
+                    (int(source[0]),),
                 ).fetchall()
+                raw = connection.execute(
+                    "SELECT text FROM private_chat_messages "
+                    "WHERE user_id='200' AND direction='user' AND message_id='456'"
+                ).fetchone()
 
-            self.assertEqual(("记住我喜欢月季",), economy_raw)
-            self.assertEqual([], economy_jobs)
+            self.assertEqual(("记住我喜欢月季",), raw)
             self.assertEqual(
                 [("private_summary",), ("private_facts",), ("relationship",)],
-                normal_jobs,
+                jobs,
             )
 
 
 class EconomyModeWorkerGateTests(unittest.TestCase):
-    def test_pending_memory_jobs_pause_in_economy_mode_and_resume_after_exit(
+    def test_pending_memory_job_types_do_not_change_with_chat_model(
         self,
     ) -> None:
         from plugins.private_memory import lifecycle
@@ -245,7 +231,7 @@ class EconomyModeWorkerGateTests(unittest.TestCase):
                 features.set_switch("economy_mode_enabled", False, "admin")
                 normal_allowed = lifecycle._allowed_job_types()
 
-        self.assertEqual(frozenset(), economy_allowed)
+        self.assertEqual(normal_allowed, economy_allowed)
         self.assertEqual(
             frozenset({"private_summary", "private_facts", "relationship"}),
             normal_allowed,

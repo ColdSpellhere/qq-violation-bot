@@ -117,11 +117,29 @@ class FeatureController:
         for name, enabled in changes.items():
             self._validate_switch(name, enabled)
         with self._lock:
-            if (
+            disabling_only_available_chat_model = (
                 changes.get("economy_mode_enabled") is False
                 and self._state.economy_mode_enabled
-                and not self._primary_provider_available
                 and changes.get("llm_gateway_enabled") is not False
+            )
+            enabling_primary_gateway_without_provider = (
+                {
+                    "llm_gateway_enabled",
+                    "economy_mode_enabled",
+                }.intersection(changes)
+                and changes.get(
+                    "llm_gateway_enabled", self._state.llm_gateway_enabled
+                )
+                and not changes.get(
+                    "economy_mode_enabled", self._state.economy_mode_enabled
+                )
+            )
+            if (
+                not self._primary_provider_available
+                and (
+                    disabling_only_available_chat_model
+                    or enabling_primary_gateway_without_provider
+                )
             ):
                 raise ValueError("primary provider is unavailable")
             return self._replace_state(**changes, updated_by=str(actor))
@@ -196,16 +214,22 @@ class FeatureController:
         if domain == "business" and not self._business_capable:
             return False
         state = self.snapshot()
-        if state.economy_mode_enabled:
-            return domain in {"chat", "business"}
+        # ``economy_mode_enabled`` is the legacy persisted name for the hot
+        # chat-text model selector. It must never override another domain's
+        # rollout switch.
+        if domain == "chat" and state.economy_mode_enabled:
+            return True
         return state.llm_gateway_enabled and getattr(state, field_name)
 
     def image_understanding_allowed(self) -> bool:
-        return not self.snapshot().economy_mode_enabled
+        return True
 
     def background_memory_allowed(self) -> bool:
-        """Keep economy-provider capacity for foreground chat and business calls."""
-        return not self.snapshot().economy_mode_enabled
+        return True
+
+    def chat_text_uses_glm(self) -> bool:
+        """Return whether image-free chat text uses the GLM provider."""
+        return self.snapshot().economy_mode_enabled
 
     def _replace_state(self, **changes: Any) -> FeatureState:
         candidate = replace(

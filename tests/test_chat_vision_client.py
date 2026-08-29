@@ -197,24 +197,31 @@ class ChatVisionClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_Client.posted)
         self._assert_redacted(raised.exception)
 
-    async def test_economy_mode_rejects_before_building_or_sending_image_payload(self):
+    async def test_chat_model_switch_keeps_legacy_vision_on_primary_model(self):
         features = type(
             "Features",
             (),
-            {"image_understanding_allowed": staticmethod(lambda: False)},
+            {
+                "image_understanding_allowed": staticmethod(lambda: True),
+                "llm_gateway_allowed": staticmethod(lambda _domain: False),
+                "snapshot": staticmethod(
+                    lambda: type("State", (), {"economy_mode_enabled": True})()
+                ),
+            },
         )()
         with (
             patch.object(vision_client, "FEATURES", features),
             patch("plugins.chat_vision.client.httpx.AsyncClient", _Client),
-            self.assertRaisesRegex(ChatVisionAIError, "^EconomyModeEnabled$") as raised,
         ):
-            await self._call()
+            description = await self._call()
 
-        self.assertEqual("economy_mode", raised.exception.code)
-        self.assertFalse(raised.exception.retryable)
-        self.assertIsNone(_Client.posted)
+        self.assertEqual("一名粉发小精灵在飞。", description)
+        url, _headers, payload, _timeout = _Client.posted
+        self.assertEqual("https://api.deepseek.com/v1/chat/completions", url)
+        self.assertEqual("deepseek-v4-flash-vision-exp", payload["model"])
+        self.assertEqual("image_url", payload["messages"][0]["content"][1]["type"])
 
-    async def test_already_claimed_image_can_finish_after_mode_turns_on(self):
+    async def test_already_claimed_image_can_finish_after_vision_is_disabled(self):
         features = type(
             "Features",
             (),

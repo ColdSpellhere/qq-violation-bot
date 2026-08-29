@@ -82,7 +82,7 @@ class _Features:
     def llm_gateway_allowed(self, domain: str) -> bool:
         if domain != "private_memory":
             raise AssertionError(domain)
-        return self.economy or self.enabled
+        return self.enabled
 
 
 class _Gateway:
@@ -120,7 +120,7 @@ class _MemberFeatures:
     def llm_gateway_allowed(self, domain: str) -> bool:
         if domain != "member_memory":
             raise AssertionError(domain)
-        return self.economy or self.enabled
+        return self.enabled
 
 
 class _MemberGateway:
@@ -142,10 +142,10 @@ class MemberMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-    async def test_member_tasks_freeze_economy_mode_before_gateway_await(self) -> None:
+    async def test_member_tasks_ignore_chat_model_switch(self) -> None:
         from plugins.member_memory import ai
 
-        features = _MemberFeatures(False, economy=True)
+        features = _MemberFeatures(True, economy=True)
         gateway = _MemberGateway()
 
         async def delayed_gateway():
@@ -177,11 +177,11 @@ class MemberMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIs(
-            True,
+            False,
             gateway.extract_member_memories.await_args.kwargs["economy_mode"],
         )
         self.assertIs(
-            True,
+            False,
             gateway.summarize_member_memory.await_args.kwargs["economy_mode"],
         )
 
@@ -302,10 +302,10 @@ class MemberMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_private_tasks_freeze_economy_mode_before_gateway_await(self) -> None:
+    async def test_private_tasks_ignore_chat_model_switch(self) -> None:
         from plugins.private_memory import ai
 
-        features = _Features(False, economy=True)
+        features = _Features(True, economy=True)
         gateway = _Gateway()
 
         async def delayed_gateway():
@@ -328,15 +328,15 @@ class PrivateMemoryGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
             await ai.generate_relationship_candidate(None, (_message(),))
 
         self.assertIs(
-            True,
+            False,
             gateway.summarize_private_conversation.await_args.kwargs["economy_mode"],
         )
         self.assertIs(
-            True,
+            False,
             gateway.extract_private_facts.await_args.kwargs["economy_mode"],
         )
         self.assertIs(
-            True,
+            False,
             gateway.update_relationship_state.await_args.kwargs["economy_mode"],
         )
 

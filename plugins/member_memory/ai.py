@@ -96,12 +96,11 @@ async def _complete(
 
 def _request_policy() -> tuple[bool, bool]:
     state = FEATURES.snapshot()
-    economy_mode = bool(getattr(state, "economy_mode_enabled", False))
-    use_gateway = economy_mode or bool(
+    use_gateway = bool(
         getattr(state, "llm_gateway_enabled", False)
         and getattr(state, "llm_gateway_member_memory_enabled", False)
     )
-    return use_gateway, economy_mode
+    return use_gateway, False
 
 
 async def extract_memory_candidates(context: Sequence[ContextMessage]) -> list[dict[str, object]]:

@@ -49,13 +49,13 @@ def _runtime_enabled() -> bool:
     from plugins.feature_control.runtime import FEATURES
 
     state = FEATURES.snapshot()
-    return state.llm_gateway_enabled or state.economy_mode_enabled
+    return state.llm_gateway_enabled or FEATURES.chat_text_uses_glm()
 
 
 def _economy_mode_enabled() -> bool:
     from plugins.feature_control.runtime import FEATURES
 
-    return FEATURES.snapshot().economy_mode_enabled
+    return FEATURES.chat_text_uses_glm()
 
 
 def _client_factory(*, limits: httpx.Limits) -> httpx.AsyncClient:

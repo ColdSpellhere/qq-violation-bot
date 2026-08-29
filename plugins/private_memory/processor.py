@@ -64,9 +64,7 @@ def _background_memory_allowed() -> bool:
     controller_gate = getattr(FEATURES, "background_memory_allowed", None)
     if callable(controller_gate):
         return bool(controller_gate())
-    return not bool(
-        getattr(FEATURES.snapshot(), "economy_mode_enabled", False)
-    )
+    return True
 
 
 class PrivateMemoryProcessor:

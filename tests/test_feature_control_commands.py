@@ -123,6 +123,9 @@ class FeatureControlCommandTests(unittest.TestCase):
             "/模型网关 成员记忆 开",
             "/模型网关 聊天 关",
             "/模型网关 业务 开",
+            "/模型切换 GLM",
+            "/聊天模型 原模型",
+            "/穷鬼模式 开",
             "/提示构建 开",
         ):
             self.assertTrue(is_control_command(text), text)

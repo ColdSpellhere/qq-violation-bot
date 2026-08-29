@@ -198,29 +198,43 @@ class EconomyFeatureControlTests(unittest.TestCase):
             ).economy_provider_available
         )
 
-    def test_superuser_command_persists_mode_and_overrides_effective_gateway_domains(self) -> None:
+    def test_model_switch_persists_and_only_overrides_image_free_chat(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime_features.json"
             controller = FeatureController(
                 path,
-                _state(),
+                _state(
+                    llm_gateway_enabled=True,
+                    llm_gateway_vision_enabled=True,
+                    llm_gateway_member_memory_enabled=True,
+                    llm_gateway_private_memory_enabled=False,
+                    llm_gateway_chat_enabled=False,
+                    llm_gateway_business_enabled=False,
+                ),
                 economy_provider_available=True,
             )
+            preserved_domains = {
+                domain: controller.llm_gateway_allowed(domain)
+                for domain in ("business", "vision", "member_memory", "private_memory")
+            }
 
-            self.assertTrue(is_control_command("/穷鬼模式 开"))
+            self.assertTrue(is_control_command("/模型切换 GLM"))
             self.assertEqual(
-                "穷鬼模式已开启：聊天和业务文字请求切换为 glm-4.7-flash；"
-                "图片理解和后台记忆整理已暂停，聊天原文继续保存。",
-                execute_control_command("/穷鬼模式 开", controller, "1"),
+                "聊天文字模型已切换为 glm-4.7-flash；"
+                "图片、记忆和业务模型保持原配置。",
+                execute_control_command("/模型切换 GLM", controller, "1"),
             )
             self.assertTrue(controller.snapshot().economy_mode_enabled)
-            self.assertFalse(controller.background_memory_allowed())
-            for domain in ("business", "chat"):
-                self.assertTrue(controller.llm_gateway_allowed(domain), domain)
-            for domain in ("member_memory", "private_memory"):
-                self.assertFalse(controller.llm_gateway_allowed(domain), domain)
-            self.assertFalse(controller.llm_gateway_allowed("vision"))
-            self.assertFalse(controller.image_understanding_allowed())
+            self.assertTrue(controller.background_memory_allowed())
+            self.assertTrue(controller.image_understanding_allowed())
+            self.assertTrue(controller.llm_gateway_allowed("chat"))
+            self.assertEqual(
+                preserved_domains,
+                {
+                    domain: controller.llm_gateway_allowed(domain)
+                    for domain in preserved_domains
+                },
+            )
 
             reloaded = FeatureController(
                 path,
@@ -228,15 +242,13 @@ class EconomyFeatureControlTests(unittest.TestCase):
                 economy_provider_available=True,
             )
             self.assertTrue(reloaded.snapshot().economy_mode_enabled)
-            self.assertIn(
-                "穷鬼模式：开（聊天/业务文字：glm-4.7-flash；"
-                "图片理解/后台记忆整理：暂停；原文归档：继续）",
-                execute_control_command("/模块状态", reloaded, "1"),
-            )
+            status = execute_control_command("/模块状态", reloaded, "1")
+            self.assertIn("聊天文字模型：glm-4.7-flash", status)
+            self.assertNotIn("暂停", status)
 
             self.assertEqual(
-                "穷鬼模式已关闭：已恢复原文字模型、后台记忆整理和图片理解配置。",
-                execute_control_command("/穷鬼模式 关", reloaded, "1"),
+                "聊天文字模型已切换为原模型；图片、记忆和业务模型保持原配置。",
+                execute_control_command("/模型切换 原模型", reloaded, "1"),
             )
             self.assertFalse(reloaded.snapshot().economy_mode_enabled)
             self.assertTrue(reloaded.background_memory_allowed())
@@ -251,10 +263,42 @@ class EconomyFeatureControlTests(unittest.TestCase):
                 economy_provider_available=False,
             )
             self.assertEqual(
-                "穷鬼模式不可用：当前实例未完整配置 GLM 网关。",
-                execute_control_command("/穷鬼模式 开", controller, "1"),
+                "模型切换不可用：当前实例未完整配置 GLM 网关。",
+                execute_control_command("/模型切换 GLM", controller, "1"),
             )
             self.assertFalse(controller.snapshot().economy_mode_enabled)
+
+    def test_model_command_aliases_keep_the_same_narrow_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = FeatureController(
+                Path(directory) / "runtime_features.json",
+                _state(),
+                economy_provider_available=True,
+            )
+            for command in ("/模型切换 GLM", "/聊天模型 GLM", "/穷鬼模式 开"):
+                self.assertTrue(is_control_command(command), command)
+
+            self.assertEqual(
+                "聊天文字模型已切换为 glm-4.7-flash；"
+                "图片、记忆和业务模型保持原配置。",
+                execute_control_command("/聊天模型 GLM", controller, "1"),
+            )
+            self.assertEqual(
+                "当前聊天文字模型：glm-4.7-flash。",
+                execute_control_command("/模型切换 状态", controller, "1"),
+            )
+            self.assertEqual(
+                "聊天文字模型已切换为原模型；"
+                "图片、记忆和业务模型保持原配置。",
+                execute_control_command("/穷鬼模式 关", controller, "1"),
+            )
+            self.assertFalse(controller.snapshot().economy_mode_enabled)
+            self.assertEqual(
+                "聊天文字模型已切换为 glm-4.7-flash；"
+                "图片、记忆和业务模型保持原配置。",
+                execute_control_command("/穷鬼模式 开", controller, "1"),
+            )
+            self.assertTrue(controller.snapshot().economy_mode_enabled)
 
     def test_enabled_mode_stays_fail_closed_when_provider_configuration_disappears(
         self,
@@ -276,16 +320,15 @@ class EconomyFeatureControlTests(unittest.TestCase):
 
             self.assertTrue(unavailable.snapshot().economy_mode_enabled)
             self.assertTrue(unavailable.llm_gateway_allowed("chat"))
-            self.assertFalse(unavailable.image_understanding_allowed())
-            self.assertIn(
-                "穷鬼模式：开（GLM 配置不可用；文字调用已阻断；"
-                "图片理解/后台记忆整理：暂停；原文归档：继续）",
-                execute_control_command("/模块状态", unavailable, "1"),
-            )
+            self.assertTrue(unavailable.image_understanding_allowed())
+            self.assertTrue(unavailable.background_memory_allowed())
+            status = execute_control_command("/模块状态", unavailable, "1")
+            self.assertIn("聊天文字模型：glm-4.7-flash（配置不可用）", status)
+            self.assertNotIn("暂停", status)
 
             self.assertEqual(
-                "穷鬼模式已关闭：已恢复原文字模型、后台记忆整理和图片理解配置。",
-                execute_control_command("/穷鬼模式 关", unavailable, "1"),
+                "聊天文字模型已切换为原模型；图片、记忆和业务模型保持原配置。",
+                execute_control_command("/模型切换 原模型", unavailable, "1"),
             )
             self.assertFalse(unavailable.snapshot().economy_mode_enabled)
 
@@ -321,8 +364,11 @@ class EconomyFeatureControlTests(unittest.TestCase):
                 _state(),
                 economy_provider_available=True,
             )
-            execute_control_command("/穷鬼模式 开", controller, "1")
-            execute_control_command("/模型网关 关", controller, "1")
+            execute_control_command("/模型切换 GLM", controller, "1")
+            self.assertEqual(
+                "模型网关已关闭，聊天文字模型已恢复原模型。",
+                execute_control_command("/模型网关 关", controller, "1"),
+            )
             self.assertFalse(controller.snapshot().llm_gateway_enabled)
             self.assertFalse(controller.snapshot().economy_mode_enabled)
 
@@ -338,20 +384,29 @@ class EconomyFeatureControlTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                "穷鬼模式无法关闭：当前实例未配置原文字模型；"
+                "无法切换到原模型：当前实例未配置原文字模型；"
                 "请先恢复原模型配置；如需停止当前纯 GLM 实例的模型调用，"
                 "可使用 /模型网关 关。",
-                execute_control_command("/穷鬼模式 关", controller, "1"),
+                execute_control_command("/模型切换 原模型", controller, "1"),
             )
             self.assertTrue(controller.snapshot().economy_mode_enabled)
             with self.assertRaisesRegex(ValueError, "primary provider"):
                 controller.set_switch("economy_mode_enabled", False, "1")
 
             self.assertEqual(
-                "模型网关已关闭。",
+                "模型网关已关闭，聊天文字模型已恢复原模型。",
                 execute_control_command("/模型网关 关", controller, "1"),
             )
             self.assertFalse(controller.snapshot().economy_mode_enabled)
+
+            self.assertEqual(
+                "模型网关无法开启：当前实例未配置原文字模型；"
+                "请先切换到 GLM 或恢复原模型配置。",
+                execute_control_command("/模型网关 开", controller, "1"),
+            )
+            self.assertFalse(controller.snapshot().llm_gateway_enabled)
+            with self.assertRaisesRegex(ValueError, "primary provider"):
+                controller.set_switch("llm_gateway_enabled", True, "1")
 
 
 class EconomyGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -380,7 +435,7 @@ class EconomyGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(LLMProvider.ECONOMY, transport.requests[-1].provider)
 
-    async def test_hot_mode_switch_routes_every_text_task_without_rebuilding_gateway(self) -> None:
+    async def test_hot_model_switch_only_routes_image_free_chat_without_rebuilding_gateway(self) -> None:
         enabled = False
         transport = _Transport()
         gateway = Gateway(
@@ -395,35 +450,31 @@ class EconomyGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("deepseek-chat", transport.requests[-1].model)
 
         enabled = True
-        calls = (
+        self.assertEqual("ok", await gateway.generate_chat_reply(MESSAGES, images=False))
+        chat_request = transport.requests[-1]
+        self.assertEqual(LLMProvider.ECONOMY, chat_request.provider)
+        self.assertEqual("glm-4.7-flash", chat_request.model)
+        self.assertTrue(chat_request.thinking_disabled)
+
+        primary_calls = (
             gateway.parse_business_intent(MESSAGES),
-            gateway.generate_chat_reply(MESSAGES, images=False),
             gateway.extract_member_memories(MESSAGES),
             gateway.summarize_member_memory(MESSAGES),
             gateway.extract_private_facts(MESSAGES),
             gateway.summarize_private_conversation(MESSAGES),
             gateway.update_relationship_state(MESSAGES),
         )
-        for call in calls:
+        for call in primary_calls:
             self.assertEqual("ok", await call)
+        for request in transport.requests[-len(primary_calls) :]:
+            self.assertEqual(LLMProvider.PRIMARY, request.provider)
+            self.assertEqual("deepseek-chat", request.model)
 
-        economy_requests = transport.requests[-len(calls) :]
-        self.assertTrue(economy_requests)
-        for request in economy_requests:
-            self.assertEqual(LLMProvider.ECONOMY, request.provider)
-            self.assertEqual("glm-4.7-flash", request.model)
-            self.assertEqual(30, request.timeout)
-            self.assertTrue(request.thinking_disabled)
-            self.assertTrue(all(isinstance(message["content"], str) for message in request.messages))
-        self.assertEqual(0.1, economy_requests[0].temperature)
-        member_extraction = next(
-            request
-            for request in economy_requests
-            if request.task is LLMTask.MEMBER_EXTRACTION
-        )
-        self.assertEqual({"type": "json_object"}, member_extraction.response_format)
+        enabled = False
+        self.assertEqual("ok", await gateway.generate_chat_reply(MESSAGES, images=False))
+        self.assertEqual(LLMProvider.PRIMARY, transport.requests[-1].provider)
 
-    async def test_economy_mode_defensively_rejects_every_vision_request(self) -> None:
+    async def test_model_switch_keeps_every_vision_request_on_primary(self) -> None:
         transport = _Transport()
         gateway = Gateway(
             transport=transport,
@@ -431,24 +482,26 @@ class EconomyGatewayRoutingTests(unittest.IsolatedAsyncioTestCase):
             config=_config(),
             economy_mode_enabled=lambda: True,
         )
-        with self.assertRaises(GatewayConfigurationError):
-            await gateway.generate_chat_reply(MESSAGES, images=True)
-        with self.assertRaises(GatewayConfigurationError):
-            await gateway.describe_image(
-                (
+        vision_messages = (
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "看图"},
                     {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "看图"},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": "data:image/png;base64,AAAA"},
-                            },
-                        ],
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
                     },
-                )
-            )
-        self.assertEqual([], transport.requests)
+                ],
+            },
+        )
+        self.assertEqual(
+            "ok", await gateway.generate_chat_reply(vision_messages, images=True)
+        )
+        self.assertEqual("ok", await gateway.describe_image(vision_messages))
+        self.assertEqual(2, len(transport.requests))
+        for request in transport.requests:
+            self.assertEqual(LLMProvider.PRIMARY, request.provider)
+            self.assertEqual("vision-model", request.model)
 
     async def test_claimed_vision_request_can_finish_with_its_frozen_primary_policy(
         self,

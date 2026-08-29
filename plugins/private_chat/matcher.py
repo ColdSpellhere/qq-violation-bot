@@ -58,10 +58,6 @@ def _persistent_allowed(user_id: str) -> bool:
     )
 
 
-def _background_memory_allowed() -> bool:
-    return not bool(getattr(FEATURES.snapshot(), "economy_mode_enabled", False))
-
-
 def _private_profile(
     *,
     store: PrivateMemoryStore,
@@ -153,8 +149,6 @@ def _enqueue_private_jobs(
     user_id: str,
     input_through_id: int,
 ) -> None:
-    if not _background_memory_allowed():
-        return
     if _persistent_allowed(user_id):
         summary_version, _ = store.get_summary_version_state(user_id=user_id)
         if _persistent_allowed(user_id):

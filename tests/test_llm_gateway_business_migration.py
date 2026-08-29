@@ -37,7 +37,7 @@ class _Features:
     def llm_gateway_allowed(self, domain: str) -> bool:
         if domain != "business":
             raise AssertionError(domain)
-        return self.economy or self.enabled
+        return self.enabled
 
 
 class _FixedDateTime(datetime):
@@ -54,7 +54,7 @@ def _output(intent: str, **overrides: object) -> str:
 
 
 class BusinessGatewayMigrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_chat_only_economy_mode_never_falls_back_to_primary_legacy(
+    async def test_chat_model_switch_does_not_force_business_into_gateway(
         self,
     ) -> None:
         features = _Features(
@@ -78,16 +78,13 @@ class BusinessGatewayMigrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             await ai_router.parse_intent("请解析这条业务消息")
 
-        legacy.assert_not_awaited()
-        self.assertIs(
-            True,
-            gateway.parse_business_intent.await_args.kwargs["economy_mode"],
-        )
+        legacy.assert_awaited_once()
+        gateway.parse_business_intent.assert_not_awaited()
 
-    async def test_business_request_freezes_economy_mode_before_gateway_await(
+    async def test_gateway_business_stays_on_primary_when_chat_uses_glm(
         self,
     ) -> None:
-        features = _Features(enabled=False, economy=True)
+        features = _Features(enabled=True, economy=True)
         gateway = _Gateway(_output("unknown"))
 
         async def delayed_gateway():
@@ -110,7 +107,7 @@ class BusinessGatewayMigrationTests(unittest.IsolatedAsyncioTestCase):
 
         gateway.parse_business_intent.assert_awaited_once()
         self.assertIs(
-            True,
+            False,
             gateway.parse_business_intent.await_args.kwargs["economy_mode"],
         )
 

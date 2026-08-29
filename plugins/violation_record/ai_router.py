@@ -56,8 +56,6 @@ def _gateway_enabled(state: object | None = None) -> bool:
 
     if state is None:
         state = FEATURES.snapshot()
-    if bool(getattr(state, "economy_mode_enabled", False)):
-        return True
     return bool(
         getattr(FEATURES, "business_capable", True)
         and getattr(state, "llm_gateway_enabled", False)
@@ -65,9 +63,7 @@ def _gateway_enabled(state: object | None = None) -> bool:
     )
 
 
-def _text_api_available(*, economy_mode: bool) -> bool:
-    if economy_mode:
-        return bool(getattr(CONFIG, "glm_api_key", ""))
+def _text_api_available() -> bool:
     return bool(CONFIG.ai_api_key)
 
 
@@ -239,16 +235,15 @@ async def parse_intent(message: str, referenced_time: str | None = None) -> dict
     from plugins.feature_control.runtime import FEATURES
 
     state = FEATURES.snapshot()
-    economy_mode = bool(getattr(state, "economy_mode_enabled", False))
     use_gateway = _gateway_enabled(state)
-    if not _text_api_available(economy_mode=economy_mode):
-        raise AIRouterError("AI 未启用或缺少当前文字模型密钥，无法进行自然语言解析。")
+    if not _text_api_available():
+        raise AIRouterError("AI 未启用或缺少业务模型密钥，无法进行自然语言解析。")
     messages = _intent_messages(message, referenced_time=referenced_time)
     try:
         if use_gateway:
             gateway = await get_gateway()
             content = await gateway.parse_business_intent(
-                messages, economy_mode=economy_mode
+                messages, economy_mode=False
             )
         else:
             content = await _legacy_complete(messages)

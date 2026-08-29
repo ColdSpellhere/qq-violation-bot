@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
 from datetime import datetime
 import json
 import logging
@@ -161,21 +160,14 @@ async def generate_replies(
         raise ValueError("real_text_present must be boolean")
     feature_state = FEATURES.snapshot()
     economy_mode = bool(getattr(feature_state, "economy_mode_enabled", False))
-    if economy_mode and real_text_present is False:
-        return ()
-    gateway_allowed = economy_mode or (
+    use_glm_for_text = economy_mode and not images
+    gateway_allowed = use_glm_for_text or (
         bool(getattr(feature_state, "llm_gateway_enabled", False))
         and bool(getattr(feature_state, "llm_gateway_chat_enabled", False))
     )
-    if economy_mode:
+    if use_glm_for_text:
         if not getattr(CONFIG, "glm_api_key", ""):
             return ()
-        context = tuple(
-            replace(item, image_descriptions=()) for item in context
-        )
-        if current is not None:
-            current = replace(current, image_descriptions=())
-        images = ()
     elif not CONFIG.ai_api_key:
         return ()
     gateway = None
@@ -301,7 +293,7 @@ async def generate_replies(
             content = await gateway.generate_chat_reply(
                 messages,
                 images=bool(images),
-                economy_mode=economy_mode,
+                economy_mode=use_glm_for_text,
             )
         else:
             content = await _legacy_complete(messages, images=bool(images))

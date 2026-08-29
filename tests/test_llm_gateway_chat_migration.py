@@ -123,7 +123,9 @@ class LLMGatewayChatMigrationTests(unittest.IsolatedAsyncioTestCase):
         legacy.assert_awaited_once()
         self.assertIn("旧请求可见的图片描述", str(legacy.await_args.args[0]))
 
-    async def test_request_keeps_economy_policy_if_mode_turns_off_mid_build(self) -> None:
+    async def test_image_free_request_keeps_frozen_economy_policy_and_descriptions(
+        self,
+    ) -> None:
         features = _Features(builder=True, gateway=False, economy=True)
         gateway = _Gateway()
         legacy = AsyncMock(return_value="不应调用")
@@ -156,10 +158,11 @@ class LLMGatewayChatMigrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("自然回复", reply)
         legacy.assert_not_awaited()
+        self.assertFalse(gateway.calls[0][1])
         self.assertEqual([True], gateway.economy_modes)
-        self.assertNotIn("不得跨供应商发送", str(gateway.calls[0][0]))
+        self.assertIn("不得跨供应商发送", str(gateway.calls[0][0]))
 
-    async def test_economy_mode_strips_current_and_historical_image_context(self) -> None:
+    async def test_model_switch_keeps_image_chat_on_primary_vision(self) -> None:
         for chat_mode in ("group", "private"):
             gateway = _Gateway()
             current = ContextMessage(
@@ -167,7 +170,7 @@ class LLMGatewayChatMigrationTests(unittest.IsolatedAsyncioTestCase):
                 "只聊文字",
                 message_id="m2",
                 user_id="100",
-                image_descriptions=("当前图片里的私密内容",),
+                image_descriptions=("当前图片内容",),
             )
             context = (
                 ContextMessage(
@@ -175,7 +178,7 @@ class LLMGatewayChatMigrationTests(unittest.IsolatedAsyncioTestCase):
                     "之前发过图片",
                     message_id="m1",
                     user_id="200" if chat_mode == "group" else "100",
-                    image_descriptions=("历史图片里的私密内容",),
+                    image_descriptions=("历史图片内容",),
                 ),
             )
             with self.subTest(chat_mode=chat_mode), patch(
@@ -199,13 +202,14 @@ class LLMGatewayChatMigrationTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             messages, has_images = gateway.calls[0]
-            self.assertFalse(has_images)
+            self.assertTrue(has_images)
             rendered = str(messages)
-            self.assertNotIn("当前图片里的私密内容", rendered)
-            self.assertNotIn("历史图片里的私密内容", rendered)
-            self.assertNotIn("data:image", rendered)
+            self.assertIn("当前图片内容", rendered)
+            self.assertIn("历史图片内容", rendered)
+            self.assertIn("data:image", rendered)
+            self.assertEqual([False], gateway.economy_modes)
 
-    async def test_economy_policy_silences_pure_image_after_a_midflight_switch(self) -> None:
+    async def test_model_switch_keeps_addressed_pure_image_reply(self) -> None:
         gateway = _Gateway()
         current = ContextMessage(
             "甲",
@@ -231,9 +235,11 @@ class LLMGatewayChatMigrationTests(unittest.IsolatedAsyncioTestCase):
                 real_text_present=False,
             )
 
-        self.assertIsNone(reply)
-        get_gateway.assert_not_awaited()
-        self.assertEqual([], gateway.calls)
+        self.assertEqual("自然回复", reply)
+        get_gateway.assert_awaited_once()
+        self.assertEqual(1, len(gateway.calls))
+        self.assertTrue(gateway.calls[0][1])
+        self.assertEqual([False], gateway.economy_modes)
 
     async def test_builder_and_gateway_receive_typed_untrusted_group_context(self) -> None:
         gateway = _Gateway()

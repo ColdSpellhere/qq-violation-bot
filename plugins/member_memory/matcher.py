@@ -21,10 +21,6 @@ from plugins.violation_record.config import CONFIG
 BATCHER = MemberMemoryBatcher(threshold=5, delay_seconds=60.0)
 
 
-def _background_memory_allowed() -> bool:
-    return not bool(getattr(FEATURES.snapshot(), "economy_mode_enabled", False))
-
-
 def _enqueue_group_relationship(event: GroupMessageEvent) -> None:
     """Queue from the archived row; never invoke relationship AI inline."""
     # This matcher loads before the private-memory NoneBot plugin. Import lazily so
@@ -80,8 +76,6 @@ async def collect_member_memory(event: GroupMessageEvent) -> None:
     text = event.get_plaintext().strip()
     if not text or text.startswith("/"):
         return
-    if not _background_memory_allowed():
-        return
     BATCHER.add(
         group_id=int(event.group_id),
         user_id=str(event.user_id),
@@ -101,10 +95,7 @@ async def collect_member_memory(event: GroupMessageEvent) -> None:
 
 
 async def analyze_member_memory(group_id: int, user_id: str, event_time: int) -> None:
-    if (
-        not FEATURES.group_chat_allowed(group_id)
-        or not _background_memory_allowed()
-    ):
+    if not FEATURES.group_chat_allowed(group_id):
         return
     try:
         context = recent_text_context(
@@ -115,18 +106,13 @@ async def analyze_member_memory(group_id: int, user_id: str, event_time: int) ->
             exclude_message_id="",
             bot_user_id=str(CONFIG.bot_self_id),
         )
-        if not _background_memory_allowed():
-            return
         candidates = await extract_memory_candidates(context)
         member_candidates = [
             item
             for item in candidates
             if str(item.get("user_id") or "") == user_id
         ]
-        if (
-            not FEATURES.group_chat_allowed(group_id)
-            or not _background_memory_allowed()
-        ):
+        if not FEATURES.group_chat_allowed(group_id):
             return
         applied = apply_candidates(
             CONFIG.chat_archive_path,
