@@ -630,7 +630,10 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context, generated["context"])
         self.assertEqual("123", generated["current"].user_id)
         self.assertEqual([], generated["profiles"])
-        bot.send_group_msg.assert_awaited_once_with(group_id=789, message="自然回复")
+        bot.send_group_msg.assert_awaited_once()
+        outbound = bot.send_group_msg.await_args.kwargs["message"]
+        self.assertEqual(["text"], [segment.type for segment in outbound])
+        self.assertEqual("自然回复", outbound[0].data["text"])
         extract.assert_not_awaited()
         apply.assert_not_called()
 
@@ -1113,7 +1116,9 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
             sent = await send_random_reply(bot, _event(), "当前消息")
 
         self.assertTrue(sent)
-        self.assertEqual("自然回复", bot.send_group_msg.await_args.kwargs["message"])
+        outbound = bot.send_group_msg.await_args.kwargs["message"]
+        self.assertEqual(["text"], [segment.type for segment in outbound])
+        self.assertEqual("自然回复", outbound[0].data["text"])
         payload = archive.call_args.args[2]
         self.assertEqual("999", payload["user_id"])
         self.assertEqual("自然回复", payload["plaintext"])

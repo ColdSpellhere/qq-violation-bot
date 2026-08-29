@@ -83,9 +83,11 @@ def _status(controller: FeatureController) -> str:
             "穷鬼模式："
             + (
                 (
-                    "开（文字：glm-4.7-flash；图片理解：关）"
+                    "开（聊天/业务文字：glm-4.7-flash；"
+                    "图片理解/后台记忆整理：暂停；原文归档：继续）"
                     if controller.economy_provider_available
-                    else "开（GLM 配置不可用；文字调用已阻断；图片理解：关）"
+                    else "开（GLM 配置不可用；文字调用已阻断；"
+                    "图片理解/后台记忆整理：暂停；原文归档：继续）"
                 )
                 if state.economy_mode_enabled
                 else "关"
@@ -154,8 +156,11 @@ def _set_switch(parts: list[str], controller: FeatureController, actor: str) -> 
             )
         controller.set_switch(field_name, enabled, actor)
         if enabled:
-            return "穷鬼模式已开启：文字模型切换为 glm-4.7-flash，图片理解已停用。"
-        return "穷鬼模式已关闭：已恢复原文字模型和图片理解配置。"
+            return (
+                "穷鬼模式已开启：聊天和业务文字请求切换为 glm-4.7-flash；"
+                "图片理解和后台记忆整理已暂停，聊天原文继续保存。"
+            )
+        return "穷鬼模式已关闭：已恢复原文字模型、后台记忆整理和图片理解配置。"
     controller.set_switch(field_name, enabled, actor)
     return f"{label}已{'开启' if enabled else '关闭'}。"
 

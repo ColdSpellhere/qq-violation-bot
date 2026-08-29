@@ -5,7 +5,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from plugins.chat_archive.db import archive_payload
 from plugins.private_memory.jobs import MemoryJobQueue
@@ -58,6 +58,43 @@ class PrivateMemoryProcessorTests(unittest.IsolatedAsyncioTestCase):
         }
         values.update(changes)
         return PrivateMemoryProcessor(**values)
+
+    async def test_background_gate_blocks_already_claimed_jobs_before_model_calls(self) -> None:
+        through = self.append("p1", "先暂停后台整理", 1)
+
+        for job_type, callable_name in (
+            ("private_summary", "summarize"),
+            ("private_facts", "extract"),
+            ("relationship", "update_relationship"),
+        ):
+            model_call = AsyncMock(return_value=None)
+            processor = self.processor(
+                **{
+                    callable_name: model_call,
+                    "background_memory_allowed": lambda: False,
+                }
+            )
+
+            with self.subTest(job_type=job_type):
+                self.assertFalse(
+                    await processor.process(_job(job_type, watermark=through))
+                )
+                model_call.assert_not_awaited()
+
+    async def test_background_gate_rechecks_before_and_after_model_await(self) -> None:
+        through = self.append("p1", "切换时不要提交旧结果", 1)
+        gate = Mock(side_effect=(True, True, False))
+        summarize = AsyncMock(return_value="不应提交的摘要")
+        processor = self.processor(
+            summarize=summarize,
+            background_memory_allowed=gate,
+        )
+
+        self.assertFalse(
+            await processor.process(_job("private_summary", watermark=through))
+        )
+        summarize.assert_awaited_once()
+        self.assertIsNone(self.store.get_summary(user_id="200"))
 
     async def test_summary_reloads_only_committed_scope_through_watermark(self) -> None:
         first = self.append("p1", "第一句", 1)

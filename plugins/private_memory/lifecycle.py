@@ -71,6 +71,8 @@ async def _run_daily_retention(store: PrivateMemoryStore) -> None:
 
 def _allowed_job_types() -> frozenset[str]:
     state = FEATURES.snapshot()
+    if bool(getattr(state, "economy_mode_enabled", False)):
+        return frozenset()
     allowed: set[str] = set()
     if state.private_memory_enabled:
         allowed.update(("private_summary", "private_facts"))

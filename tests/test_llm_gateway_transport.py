@@ -289,7 +289,7 @@ class LLMTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(0, raised.exception.retries)
             self.assertNotIn("sensitive", str(raised.exception))
 
-    async def test_bigmodel_rate_and_busy_codes_retry_without_exposing_body(self) -> None:
+    async def test_bigmodel_rate_and_busy_codes_fail_fast_without_request_storm(self) -> None:
         request = replace(gateway_request(), provider=LLMProvider.ECONOMY)
         for code in ("1302", "1305"):
             attempts = 0
@@ -305,8 +305,8 @@ class LLMTransportTests(unittest.IsolatedAsyncioTestCase):
 
             with self.subTest(code=code), self.assertRaises(GatewayRateLimitError):
                 await self.make_transport(handler, sleep=sleep).complete(request)
-            self.assertEqual(3, attempts)
-            self.assertEqual([call(0.5), call(1.0)], sleep.await_args_list)
+            self.assertEqual(1, attempts)
+            sleep.assert_not_awaited()
 
     async def test_bigmodel_network_finish_reason_retries(self) -> None:
         attempts = 0

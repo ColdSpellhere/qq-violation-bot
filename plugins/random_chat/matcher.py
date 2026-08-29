@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 
 _RAW_REPLY_MAX_IMAGES = 4
+_BUSY_NOTICE = "现在请求有点多，我暂时没接住，过一会儿再叫我吧。"
 _GROUP_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -321,7 +322,21 @@ async def _send_random_reply_locked(
             real_text_present=bool(stripped_text),
         )
     except RandomChatAIError as exc:
-        logger.warning(f"随机闲聊 AI 回复失败：{exc}")
+        logger.warning(f"随机闲聊 AI 回复失败：{type(exc).__name__}")
+        if (
+            addressed
+            and exc.retry_later
+            and FEATURES.group_chat_allowed(int(event.group_id))
+        ):
+            try:
+                await bot.send_group_msg(
+                    group_id=int(event.group_id), message=_BUSY_NOTICE
+                )
+                return True
+            except Exception as send_exc:
+                logger.warning(
+                    f"随机闲聊繁忙提示发送失败：{type(send_exc).__name__}"
+                )
         return False
     replies = (reply,) if isinstance(reply, str) else tuple(reply or ())
     if replies:
@@ -331,16 +346,17 @@ async def _send_random_reply_locked(
                 special_filename=CONFIG.random_chat_special_sticker,
                 attachment_probability=CONFIG.random_chat_sticker_probability,
             )
-            def decorate(value: str) -> str | Message:
-                if sticker is None:
-                    return value
-                message = Message(value)
-                message += MessageSegment.image(file=f"file://{sticker}")
+            def decorate(value: str) -> Message:
+                message = Message(MessageSegment.text(value))
+                if sticker is not None:
+                    message += MessageSegment.image(file=f"file://{sticker}")
                 return message
 
             send_results: list[object] = []
 
             async def send(message: object) -> None:
+                if not isinstance(message, Message):
+                    message = Message(MessageSegment.text(str(message)))
                 result = await bot.send_group_msg(
                     group_id=int(event.group_id), message=message
                 )

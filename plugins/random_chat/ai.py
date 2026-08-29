@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import datetime
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Literal, Protocol
 
 import httpx
@@ -14,7 +15,13 @@ from plugins.chat_prompt import ChatPromptInput, PromptBudget, build_chat_prompt
 from plugins.chat_prompt.sanitize import neutralize_role_markers
 from plugins.feature_control.runtime import FEATURES
 from plugins.llm_gateway import get_gateway
-from plugins.llm_gateway.errors import GatewayError
+from plugins.llm_gateway.errors import (
+    GatewayError,
+    GatewayRateLimitError,
+    GatewayServerError,
+    GatewayTimeout,
+    GatewayTransportError,
+)
 from plugins.member_memory.store import MemberProfile
 from plugins.random_chat.persona import load_character_prompt
 from plugins.violation_record.config import CONFIG
@@ -26,8 +33,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_JSON_FENCE_RE = re.compile(
+    r"\A```(?:json)?[ \t]*\r?\n(?P<body>.*)\r?\n```[ \t]*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 class RandomChatAIError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retry_later: bool = False) -> None:
+        super().__init__(message)
+        self.retry_later = bool(retry_later)
+
+
+def _chat_error(error: BaseException) -> RandomChatAIError:
+    retry_later = isinstance(
+        error,
+        (
+            GatewayRateLimitError,
+            GatewayTimeout,
+            GatewayTransportError,
+            httpx.TimeoutException,
+            httpx.TransportError,
+        ),
+    )
+    if isinstance(error, GatewayServerError):
+        retry_later = error.status_code is None or error.status_code in {
+            500,
+            502,
+            503,
+            504,
+        }
+    if isinstance(error, httpx.HTTPStatusError):
+        retry_later = error.response.status_code in {408, 429, 500, 502, 503, 504}
+    message = (
+        type(error).__name__
+        if isinstance(error, GatewayError)
+        else str(error).strip() or type(error).__name__
+    )
+    return RandomChatAIError(message, retry_later=retry_later)
 
 
 class RelationshipStateLike(Protocol):
@@ -49,10 +92,31 @@ def _clean_reply(content: object) -> str | None:
 def parse_chat_replies(content: object, *, max_messages: int) -> tuple[str, ...]:
     if type(max_messages) is not int or max_messages not in {1, 2, 3}:
         raise ValueError("max_messages must be 1..3")
-    raw = str(content).strip()
+    if type(content) is not str:
+        return ()
+    raw = content.strip()
+    if raw.startswith("\ufeff"):
+        raw = raw.lstrip("\ufeff").lstrip()
     if not raw or raw.casefold() == "skip":
         return ()
-    if not raw.startswith("{"):
+    structured = raw.startswith(("{", "["))
+    if raw.startswith("```"):
+        fenced = _JSON_FENCE_RE.fullmatch(raw)
+        if fenced is None:
+            return ()
+        raw = fenced.group("body").strip()
+        structured = True
+    if not structured:
+        try:
+            candidate = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        else:
+            structured = (
+                candidate is None
+                or type(candidate) in {str, int, float, bool}
+            )
+    if not structured:
         cleaned = _clean_reply(raw)
         return (cleaned,) if cleaned and len(cleaned) <= 1200 else ()
     try:
@@ -119,9 +183,9 @@ async def generate_replies(
         try:
             gateway = await get_gateway()
         except GatewayError as exc:
-            raise RandomChatAIError(type(exc).__name__) from None
+            raise _chat_error(exc) from None
         except Exception as exc:
-            raise RandomChatAIError(str(exc)) from exc
+            raise _chat_error(exc) from exc
     reply_limit = max_messages or (
         3 if chat_mode == "private" or addressed or required_reply else 1
     )
@@ -242,9 +306,9 @@ async def generate_replies(
         else:
             content = await _legacy_complete(messages, images=bool(images))
     except GatewayError as exc:
-        raise RandomChatAIError(type(exc).__name__) from None
+        raise _chat_error(exc) from None
     except Exception as exc:
-        raise RandomChatAIError(str(exc)) from exc
+        raise _chat_error(exc) from exc
     return parse_chat_replies(content, max_messages=reply_limit)
 
 

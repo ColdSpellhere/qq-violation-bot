@@ -197,10 +197,14 @@ class FeatureController:
             return False
         state = self.snapshot()
         if state.economy_mode_enabled:
-            return domain != "vision"
+            return domain in {"chat", "business"}
         return state.llm_gateway_enabled and getattr(state, field_name)
 
     def image_understanding_allowed(self) -> bool:
+        return not self.snapshot().economy_mode_enabled
+
+    def background_memory_allowed(self) -> bool:
+        """Keep economy-provider capacity for foreground chat and business calls."""
         return not self.snapshot().economy_mode_enabled
 
     def _replace_state(self, **changes: Any) -> FeatureState:

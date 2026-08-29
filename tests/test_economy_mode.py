@@ -209,12 +209,16 @@ class EconomyFeatureControlTests(unittest.TestCase):
 
             self.assertTrue(is_control_command("/穷鬼模式 开"))
             self.assertEqual(
-                "穷鬼模式已开启：文字模型切换为 glm-4.7-flash，图片理解已停用。",
+                "穷鬼模式已开启：聊天和业务文字请求切换为 glm-4.7-flash；"
+                "图片理解和后台记忆整理已暂停，聊天原文继续保存。",
                 execute_control_command("/穷鬼模式 开", controller, "1"),
             )
             self.assertTrue(controller.snapshot().economy_mode_enabled)
-            for domain in ("business", "chat", "member_memory", "private_memory"):
+            self.assertFalse(controller.background_memory_allowed())
+            for domain in ("business", "chat"):
                 self.assertTrue(controller.llm_gateway_allowed(domain), domain)
+            for domain in ("member_memory", "private_memory"):
+                self.assertFalse(controller.llm_gateway_allowed(domain), domain)
             self.assertFalse(controller.llm_gateway_allowed("vision"))
             self.assertFalse(controller.image_understanding_allowed())
 
@@ -225,15 +229,17 @@ class EconomyFeatureControlTests(unittest.TestCase):
             )
             self.assertTrue(reloaded.snapshot().economy_mode_enabled)
             self.assertIn(
-                "穷鬼模式：开（文字：glm-4.7-flash；图片理解：关）",
+                "穷鬼模式：开（聊天/业务文字：glm-4.7-flash；"
+                "图片理解/后台记忆整理：暂停；原文归档：继续）",
                 execute_control_command("/模块状态", reloaded, "1"),
             )
 
             self.assertEqual(
-                "穷鬼模式已关闭：已恢复原文字模型和图片理解配置。",
+                "穷鬼模式已关闭：已恢复原文字模型、后台记忆整理和图片理解配置。",
                 execute_control_command("/穷鬼模式 关", reloaded, "1"),
             )
             self.assertFalse(reloaded.snapshot().economy_mode_enabled)
+            self.assertTrue(reloaded.background_memory_allowed())
             self.assertFalse(reloaded.llm_gateway_allowed("chat"))
             self.assertTrue(reloaded.image_understanding_allowed())
 
@@ -272,12 +278,13 @@ class EconomyFeatureControlTests(unittest.TestCase):
             self.assertTrue(unavailable.llm_gateway_allowed("chat"))
             self.assertFalse(unavailable.image_understanding_allowed())
             self.assertIn(
-                "穷鬼模式：开（GLM 配置不可用；文字调用已阻断；图片理解：关）",
+                "穷鬼模式：开（GLM 配置不可用；文字调用已阻断；"
+                "图片理解/后台记忆整理：暂停；原文归档：继续）",
                 execute_control_command("/模块状态", unavailable, "1"),
             )
 
             self.assertEqual(
-                "穷鬼模式已关闭：已恢复原文字模型和图片理解配置。",
+                "穷鬼模式已关闭：已恢复原文字模型、后台记忆整理和图片理解配置。",
                 execute_control_command("/穷鬼模式 关", unavailable, "1"),
             )
             self.assertFalse(unavailable.snapshot().economy_mode_enabled)

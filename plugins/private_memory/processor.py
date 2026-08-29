@@ -60,6 +60,15 @@ def _relationship_enabled() -> bool:
     return bool(FEATURES.snapshot().relationship_state_enabled)
 
 
+def _background_memory_allowed() -> bool:
+    controller_gate = getattr(FEATURES, "background_memory_allowed", None)
+    if callable(controller_gate):
+        return bool(controller_gate())
+    return not bool(
+        getattr(FEATURES.snapshot(), "economy_mode_enabled", False)
+    )
+
+
 class PrivateMemoryProcessor:
     def __init__(
         self,
@@ -71,6 +80,7 @@ class PrivateMemoryProcessor:
         update_relationship: RelationshipCallable = generate_relationship_candidate,
         private_memory_enabled: Gate = _private_memory_enabled,
         relationship_enabled: Gate = _relationship_enabled,
+        background_memory_allowed: Gate = _background_memory_allowed,
     ) -> None:
         self.store = store
         self.relationship_store = relationship_store
@@ -79,6 +89,7 @@ class PrivateMemoryProcessor:
         self.update_relationship = update_relationship
         self.private_memory_enabled = private_memory_enabled
         self.relationship_enabled = relationship_enabled
+        self.background_memory_allowed = background_memory_allowed
 
     async def __call__(self, job: MemoryJob) -> bool:
         return await self.process(job)
@@ -93,7 +104,11 @@ class PrivateMemoryProcessor:
         raise ValueError("unknown memory job type")
 
     async def _process_summary(self, job: MemoryJob) -> bool:
-        if job.scope.conversation_kind != "private" or not self.private_memory_enabled():
+        if (
+            job.scope.conversation_kind != "private"
+            or not self.private_memory_enabled()
+            or not self.background_memory_allowed()
+        ):
             return False
         current = self.store.get_summary(user_id=job.scope.user_id)
         current_version, previous_through = self.store.get_summary_version_state(
@@ -117,8 +132,14 @@ class PrivateMemoryProcessor:
         )
         if not messages or messages[-1].id != job.input_through_id:
             return False
+        if not self.background_memory_allowed():
+            return False
         summary = await self.summarize(current.summary_text if current else "", messages)
-        if summary is None or not self.private_memory_enabled():
+        if (
+            summary is None
+            or not self.private_memory_enabled()
+            or not self.background_memory_allowed()
+        ):
             return False
         return self.store.commit_summary(
             user_id=job.scope.user_id,
@@ -130,15 +151,24 @@ class PrivateMemoryProcessor:
         )
 
     async def _process_facts(self, job: MemoryJob) -> bool:
-        if job.scope.conversation_kind != "private" or not self.private_memory_enabled():
+        if (
+            job.scope.conversation_kind != "private"
+            or not self.private_memory_enabled()
+            or not self.background_memory_allowed()
+        ):
             return False
         messages = self._private_messages(
             job.scope, after=0, through=job.input_through_id, user_only=True
         )
         if not messages or messages[-1].id != job.input_through_id:
             return False
+        if not self.background_memory_allowed():
+            return False
         candidates = await self.extract(messages)
-        if not self.private_memory_enabled():
+        if (
+            not self.private_memory_enabled()
+            or not self.background_memory_allowed()
+        ):
             return False
         sources = {message.message_id: message for message in messages}
         for candidate in candidates:
@@ -158,7 +188,10 @@ class PrivateMemoryProcessor:
         return True
 
     async def _process_relationship(self, job: MemoryJob) -> bool:
-        if not self.relationship_enabled():
+        if (
+            not self.relationship_enabled()
+            or not self.background_memory_allowed()
+        ):
             return False
         current = self._relationship(job.scope)
         current_version = current.version if current else 0
@@ -191,8 +224,14 @@ class PrivateMemoryProcessor:
             raise ValueError("unknown conversation kind")
         if not messages or messages[-1].id != job.input_through_id:
             return False
+        if not self.background_memory_allowed():
+            return False
         candidate = await self.update_relationship(current, messages)
-        if candidate is None or not self.relationship_enabled():
+        if (
+            candidate is None
+            or not self.relationship_enabled()
+            or not self.background_memory_allowed()
+        ):
             return False
         source = messages[-1]
         state = RelationshipState(

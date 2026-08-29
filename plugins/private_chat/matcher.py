@@ -33,6 +33,7 @@ _FACTS_LIMIT = 1_200
 _RELATIONSHIP_LIMIT = 600
 _TOPIC_LIMIT = 80
 _TOPIC_COUNT = 5
+_BUSY_NOTICE = "现在请求有点多，我暂时没接住，过一会儿再叫我吧。"
 
 
 async def private_chat_candidate(event: Event) -> bool:
@@ -55,6 +56,10 @@ def _persistent_allowed(user_id: str) -> bool:
         FEATURES.private_chat_allowed(user_id)
         and FEATURES.snapshot().private_memory_enabled
     )
+
+
+def _background_memory_allowed() -> bool:
+    return not bool(getattr(FEATURES.snapshot(), "economy_mode_enabled", False))
 
 
 def _private_profile(
@@ -148,6 +153,8 @@ def _enqueue_private_jobs(
     user_id: str,
     input_through_id: int,
 ) -> None:
+    if not _background_memory_allowed():
+        return
     if _persistent_allowed(user_id):
         summary_version, _ = store.get_summary_version_state(user_id=user_id)
         if _persistent_allowed(user_id):
@@ -396,6 +403,21 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             )
         except RandomChatAIError as exc:
             logger.warning(f"私聊 AI 回复失败：{type(exc).__name__}")
+            can_send_notice = (
+                exc.retry_later
+                and FEATURES.private_chat_allowed(user_id)
+                and (not persistent or _persistent_allowed(user_id))
+                and current_event_is_live()
+            )
+            if can_send_notice:
+                try:
+                    await bot.send_private_msg(
+                        user_id=int(event.user_id), message=_BUSY_NOTICE
+                    )
+                except Exception as send_exc:
+                    logger.warning(
+                        f"私聊繁忙提示发送失败：{type(send_exc).__name__}"
+                    )
             return
         replies = (reply,) if isinstance(reply, str) else tuple(reply or ())
         if not replies:
@@ -417,11 +439,10 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             logger.warning(f"私聊表情包选择失败：{type(exc).__name__}")
             sticker = None
 
-        def decorate(value: str) -> str | Message:
-            if sticker is None:
-                return value
-            message = Message(value)
-            message += MessageSegment.image(file=f"file://{sticker}")
+        def decorate(value: str) -> Message:
+            message = Message(MessageSegment.text(value))
+            if sticker is not None:
+                message += MessageSegment.image(file=f"file://{sticker}")
             return message
 
         async def persist(value: str, index: int) -> None:
@@ -443,6 +464,8 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                 raise RuntimeError("private memory access changed")
             if not current_event_is_live():
                 raise RuntimeError("private message was cleared")
+            if not isinstance(message, Message):
+                message = Message(MessageSegment.text(str(message)))
             await bot.send_private_msg(user_id=int(event.user_id), message=message)
 
         delivered = await deliver_replies(

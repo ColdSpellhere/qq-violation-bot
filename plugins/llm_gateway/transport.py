@@ -186,7 +186,9 @@ class LLMTransport:
             except GatewayError as caught:
                 error = caught
 
-            if attempt >= self._max_attempts or not self._should_retry(error):
+            if attempt >= self._max_attempts or not self._should_retry(
+                error, request=request
+            ):
                 error.retries = attempt - 1
                 raise error
             await self._sleep(self._retry_delay(attempt, response))
@@ -305,7 +307,14 @@ class LLMTransport:
             raise GatewayContractError(task=request.task) from exc
 
     @staticmethod
-    def _should_retry(error: GatewayError) -> bool:
+    def _should_retry(
+        error: GatewayError, *, request: GatewayRequest
+    ) -> bool:
+        if (
+            request.provider is LLMProvider.ECONOMY
+            and isinstance(error, GatewayRateLimitError)
+        ):
+            return False
         if isinstance(error, GatewayServerError):
             return error.status_code in _RETRYABLE_SERVER_STATUSES
         return is_retryable(error)
