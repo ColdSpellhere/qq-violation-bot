@@ -14,6 +14,7 @@ _SWITCH_COMMANDS = {
     "/模型网关": ("llm_gateway_enabled", "模型网关"),
     "/提示构建": ("prompt_builder_enabled", "提示构建"),
     "/联网搜索": ("web_search_enabled", "联网搜索"),
+    "/群员监控": ("hive_member_monitor_enabled", "群员监控"),
 }
 _MODEL_SWITCH_COMMANDS = frozenset({"/模型切换", "/聊天模型", "/穷鬼模式"})
 _GATEWAY_DOMAIN_COMMANDS = {
@@ -98,6 +99,12 @@ def _status(controller: FeatureController) -> str:
             f"模型网关业务调用：{gateway_business_status}",
             f"提示构建：{_switch_text(state.prompt_builder_enabled)}",
             f"联网搜索：{_switch_text(state.web_search_enabled)}",
+            "群员监控："
+            + (
+                _switch_text(state.hive_member_monitor_enabled)
+                if controller.hive_member_monitor_capable
+                else "不可用（未配置）"
+            ),
         )
     )
 
@@ -149,6 +156,11 @@ def _set_switch(parts: list[str], controller: FeatureController, actor: str) -> 
     enabled = parts[1] == "开"
     if field_name == "business_enabled" and not controller.business_capable:
         return "业务功能不可用：当前为纯聊天实例。"
+    if (
+        field_name == "hive_member_monitor_enabled"
+        and not controller.hive_member_monitor_capable
+    ):
+        return "群员监控不可用：当前实例未配置监控群和日志群。"
     controller.set_switch(field_name, enabled, actor)
     return f"{label}已{'开启' if enabled else '关闭'}。"
 

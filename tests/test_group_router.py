@@ -20,6 +20,7 @@ from plugins.feature_control.state import FeatureController, FeatureState
 from plugins.chat_archive import matcher as archive_matcher
 from plugins.group_router import matcher as group_router
 from plugins.member_memory import matcher as memory_matcher
+from plugins.chat_vision import matcher as vision_matcher
 from plugins.violation_record import matcher as violation_matcher
 from plugins.violation_record.schemas import DEFAULT_INTENT
 
@@ -94,6 +95,39 @@ class GroupRouterTests(unittest.IsolatedAsyncioTestCase):
     def controller(self, **changes) -> FeatureController:
         state = replace(self.defaults, **changes)
         return FeatureController(Path(self.directory.name) / "features.json", state)
+
+    async def test_monitor_only_group_is_hard_excluded_from_all_chat_paths(self) -> None:
+        event = _group_event(
+            "不要归档或送入模型",
+            group_id=CHAT_GROUP_ID,
+            addressed=True,
+            image=True,
+        )
+        controller = FeatureController(
+            Path(self.directory.name) / "monitor-features.json",
+            self.defaults,
+            excluded_group_chat_ids=(CHAT_GROUP_ID,),
+        )
+        with patch.object(group_router, "FEATURES", controller), patch.object(
+            archive_matcher, "FEATURES", controller
+        ), patch.object(memory_matcher, "FEATURES", controller), patch.object(
+            vision_matcher, "FEATURES", controller
+        ), patch.object(
+            group_router,
+            "CONFIG",
+            SimpleNamespace(
+                target_group_id=TARGET_GROUP_ID,
+                peer_bot_user_ids=(),
+            ),
+        ), patch.object(
+            vision_matcher,
+            "CONFIG",
+            SimpleNamespace(chat_vision_enabled=True),
+        ), patch.object(vision_matcher, "live_event_time_allowed", return_value=True):
+            self.assertFalse(await group_router.group_message_candidate(event))
+            self.assertFalse(archive_matcher._chat_group(event))
+            self.assertFalse(memory_matcher._target_member_message(event))
+            self.assertFalse(vision_matcher.chat_image_candidate(event))
 
     async def test_configured_peer_bot_is_not_a_chat_candidate(self) -> None:
         event = _group_event("机器人之间不要互相触发", user_id=888)

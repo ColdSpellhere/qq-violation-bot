@@ -24,6 +24,9 @@ if TYPE_CHECKING:
 
 
 async def is_memory_governance_event(event: Event) -> bool:
+    group_id = getattr(event, "group_id", None)
+    if group_id is not None and int(group_id) in CONFIG.monitor_only_group_ids:
+        return False
     message = addressed_group_admin_message(event)
     if message is None:
         return False

@@ -5,9 +5,13 @@ from nonebot.rule import Rule
 from .addressing import addressed_group_admin_message
 from .commands import execute_control_command, is_control_command
 from .runtime import FEATURES
+from plugins.violation_record.config import CONFIG
 
 
 async def is_control_event(event: Event) -> bool:
+    group_id = getattr(event, "group_id", None)
+    if group_id is not None and int(group_id) in CONFIG.monitor_only_group_ids:
+        return False
     message = addressed_group_admin_message(event)
     if message is None or any(segment.type == "at" for segment in message):
         return False

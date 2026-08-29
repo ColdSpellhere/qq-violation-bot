@@ -25,6 +25,7 @@ SWITCH_NAMES = {
     "llm_gateway_chat_enabled",
     "llm_gateway_business_enabled",
     "economy_mode_enabled",
+    "hive_member_monitor_enabled",
 }
 ALLOWLIST_KINDS = {"group_chat", "private_chat"}
 GATEWAY_DOMAIN_SWITCHES = {
@@ -56,6 +57,7 @@ class FeatureState:
     llm_gateway_business_enabled: bool = False
     web_search_enabled: bool = False
     economy_mode_enabled: bool = False
+    hive_member_monitor_enabled: bool = False
     updated_at: str = ""
     updated_by: str = ""
 
@@ -69,12 +71,20 @@ class FeatureController:
         business_capable: bool = True,
         economy_provider_available: bool = True,
         primary_provider_available: bool = True,
+        hive_member_monitor_capable: bool = False,
+        excluded_group_chat_ids: tuple[int, ...] = (),
     ):
         self._path = Path(path)
         self._lock = RLock()
         self._business_capable = bool(business_capable)
         self._economy_provider_available = bool(economy_provider_available)
         self._primary_provider_available = bool(primary_provider_available)
+        self._hive_member_monitor_capable = bool(hive_member_monitor_capable)
+        self._excluded_group_chat_ids = frozenset(
+            normalized
+            for value in excluded_group_chat_ids
+            if (normalized := self._as_positive_int(value)) is not None
+        )
         loaded = self._load_state(self._path, defaults) or self._load_state(
             self._backup_path, defaults
         ) or defaults
@@ -84,6 +94,8 @@ class FeatureController:
                 business_enabled=False,
                 llm_gateway_business_enabled=False,
             )
+        if not self._hive_member_monitor_capable:
+            unavailable_changes["hive_member_monitor_enabled"] = False
         self._state = replace(loaded, **unavailable_changes) if unavailable_changes else loaded
 
     @property
@@ -97,6 +109,10 @@ class FeatureController:
     @property
     def primary_provider_available(self) -> bool:
         return self._primary_provider_available
+
+    @property
+    def hive_member_monitor_capable(self) -> bool:
+        return self._hive_member_monitor_capable
 
     @property
     def _backup_path(self) -> Path:
@@ -157,6 +173,12 @@ class FeatureController:
             raise ValueError("business capability is unavailable in chat-only mode")
         if name == "economy_mode_enabled" and enabled and not self._economy_provider_available:
             raise ValueError("economy provider is unavailable")
+        if (
+            name == "hive_member_monitor_enabled"
+            and enabled
+            and not self._hive_member_monitor_capable
+        ):
+            raise ValueError("hive member monitor capability is unavailable")
 
     def add_allowed(self, kind: str, value: str, actor: str) -> FeatureState:
         normalized = self._validate_allowed_value(kind, value)
@@ -193,6 +215,7 @@ class FeatureController:
             state.chat_enabled
             and state.group_chat_enabled
             and normalized is not None
+            and normalized not in self._excluded_group_chat_ids
             and normalized in state.group_chat_allowed_group_ids
         )
 
@@ -327,6 +350,12 @@ class FeatureController:
                 ),
                 economy_mode_enabled=cls._strict_bool(
                     raw.get("economy_mode_enabled", False)
+                ),
+                hive_member_monitor_enabled=cls._strict_bool(
+                    raw.get(
+                        "hive_member_monitor_enabled",
+                        defaults.hive_member_monitor_enabled if defaults else False,
+                    )
                 ),
                 group_chat_allowed_group_ids=cls._load_allowlist(
                     "group_chat", raw["group_chat_allowed_group_ids"]

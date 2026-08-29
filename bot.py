@@ -17,6 +17,9 @@ import plugins.web_search.runtime  # registers bounded search-client shutdown
 nonebot.load_plugin("plugins.feature_control.matcher")
 nonebot.load_plugin("plugins.memory_governance")
 nonebot.load_plugin("plugins.memory_governance.matcher")
+nonebot.load_plugin(
+    "plugins.hive_member_monitor.hive_member_monitor_runtime"
+)
 nonebot.load_plugin("plugins.chat_archive")
 nonebot.load_plugin("plugins.member_memory.matcher")
 nonebot.load_plugin("plugins.random_chat")

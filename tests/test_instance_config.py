@@ -20,6 +20,40 @@ class InstanceConfigTests(unittest.TestCase):
 
         self.assertIn("exec .venv/bin/python -B bot.py", script)
 
+    def test_enabled_hive_monitor_rejects_business_target_as_monitor_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "BOT_INSTANCE_ROOT": temporary,
+                    "BOT_MODE": "full",
+                    "TARGET_GROUP_ID": "123456789",
+                    "HIVE_MEMBER_MONITOR_ENABLED": "true",
+                    "HIVE_MEMBER_MONITOR_GROUP_ID": "123456789",
+                    "HIVE_MEMBER_REPORT_GROUP_ID": "987654321",
+                    "PYTHONPATH": str(PROJECT_ROOT),
+                }
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    "from plugins.violation_record.config import CONFIG",
+                ],
+                cwd=PROJECT_ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(
+            "HIVE_MEMBER_MONITOR_GROUP_ID must differ from TARGET_GROUP_ID",
+            result.stdout + result.stderr,
+        )
+
     def _probe(self, instance_root: Path) -> dict[str, object]:
         environment = os.environ.copy()
         for name in (
@@ -53,6 +87,8 @@ print(json.dumps({
     "chat_archive_path": str(config.CONFIG.chat_archive_path),
     "runtime_features_path": str(config.CONFIG.runtime_features_path),
     "sticker_root": str(config.CONFIG.random_chat_sticker_root),
+    "hive_monitor_database_path": str(config.CONFIG.hive_member_monitor_database_path),
+    "hive_monitor_export_dir": str(config.CONFIG.hive_member_monitor_export_dir),
     "chat_context_messages": config.CONFIG.chat_context_messages,
     "chat_context_minutes": config.CONFIG.chat_context_minutes,
     "chat_context_self_messages": config.CONFIG.chat_context_self_messages,
@@ -65,6 +101,8 @@ print(json.dumps({
         str(config.CONFIG.chat_vision_root),
         str(config.CONFIG.random_chat_sticker_root),
         str(config.CONFIG.runtime_features_path),
+        str(config.CONFIG.hive_member_monitor_database_path),
+        str(config.CONFIG.hive_member_monitor_export_dir),
     ],
 }, ensure_ascii=False))
 '''
@@ -115,6 +153,8 @@ print(json.dumps({
                 "runtime_features_path",
                 "sticker_root",
                 "character_file",
+                "hive_monitor_database_path",
+                "hive_monitor_export_dir",
             ):
                 self.assertNotEqual(carrot[key], kona[key], key)
 

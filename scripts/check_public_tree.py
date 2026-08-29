@@ -24,6 +24,9 @@ SENSITIVE_KEYS = (
     "GROUP_CHAT_ALLOWED_GROUP_IDS",
     "PRIVATE_CHAT_ALLOWED_USER_IDS",
     "PRIVATE_CHAT_ALLOWED_USER_ID",
+    "HIVE_MEMBER_MONITOR_GROUP_ID",
+    "HIVE_MEMBER_REPORT_GROUP_ID",
+    "MONITOR_ONLY_GROUP_IDS",
 )
 TOKEN_RE = re.compile(r"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})")
 GLM_TOKEN_RE = re.compile(r"[A-Fa-f0-9]{32}\.[A-Za-z0-9_-]{16,}")

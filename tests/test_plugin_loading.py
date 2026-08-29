@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,106 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PluginLoadingTests(unittest.TestCase):
+    def test_configured_hive_monitor_loads_notice_plugin_before_chat_handlers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "BOT_INSTANCE_ROOT": directory,
+                    "TARGET_GROUP_ID": "123456789",
+                    "LOG_LEVEL": "WARNING",
+                    "HIVE_MEMBER_MONITOR_ENABLED": "true",
+                    "HIVE_MEMBER_MONITOR_GROUP_ID": "123456780",
+                    "HIVE_MEMBER_REPORT_GROUP_ID": "123456789",
+                    "MONITOR_ONLY_GROUP_IDS": "123456780",
+                }
+            )
+            script = """
+import nonebot
+import bot
+from nonebot.matcher import matchers
+
+loaded_modules = {plugin.module_name for plugin in nonebot.get_loaded_plugins()}
+if "plugins.hive_member_monitor.hive_member_monitor_runtime" not in loaded_modules:
+    raise SystemExit(f"hive monitor plugin missing: {sorted(loaded_modules)}")
+registered = {
+    matcher.module.__name__
+    for priority_matchers in matchers.values()
+    for matcher in priority_matchers
+}
+if "plugins.hive_member_monitor.matcher" not in registered:
+    raise SystemExit(f"hive notice matcher missing: {sorted(registered)}")
+source = open("bot.py", encoding="utf-8").read()
+if source.index('"plugins.hive_member_monitor.hive_member_monitor_runtime"') >= source.index('nonebot.load_plugin("plugins.chat_archive")'):
+    raise SystemExit("hive monitor must register before chat handlers")
+"""
+            completed = subprocess.run(
+                [sys.executable, "-B", "-c", script],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                completed.returncode,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_unconfigured_instance_registers_no_hive_notice_or_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "BOT_INSTANCE_ROOT": directory,
+                    "BOT_MODE": "chat_only",
+                    "LOG_LEVEL": "WARNING",
+                    "HIVE_MEMBER_MONITOR_ENABLED": "false",
+                }
+            )
+            for key in (
+                "HIVE_MEMBER_MONITOR_GROUP_ID",
+                "HIVE_MEMBER_REPORT_GROUP_ID",
+                "MONITOR_ONLY_GROUP_IDS",
+            ):
+                env.pop(key, None)
+            script = """
+import sys
+import nonebot
+import bot
+from nonebot.matcher import matchers
+
+registered = {
+    matcher.module.__name__
+    for priority_matchers in matchers.values()
+    for matcher in priority_matchers
+}
+if "plugins.hive_member_monitor.matcher" in registered:
+    raise SystemExit("unconfigured instance registered hive notice matcher")
+if "plugins.hive_member_monitor.lifecycle" in {
+    func.__module__ for func in nonebot.get_driver()._lifespan._startup_funcs
+}:
+    raise SystemExit("unconfigured instance registered hive lifecycle")
+if "plugins.hive_member_monitor.matcher" in sys.modules:
+    raise SystemExit("unconfigured instance imported hive matcher")
+"""
+            completed = subprocess.run(
+                [sys.executable, "-B", "-c", script],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                completed.returncode,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
     def test_gateway_entrypoint_loads_after_private_schema_lifecycle_before_handlers(self) -> None:
         source = (ROOT / "bot.py").read_text(encoding="utf-8")
         private_schema = source.index('nonebot.load_plugin("plugins.private_memory")')

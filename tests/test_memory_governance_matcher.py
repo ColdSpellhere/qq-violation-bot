@@ -64,6 +64,19 @@ def _features(*, enabled: bool = True, allowed: tuple[str, ...] = ("200",)):
 
 
 class MemoryGovernanceRuleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_monitor_only_group_cannot_match_memory_governance_commands(self) -> None:
+        monitor_group_id = 456
+        with patch.object(
+            matcher,
+            "CONFIG",
+            SimpleNamespace(monitor_only_group_ids=(monitor_group_id,)),
+        ):
+            self.assertFalse(
+                await matcher.is_memory_governance_event(
+                    _event("/记忆 状态", group_id=monitor_group_id)
+                )
+            )
+
     async def test_only_exact_first_token_is_matched(self) -> None:
         for text in ("/记忆", "/记忆 状态", "  /记忆\n状态"):
             self.assertTrue(await matcher.is_memory_governance_event(_event(text)))

@@ -26,6 +26,7 @@ from plugins.feature_control.commands import (
     execute_control_command,
     is_control_command,
 )
+from plugins.feature_control import matcher as feature_matcher
 from plugins.feature_control.matcher import handle_control_command, is_control_event
 from plugins.feature_control.state import FeatureController, FeatureState
 
@@ -36,6 +37,7 @@ def _event(
     user_id: int = 1,
     self_id: int = 999999,
     addressed: bool = True,
+    group_id: int = 123456,
 ) -> GroupMessageEvent:
     message = Message()
     if addressed:
@@ -49,7 +51,7 @@ def _event(
         user_id=user_id,
         message_type="group",
         message_id=456,
-        group_id=123456,
+        group_id=group_id,
         message=message,
         original_message=message,
         raw_message=str(message),
@@ -104,6 +106,28 @@ class FeatureControlCommandTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
+    def test_monitor_only_group_cannot_match_feature_control_commands(self) -> None:
+        monitor_group_id = 654321
+        with patch.object(
+            feature_matcher,
+            "CONFIG",
+            SimpleNamespace(monitor_only_group_ids=(monitor_group_id,)),
+            create=True,
+        ):
+            matched = self._async_result(
+                feature_matcher.is_control_event(
+                    _event("/模块状态", group_id=monitor_group_id)
+                )
+            )
+
+        self.assertFalse(matched)
+
+    @staticmethod
+    def _async_result(awaitable):
+        import asyncio
+
+        return asyncio.run(awaitable)
+
     def test_recognizes_only_control_command_prefixes(self) -> None:
         for text in (
             "/模块状态",
@@ -127,6 +151,7 @@ class FeatureControlCommandTests(unittest.TestCase):
             "/聊天模型 原模型",
             "/穷鬼模式 开",
             "/提示构建 开",
+            "/群员监控 关",
         ):
             self.assertTrue(is_control_command(text), text)
 
@@ -205,6 +230,23 @@ class FeatureControlCommandTests(unittest.TestCase):
         self.assertTrue(self.controller.snapshot().llm_gateway_member_memory_enabled)
         self.assertTrue(self.controller.snapshot().llm_gateway_chat_enabled)
         self.assertTrue(self.controller.snapshot().llm_gateway_business_enabled)
+
+    def test_hive_monitor_switch_requires_instance_capability(self) -> None:
+        self.assertEqual(
+            "群员监控不可用：当前实例未配置监控群和日志群。",
+            execute_control_command("/群员监控 开", self.controller, "1"),
+        )
+        capable = FeatureController(
+            Path(self.temporary_directory.name) / "hive-features.json",
+            self.controller.snapshot(),
+            hive_member_monitor_capable=True,
+        )
+        self.assertEqual(
+            "群员监控已开启。",
+            execute_control_command("/群员监控 开", capable, "1"),
+        )
+        self.assertTrue(capable.snapshot().hive_member_monitor_enabled)
+        self.assertIn("群员监控：开", execute_control_command("/模块状态", capable, "1"))
 
     def test_executes_all_allowlist_commands(self) -> None:
         self.assertEqual(

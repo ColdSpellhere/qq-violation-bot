@@ -311,8 +311,44 @@ class AppConfig:
     private_memory_shutdown_timeout: float = max(
         0.1, _float_env("PRIVATE_MEMORY_SHUTDOWN_TIMEOUT", 10.0)
     )
+    hive_member_monitor_enabled: bool = _bool_env(
+        "HIVE_MEMBER_MONITOR_ENABLED", False
+    )
+    hive_member_monitor_group_id: int = max(
+        0, _int_env("HIVE_MEMBER_MONITOR_GROUP_ID", 0)
+    )
+    hive_member_report_group_id: int = max(
+        0, _int_env("HIVE_MEMBER_REPORT_GROUP_ID", 0)
+    )
+    hive_member_monitor_reconcile_seconds: int = _bounded_int_env(
+        "HIVE_MEMBER_MONITOR_RECONCILE_SECONDS", 300, 60, 3600
+    )
+    configured_monitor_only_group_ids: tuple[int, ...] = _id_tuple_env(
+        "MONITOR_ONLY_GROUP_IDS", ()
+    )
+    hive_member_monitor_database_path: Path = (
+        DATA_DIR / "hive_member_monitor.sqlite3"
+    )
+    hive_member_monitor_export_dir: Path = EXPORT_DIR / "hive_member_monitor"
     runtime_features_path: Path = DATA_DIR / "runtime_features.json"
     admin_seed: str = os.getenv("ADMIN_SEED", "")
+
+    @property
+    def hive_member_monitor_capable(self) -> bool:
+        return (
+            self.hive_member_monitor_group_id > 0
+            and self.hive_member_report_group_id > 0
+            and self.hive_member_monitor_group_id
+            != self.hive_member_report_group_id
+            and self.hive_member_monitor_group_id != self.target_group_id
+        )
+
+    @property
+    def monitor_only_group_ids(self) -> tuple[int, ...]:
+        values = set(self.configured_monitor_only_group_ids)
+        if self.hive_member_monitor_group_id > 0:
+            values.add(self.hive_member_monitor_group_id)
+        return tuple(sorted(values))
 
     @property
     def economy_provider_available(self) -> bool:
@@ -329,6 +365,17 @@ class AppConfig:
 
 
 CONFIG = AppConfig()
+if (
+    CONFIG.hive_member_monitor_enabled
+    and CONFIG.hive_member_monitor_group_id == CONFIG.target_group_id
+):
+    raise RuntimeError(
+        "HIVE_MEMBER_MONITOR_GROUP_ID must differ from TARGET_GROUP_ID"
+    )
+if CONFIG.hive_member_monitor_enabled and not CONFIG.hive_member_monitor_capable:
+    raise RuntimeError(
+        "HIVE_MEMBER_MONITOR_ENABLED requires distinct positive monitor and report group IDs"
+    )
 
 GROUP_AREAS = {"蜂巢", "蜂窝", "蜂箱"}
 LOCKED_STATUSES = {"已移出", "已拉黑", "已退群"}
