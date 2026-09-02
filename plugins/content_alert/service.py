@@ -106,12 +106,12 @@ class ContentAlertService:
         if not manual_matches and not background_matches and not managed_matches:
             return False
 
-        strict_hidden = bool(background_matches) or any(
-            match.disclosure_policy == "strict_hidden"
-            for match in managed_matches
-        )
         political_alert = any(
             "political_cn" in match.category_ids for match in managed_matches
+        )
+        strict_hidden = political_alert or bool(background_matches) or any(
+            match.disclosure_policy == "strict_hidden"
+            for match in managed_matches
         )
 
         delivery_key = (
@@ -164,18 +164,23 @@ class ContentAlertService:
     ) -> str:
         group_id = int(event.group_id)
         sender = event.sender
-        visible_sender_name = _one_line(
-            str(
-                getattr(sender, "card", "")
-                or getattr(sender, "nickname", "")
-                or event.user_id
-            ),
-            limit=64,
+        raw_sender_name = str(
+            getattr(sender, "card", "")
+            or getattr(sender, "nickname", "")
+            or event.user_id
         )
+        rendered_sender_name = _clean_one_line(raw_sender_name)
+        visible_sender_name = _one_line(raw_sender_name, limit=64)
         hide_sender_name = strict_hidden and not political_alert
         if political_alert:
-            hide_sender_name = self._sender_name_contains_strict_match(
-                visible_sender_name
+            # Check both the complete input and its complete display-normalized
+            # form before truncation.  Otherwise a protected term crossing the
+            # display boundary, or formed after control stripping, could leak.
+            hide_sender_name = any(
+                self._sender_name_contains_strict_match(candidate)
+                for candidate in dict.fromkeys(
+                    (raw_sender_name, rendered_sender_name)
+                )
             )
         if political_alert and hide_sender_name:
             sender_name = "昵称含受保护内容，已隐藏"
@@ -311,6 +316,13 @@ def _message_excerpt(event: GroupMessageEvent, *, limit: int) -> str:
 
 
 def _one_line(value: str, *, limit: int) -> str:
+    rendered = _clean_one_line(value)
+    if len(rendered) > limit:
+        return rendered[: limit - 1] + "…"
+    return rendered
+
+
+def _clean_one_line(value: str) -> str:
     cleaned: list[str] = []
     pending_space = False
     for character in unicodedata.normalize("NFKC", value):
@@ -326,12 +338,7 @@ def _one_line(value: str, *, limit: int) -> str:
             cleaned.append(" ")
             pending_space = False
         cleaned.append(character)
-        if len(cleaned) >= limit:
-            break
-    rendered = "".join(cleaned).strip()
-    if len(rendered) >= limit and len(value) > len(rendered):
-        return rendered[:-1] + "…"
-    return rendered
+    return "".join(cleaned).strip()
 
 
 __all__ = ("ContentAlertService",)

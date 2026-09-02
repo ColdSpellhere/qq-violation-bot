@@ -540,12 +540,19 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             return self._snapshot
 
         def match_message(self, _message: object) -> tuple[SimpleNamespace, ...]:
+            from plugins.content_alert.rules import normalize_literal_text
+
             text = "".join(
                 str(segment.data.get("text", ""))
                 for segment in _message
                 if getattr(segment, "type", None) == "text"
             )
-            return tuple(match for match in self.matches if match.term in text)
+            normalized_text = normalize_literal_text(text)
+            return tuple(
+                match
+                for match in self.matches
+                if normalize_literal_text(match.term) in normalized_text
+            )
 
     def _service(self, directory: str, *, enabled: bool = True):
         from plugins.content_alert.rules import KeywordRuleStore
@@ -803,6 +810,53 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(token, report)
         self.assertLessEqual(len(report), 1_800)
 
+    async def test_political_category_forces_hidden_disclosure_if_policy_is_wrong(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        protected_term = "受保护占位词己"
+        catalog = self.ManagedCatalog(
+            (
+                SimpleNamespace(
+                    term=protected_term,
+                    category_ids=("political_cn",),
+                    category_names=("错误披露策略占位分类",),
+                    disclosure_policy="management_visible",
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+                max_event_age_seconds=300,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event(
+                    f"消息中含{protected_term}且有完整原文",
+                    nickname="安全测试昵称",
+                ),
+            )
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn("【蜂巢政治敏感告警】", report)
+        self.assertIn("内容摘录：（内容已隐藏）", report)
+        self.assertIn("政治敏感规则命中（词条与详情已隐藏）", report)
+        self.assertNotIn(protected_term, report)
+        self.assertNotIn("错误披露策略占位分类", report)
+        self.assertNotIn("完整原文", report)
+
     async def test_political_alert_hides_protected_sender_name_but_keeps_qq(
         self,
     ) -> None:
@@ -848,6 +902,115 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             f"发送者：昵称含受保护内容，已隐藏（QQ：{MEMBER_USER_ID}）",
             report,
         )
+        self.assertNotIn(protected_term, report)
+
+    async def test_political_alert_scans_full_sender_name_before_display_truncation(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        protected_term = "受保护占位词戊"
+        # The matcher removes Cf characters, while report rendering also drops
+        # other controls.  Put both across the display limit so the privacy
+        # check must cover the full rendered form, not only raw or truncated
+        # nickname text.
+        split_protected_term = "\u200b\x01".join(protected_term)
+        nickname = "安" * 60 + split_protected_term + "尾部"
+        catalog = self.ManagedCatalog(
+            (
+                SimpleNamespace(
+                    term=protected_term,
+                    category_ids=("political_cn",),
+                    category_names=("受保护占位分类",),
+                    disclosure_policy="strict_hidden",
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+                max_event_age_seconds=300,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event(
+                    f"消息中含{protected_term}",
+                    nickname=nickname,
+                ),
+            )
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn(
+            f"发送者：昵称含受保护内容，已隐藏（QQ：{MEMBER_USER_ID}）",
+            report,
+        )
+        self.assertNotIn("安" * 20, report)
+        self.assertNotIn(protected_term, report)
+
+    async def test_political_sender_scan_failure_hides_name_but_keeps_qq(self) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        protected_term = "受保护占位词庚"
+
+        class FailingNameCatalog(self.ManagedCatalog):
+            def __init__(self) -> None:
+                super().__init__(
+                    (
+                        SimpleNamespace(
+                            term=protected_term,
+                            category_ids=("political_cn",),
+                            category_names=("受保护占位分类",),
+                            disclosure_policy="strict_hidden",
+                        ),
+                    )
+                )
+                self.calls = 0
+
+            def match_message(self, value: object) -> tuple[SimpleNamespace, ...]:
+                self.calls += 1
+                if self.calls > 1:
+                    raise RuntimeError("synthetic sender scan failure")
+                return super().match_message(value)
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=FailingNameCatalog(),
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+                max_event_age_seconds=300,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event(
+                    f"消息中含{protected_term}",
+                    nickname="原本安全的昵称",
+                ),
+            )
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn(
+            f"发送者：昵称含受保护内容，已隐藏（QQ：{MEMBER_USER_ID}）",
+            report,
+        )
+        self.assertNotIn("原本安全的昵称", report)
         self.assertNotIn(protected_term, report)
 
     async def test_active_managed_generation_disables_legacy_background_fallback(

@@ -519,6 +519,48 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
         self.assertFalse(fresh_current.exists())
         self.assertTrue((fresh_current.parent / "generations").is_dir())
 
+    def test_rollback_rejects_unreviewed_active_gender_generation(self) -> None:
+        first_code, first_output = self._apply()
+        self.assertEqual(0, first_code, first_output)
+        first_pointer, first_manifest_path, first_manifest = (
+            self._current_and_manifest()
+        )
+
+        second_path = self.base / "reviewed-second-build.json"
+        self._write_build(second_path, revision="fixture-reviewed-v2")
+        second_code, second_output = self._apply(build=second_path)
+        self.assertEqual(0, second_code, second_output)
+        current_path = self._current_path(self.instance_root)
+        second_pointer_bytes = current_path.read_bytes()
+
+        gender = next(
+            category
+            for category in first_manifest["categories"]
+            if category["id"] == "gender_conflict"
+        )
+        descriptor = gender["shards"][0]
+        shard_path = first_manifest_path.parent / descriptor["path"]
+        shard = json.loads(shard_path.read_text(encoding="utf-8"))
+        active = next(
+            entry
+            for entry in shard["entries"]
+            if entry.get("status", "active") == "active"
+        )
+        active.pop("tags", None)
+        shard_bytes = self.importer._json_bytes(shard)
+        shard_path.write_bytes(shard_bytes)
+        shard_path.chmod(0o600)
+        descriptor["sha256"] = hashlib.sha256(shard_bytes).hexdigest()
+        first_manifest_path.write_bytes(self.importer._json_bytes(first_manifest))
+        first_manifest_path.chmod(0o600)
+
+        rollback_code, rollback_output = self._rollback()
+
+        self.assertNotEqual(0, rollback_code, rollback_output)
+        self.assertEqual(second_pointer_bytes, current_path.read_bytes())
+        self.assertNotEqual(first_pointer, json.loads(current_path.read_text()))
+        self.assertNotIn(active["term"], rollback_output)
+
     def test_legacy_rules_are_imported_into_strict_category_without_mutation(self) -> None:
         legacy_path = (
             self.instance_root / "data" / "content_alert" / "background_keywords.json"

@@ -950,7 +950,12 @@ def _decode_pointer(payload: bytes) -> dict[str, Any]:
     return raw
 
 
-def _verify_pointer_catalog(managed_root: Path, pointer_bytes: bytes) -> str:
+def _verify_pointer_catalog(
+    managed_root: Path,
+    pointer_bytes: bytes,
+    *,
+    require_gender_active_review: bool = False,
+) -> str:
     pointer = _decode_pointer(pointer_bytes)
     generation_id = pointer["generation_id"]
     manifest_path = managed_root / pointer["manifest"]
@@ -1010,6 +1015,20 @@ def _verify_pointer_catalog(managed_root: Path, pointer_bytes: bytes) -> str:
                 or descriptor.get("entry_count") != len(shard["entries"])
             ):
                 raise CatalogImportError("catalog shard schema is invalid")
+            if require_gender_active_review and category_id == "gender_conflict":
+                for entry in shard["entries"]:
+                    if not isinstance(entry, dict):
+                        raise CatalogImportError("catalog shard entry is invalid")
+                    if entry.get("status") != "active":
+                        continue
+                    tags = entry.get("tags")
+                    if (
+                        not isinstance(tags, list)
+                        or GENDER_ACTIVE_REVIEW_TAG not in tags
+                    ):
+                        raise CatalogImportError(
+                            "rollback target contains unreviewed active gender entry"
+                        )
     if not REQUIRED_CATEGORY_IDS.issubset(seen_categories):
         raise CatalogImportError("catalog is missing required categories")
     return generation_id
@@ -1075,6 +1094,7 @@ def _publish_pointer(
     *,
     previous_bytes: bytes | None,
     expected_generation_id: str,
+    require_gender_active_review: bool = False,
 ) -> None:
     try:
         _atomic_write_private(current_path, pointer_bytes)
@@ -1083,7 +1103,11 @@ def _publish_pointer(
             raise CatalogImportError(
                 "catalog pointer publication verification failed"
             )
-        published_generation = _verify_pointer_catalog(managed_root, published)
+        published_generation = _verify_pointer_catalog(
+            managed_root,
+            published,
+            require_gender_active_review=require_gender_active_review,
+        )
         if published_generation != expected_generation_id:
             raise CatalogImportError(
                 "catalog pointer publication verification failed"
@@ -1309,7 +1333,11 @@ def rollback_catalog(*, instance_root: Path) -> str:
             raise CatalogImportError("rollback backup state is invalid")
         if previous.exists():
             previous_bytes = _read_regular_file(previous, label="previous pointer")
-            previous_generation = _verify_pointer_catalog(managed_root, previous_bytes)
+            previous_generation = _verify_pointer_catalog(
+                managed_root,
+                previous_bytes,
+                require_gender_active_review=True,
+            )
             _verify_runtime_pointer(
                 managed_root,
                 previous_bytes,
@@ -1321,6 +1349,7 @@ def rollback_catalog(*, instance_root: Path) -> str:
                 previous_bytes,
                 previous_bytes=current_bytes,
                 expected_generation_id=previous_generation,
+                require_gender_active_review=True,
             )
             return previous_generation
         _restore_pointer(current_path, None)
