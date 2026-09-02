@@ -108,6 +108,9 @@ class ContentAlertConfigTests(unittest.TestCase):
                 "CONTENT_ALERT_ENABLED": "true",
                 "CONTENT_ALERT_SOURCE_GROUP_IDS": str(SOURCE_GROUP_ID),
                 "CONTENT_ALERT_REPORT_GROUP_ID": str(REPORT_GROUP_ID),
+                "CONTENT_ALERT_BACKGROUND_RULES_PATH": str(
+                    instance_root / "env-must-not-control-background-rules.json"
+                ),
                 "MONITOR_ONLY_GROUP_IDS": monitor_only,
                 "PYTHONPATH": str(PROJECT_ROOT),
             }
@@ -122,6 +125,7 @@ print(json.dumps({
     "report": CONFIG.content_alert_report_group_id,
     "capable": CONFIG.content_alert_capable,
     "rule_path": str(CONFIG.content_alert_rules_path),
+    "background_rule_path": str(CONFIG.content_alert_background_rules_path),
 }))
 """
         return subprocess.run(
@@ -150,6 +154,10 @@ print(json.dumps({
         self.assertEqual(
             str(root / "data" / "content_alert" / "keywords.json"),
             payload["rule_path"],
+        )
+        self.assertEqual(
+            str(root / "data" / "content_alert" / "background_keywords.json"),
+            payload["background_rule_path"],
         )
 
     def test_enabled_source_group_must_be_monitor_only(self) -> None:
@@ -395,6 +403,66 @@ class KeywordCommandTests(unittest.TestCase):
                 execute_keyword_command("/违禁词 删除 K9999", store, actor="42"),
             )
 
+    def test_qq_commands_expose_only_manual_rules_and_never_background_rules(
+        self,
+    ) -> None:
+        from plugins.content_alert.commands import execute_keyword_command
+        from plugins.content_alert.rules import KeywordRuleStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manual_path = root / "keywords.json"
+            background_path = root / "background_keywords.json"
+            background_store = KeywordRuleStore(background_path)
+            background_store.add("后台占位词一", actor="batch-import-20260902")
+            background_store.add("后台占位词二", actor="batch-import-20260902")
+            background = background_store.add(
+                "后台私密词", actor="batch-import-20260902"
+            )
+            background_store.add("后台重合词", actor="batch-import-20260902")
+
+            # QQ command handling receives the manual store only.  The private
+            # background store survives reload independently for matching and
+            # backend audit, without becoming a QQ-visible existence oracle.
+            reloaded_manual = KeywordRuleStore(manual_path)
+            reloaded_background = KeywordRuleStore(background_path)
+            self.assertIn(
+                background.pattern,
+                {rule.pattern for rule in reloaded_background.snapshot()},
+            )
+            self.assertEqual(
+                "违禁词列表为空。",
+                execute_keyword_command("/违禁词 列表", reloaded_manual, actor="42"),
+            )
+            self.assertIn(
+                "已添加违禁词",
+                execute_keyword_command(
+                    "/违禁词 添加 后台重合词", reloaded_manual, actor="42"
+                ),
+            )
+            manual = reloaded_manual.add("群内手动词", actor="42")
+
+            listing = execute_keyword_command(
+                "/违禁词 列表", reloaded_manual, actor="42"
+            )
+            self.assertIn(f"{manual.rule_id}：{manual.pattern}", listing)
+            self.assertNotIn(background.rule_id, listing)
+            self.assertNotIn(background.pattern, listing)
+
+            responses = (
+                execute_keyword_command("/违禁词", reloaded_manual, actor="42"),
+                execute_keyword_command("/违禁词 添加 a", reloaded_manual, actor="42"),
+                execute_keyword_command(
+                    f"/违禁词 删除 {background.rule_id}",
+                    reloaded_manual,
+                    actor="42",
+                ),
+            )
+            self.assertIn("删除失败", responses[-1])
+            for response in responses:
+                self.assertNotIn(background.rule_id, response)
+                self.assertNotIn(background.pattern, response)
+
 
 class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
     class Bot:
@@ -459,6 +527,68 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertIn(expected, report)
         self.assertRegex(report, r"告警编号：KA-[0-9a-f]{12}")
+
+    async def test_background_rule_still_alerts_without_disclosing_rule_metadata(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manual_path = root / "keywords.json"
+            background_path = root / "background_keywords.json"
+            manual_store = KeywordRuleStore(manual_path)
+            background_store = KeywordRuleStore(background_path)
+            manual = manual_store.add("群内手动词", actor="42")
+            background = background_store.add(
+                "后台私密词", actor="batch-import-20260902"
+            )
+            background_store.add("后台占位词", actor="batch-import-20260902")
+            self.assertEqual(manual.rule_id, background.rule_id)
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(manual_path),
+                background_rule_store=KeywordRuleStore(background_path),
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+                max_event_age_seconds=300,
+            )
+            bot = self.Bot()
+
+            background_delivered = await service.handle_event(
+                bot,
+                _group_event(
+                    "有人发送了后台 私密词",
+                    message_id=888,
+                    nickname="后台敏感昵称",
+                ),
+            )
+            mixed_delivered = await service.handle_event(
+                bot,
+                _group_event(
+                    "群内手动词，以及后台 私密词的完整原文",
+                    message_id=889,
+                    nickname="后台敏感昵称",
+                ),
+            )
+
+        self.assertTrue(background_delivered)
+        self.assertTrue(mixed_delivered)
+        self.assertEqual(2, len(bot.calls))
+        background_report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        mixed_report = str(Message(bot.calls[1]["message"])[0].data["text"])
+        for report in (background_report, mixed_report):
+            self.assertIn("内容已隐藏", report)
+            self.assertNotIn(background.pattern, report)
+            self.assertNotIn("后台 私密词", report)
+            self.assertNotIn("后台敏感昵称", report)
+        self.assertNotIn(background.rule_id, background_report)
+        self.assertIn("消息ID：888", background_report)
+        self.assertIn(f"{manual.rule_id}：{manual.pattern}", mixed_report)
+        self.assertNotIn("完整原文", mixed_report)
 
     async def test_scope_freshness_switch_and_non_text_boundaries_fail_closed(
         self,

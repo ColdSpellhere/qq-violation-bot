@@ -371,6 +371,9 @@ class AppConfig:
     content_alert_rules_path: Path = (
         DATA_DIR / "content_alert" / "keywords.json"
     )
+    content_alert_background_rules_path: Path = (
+        DATA_DIR / "content_alert" / "background_keywords.json"
+    )
     runtime_features_path: Path = DATA_DIR / "runtime_features.json"
     admin_seed: str = os.getenv("ADMIN_SEED", "")
 

@@ -91,6 +91,8 @@ def generic_findings(path: str, text: str) -> list[str]:
 def path_findings(path: str) -> list[str]:
     normalized = path.replace("\\", "/").lstrip("./")
     lower = normalized.lower()
+    if lower.startswith("data/content_alert/"):
+        return [f"{path}: content alert rule data"]
     if lower.endswith(_DATABASE_SUFFIXES) or any(
         marker in lower for marker in (".db-", ".sqlite-")
     ):

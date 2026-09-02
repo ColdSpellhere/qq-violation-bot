@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
 
 from .engine import KeywordMatch, LiteralKeywordMatcher, match_message_text_segments
-from .rules import KeywordRuleStore
+from .rules import KeywordRule, KeywordRuleStore
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _DELIVERED_CACHE_LIMIT = 4096
@@ -26,6 +26,7 @@ class ContentAlertService:
         self,
         *,
         rule_store: KeywordRuleStore,
+        background_rule_store: KeywordRuleStore | None = None,
         source_group_labels: Mapping[int, str],
         report_group_id: int,
         peer_bot_user_ids: Sequence[int | str],
@@ -35,6 +36,7 @@ class ContentAlertService:
         max_excerpt_chars: int = 160,
     ) -> None:
         self._rule_store = rule_store
+        self._background_rule_store = background_rule_store
         self._source_group_labels = {
             int(group_id): str(label)
             for group_id, label in source_group_labels.items()
@@ -55,14 +57,23 @@ class ContentAlertService:
         if not self._eligible(event):
             return False
 
-        rules = self._rule_store.snapshot()
-        if not rules:
-            return False
-        matches = match_message_text_segments(
-            event.message,
-            LiteralKeywordMatcher(rules),
+        manual_rules = self._rule_store.snapshot()
+        background_rules = (
+            self._background_rule_store.snapshot()
+            if self._background_rule_store is not None
+            else ()
         )
-        if not matches:
+        if not manual_rules and not background_rules:
+            return False
+        manual_matches = _match_rules(
+            event.message,
+            manual_rules,
+        )
+        background_matches = _match_rules(
+            event.message,
+            background_rules,
+        )
+        if not manual_matches and not background_matches:
             return False
 
         delivery_key = (
@@ -73,7 +84,11 @@ class ContentAlertService:
         async with self._delivery_lock:
             if delivery_key in self._delivered:
                 return False
-            report = self._build_report(event, matches)
+            report = self._build_report(
+                event,
+                manual_matches,
+                has_background_match=bool(background_matches),
+            )
             await bot.send_group_msg(
                 group_id=self._report_group_id,
                 message=MessageSegment.text(report),
@@ -102,30 +117,37 @@ class ContentAlertService:
         self,
         event: GroupMessageEvent,
         matches: Sequence[KeywordMatch],
+        *,
+        has_background_match: bool = False,
     ) -> str:
         group_id = int(event.group_id)
         sender = event.sender
-        sender_name = _one_line(
-            str(
-                getattr(sender, "card", "")
-                or getattr(sender, "nickname", "")
-                or event.user_id
-            ),
-            limit=64,
+        sender_name = (
+            "昵称已隐藏"
+            if has_background_match
+            else _one_line(
+                str(
+                    getattr(sender, "card", "")
+                    or getattr(sender, "nickname", "")
+                    or event.user_id
+                ),
+                limit=64,
+            )
         )
-        excerpt = _message_excerpt(event, limit=self._max_excerpt_chars)
+        excerpt = (
+            "（内容已隐藏）"
+            if has_background_match
+            else _message_excerpt(event, limit=self._max_excerpt_chars)
+        )
         event_time = datetime.fromtimestamp(int(event.time), tz=_SHANGHAI)
         alert_id = hashlib.sha256(
             f"{event.self_id}:{group_id}:{event.message_id}".encode()
         ).hexdigest()[:12]
 
-        displayed_matches = tuple(matches[:_MAX_REPORTED_MATCHES])
-        match_text = "、".join(
-            f"{item.rule_id}：{_one_line(item.pattern, limit=64)}"
-            for item in displayed_matches
+        match_text = _render_matches(
+            matches,
+            has_background_match=has_background_match,
         )
-        if len(matches) > len(displayed_matches):
-            match_text += f"，另有 {len(matches) - len(displayed_matches)} 项"
 
         label = _one_line(
             self._source_group_labels.get(group_id, f"群{group_id}"),
@@ -145,6 +167,35 @@ class ContentAlertService:
                 "处置状态：仅告警，未自动撤回、禁言或记录违规",
             )
         )
+
+
+def _match_rules(
+    message: object,
+    rules: Sequence[KeywordRule],
+) -> tuple[KeywordMatch, ...]:
+    if not rules:
+        return ()
+    return match_message_text_segments(
+        message,
+        LiteralKeywordMatcher(rules),
+    )
+
+
+def _render_matches(
+    matches: Sequence[KeywordMatch],
+    *,
+    has_background_match: bool,
+) -> str:
+    displayed_matches = tuple(matches[:_MAX_REPORTED_MATCHES])
+    parts = [
+        f"{item.rule_id}：{_one_line(item.pattern, limit=64)}"
+        for item in displayed_matches
+    ]
+    if len(matches) > len(displayed_matches):
+        parts.append(f"另有 {len(matches) - len(displayed_matches)} 项人工规则")
+    if has_background_match:
+        parts.append("受保护规则命中（详情已隐藏）")
+    return "、".join(parts)
 
 
 def _message_excerpt(event: GroupMessageEvent, *, limit: int) -> str:

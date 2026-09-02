@@ -31,6 +31,52 @@ class PublicScannerTests(unittest.TestCase):
         self.assertEqual([], path_findings("docs/architecture.md"))
         self.assertEqual([], path_findings("tests/test_image_contract.py"))
 
+    def test_force_tracked_content_alert_rule_files_are_rejected(self) -> None:
+        forbidden_paths = (
+            "data/content_alert/keywords.json",
+            "data/content_alert/background_keywords.json",
+            "data/content_alert/keywords.json.bak",
+            "data/content_alert/background_keywords.json.tmp",
+            "data/content_alert/keywords.json.20260902.bak",
+            "data/content_alert/.background_keywords.json.swp",
+        )
+        synthetic_rules = '{"version":1,"rules":[{"id":"synthetic-only"}]}'
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def git(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            git("init", "-q")
+            (root / ".gitignore").write_text(
+                "data/content_alert/\n*.bak\n*.tmp\n*.swp\n",
+                encoding="utf-8",
+            )
+            for relative_path in forbidden_paths:
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(synthetic_rules, encoding="utf-8")
+            git("add", ".gitignore")
+            git("add", "-f", *forbidden_paths)
+
+            with patch.object(scanner, "ROOT", root):
+                findings = scanner.scan_ref(None, {})
+
+        self.assertEqual(
+            [
+                f"{path}: content alert rule data"
+                for path in sorted(forbidden_paths)
+            ],
+            findings,
+        )
+
     def test_generic_token_and_private_key_are_detected(self) -> None:
         glm_key = ("a" * 32) + "." + ("B" * 16)
         tavily_key = "tvly-" + "dev-" + ("C" * 24)
