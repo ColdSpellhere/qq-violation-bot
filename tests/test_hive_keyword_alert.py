@@ -540,7 +540,12 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             return self._snapshot
 
         def match_message(self, _message: object) -> tuple[SimpleNamespace, ...]:
-            return self.matches
+            text = "".join(
+                str(segment.data.get("text", ""))
+                for segment in _message
+                if getattr(segment, "type", None) == "text"
+            )
+            return tuple(match for match in self.matches if match.term in text)
 
     def _service(self, directory: str, *, enabled: bool = True):
         from plugins.content_alert.rules import KeywordRuleStore
@@ -719,7 +724,7 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(excerpt_line.removeprefix("内容摘录：")), 49)
         self.assertLessEqual(len(report), 1_800)
 
-    async def test_political_or_mixed_catalog_hit_hides_the_complete_event(
+    async def test_political_or_mixed_catalog_hit_identifies_sender_but_hides_content(
         self,
     ) -> None:
         from plugins.content_alert.rules import KeywordRuleStore
@@ -738,7 +743,6 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             "political_cn",
             "synthetic-generation",
             "shards/political_cn-0001.json",
-            "合成敏感昵称",
             "完整原文尾部",
         )
         catalog = self.ManagedCatalog(
@@ -786,12 +790,65 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(message))
         self.assertEqual("text", message[0].type)
         report = str(message[0].data["text"])
+        self.assertIn("【蜂巢政治敏感告警】", report)
+        self.assertIn(
+            f"发送者：合成敏感昵称（QQ：{MEMBER_USER_ID}）",
+            report,
+        )
         self.assertIn("内容已隐藏", report)
-        self.assertIn("昵称已隐藏", report)
+        self.assertIn("政治敏感规则命中（词条与详情已隐藏）", report)
+        self.assertNotIn("昵称已隐藏", report)
         self.assertIn("消息ID：456", report)
         for token in internal_tokens:
             self.assertNotIn(token, report)
         self.assertLessEqual(len(report), 1_800)
+
+    async def test_political_alert_hides_protected_sender_name_but_keeps_qq(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        protected_term = "受保护占位词丁"
+        catalog = self.ManagedCatalog(
+            (
+                SimpleNamespace(
+                    term=protected_term,
+                    category_ids=("political_cn",),
+                    category_names=("受保护占位分类",),
+                    disclosure_policy="strict_hidden",
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+                max_event_age_seconds=300,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event(
+                    f"消息中含{protected_term}",
+                    nickname=f"成员-{protected_term}",
+                ),
+            )
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn("【蜂巢政治敏感告警】", report)
+        self.assertIn(
+            f"发送者：昵称含受保护内容，已隐藏（QQ：{MEMBER_USER_ID}）",
+            report,
+        )
+        self.assertNotIn(protected_term, report)
 
     async def test_active_managed_generation_disables_legacy_background_fallback(
         self,

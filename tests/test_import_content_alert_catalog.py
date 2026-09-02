@@ -73,6 +73,11 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
                             "aliases": [f"占位别名{index:02d}-{revision}"],
                             "status": "active",
                         }
+                        | (
+                            {"tags": ["human-reviewed-gender-antagonism"]}
+                            if category_id == "gender_conflict"
+                            else {}
+                        )
                     ],
                 }
             )
@@ -123,6 +128,26 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
             str(root or self.instance_root),
             "--rollback",
         )
+
+    def test_active_gender_conflict_entry_requires_human_review_tag(self) -> None:
+        document = self._build_document(revision="fixture-unreviewed-gender")
+        gender = next(
+            category
+            for category in document["categories"]
+            if category["id"] == "gender_conflict"
+        )
+        del gender["entries"][0]["tags"]
+        self.build_path.write_text(
+            json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.build_path.chmod(0o600)
+
+        code, output = self._apply()
+
+        self.assertNotEqual(0, code, output)
+        self.assertFalse(self._current_path(self.instance_root).exists())
+        self.assertNotIn(str(gender["entries"][0]["term"]), output)
 
     @staticmethod
     def _current_path(root: Path) -> Path:

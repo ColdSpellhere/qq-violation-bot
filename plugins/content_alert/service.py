@@ -28,6 +28,7 @@ class _ManagedSnapshot(Protocol):
 
 class _ManagedMatch(Protocol):
     term: str
+    category_ids: Sequence[str]
     category_names: Sequence[str]
     disclosure_policy: str
 
@@ -109,6 +110,9 @@ class ContentAlertService:
             match.disclosure_policy == "strict_hidden"
             for match in managed_matches
         )
+        political_alert = any(
+            "political_cn" in match.category_ids for match in managed_matches
+        )
 
         delivery_key = (
             int(event.self_id),
@@ -123,6 +127,7 @@ class ContentAlertService:
                 manual_matches,
                 managed_matches=managed_matches,
                 strict_hidden=strict_hidden,
+                political_alert=political_alert,
             )
             await bot.send_group_msg(
                 group_id=self._report_group_id,
@@ -155,21 +160,29 @@ class ContentAlertService:
         *,
         managed_matches: Sequence[_ManagedMatch] = (),
         strict_hidden: bool = False,
+        political_alert: bool = False,
     ) -> str:
         group_id = int(event.group_id)
         sender = event.sender
-        sender_name = (
-            "昵称已隐藏"
-            if strict_hidden
-            else _one_line(
-                str(
-                    getattr(sender, "card", "")
-                    or getattr(sender, "nickname", "")
-                    or event.user_id
-                ),
-                limit=64,
-            )
+        visible_sender_name = _one_line(
+            str(
+                getattr(sender, "card", "")
+                or getattr(sender, "nickname", "")
+                or event.user_id
+            ),
+            limit=64,
         )
+        hide_sender_name = strict_hidden and not political_alert
+        if political_alert:
+            hide_sender_name = self._sender_name_contains_strict_match(
+                visible_sender_name
+            )
+        if political_alert and hide_sender_name:
+            sender_name = "昵称含受保护内容，已隐藏"
+        elif hide_sender_name:
+            sender_name = "昵称已隐藏"
+        else:
+            sender_name = visible_sender_name
         excerpt = (
             "（内容已隐藏）"
             if strict_hidden
@@ -184,6 +197,7 @@ class ContentAlertService:
             matches,
             managed_matches=managed_matches,
             strict_hidden=strict_hidden,
+            political_alert=political_alert,
         )
 
         label = _one_line(
@@ -192,7 +206,11 @@ class ContentAlertService:
         )
         report = "\n".join(
             (
-                f"【{label}关键词违禁告警】",
+                (
+                    f"【{label}政治敏感告警】"
+                    if political_alert
+                    else f"【{label}关键词违禁告警】"
+                ),
                 f"告警编号：KA-{alert_id}",
                 f"来源群：{label}（{group_id}）",
                 f"发送者：{sender_name}（QQ：{event.user_id}）",
@@ -207,6 +225,21 @@ class ContentAlertService:
         if len(report) <= _MAX_REPORT_CHARS:
             return report
         return report[: _MAX_REPORT_CHARS - 1] + "…"
+
+    def _sender_name_contains_strict_match(self, sender_name: str) -> bool:
+        if self._managed_catalog is None:
+            return True
+        try:
+            matches = self._managed_catalog.match_message(
+                (MessageSegment.text(sender_name),)
+            )
+        except Exception:
+            # A political alert must never turn a catalog-read failure into a
+            # disclosure path.  The QQ number remains available for identity.
+            return True
+        return any(
+            match.disclosure_policy == "strict_hidden" for match in matches
+        )
 
 
 def _match_rules(
@@ -226,11 +259,14 @@ def _render_matches(
     *,
     managed_matches: Sequence[_ManagedMatch] = (),
     strict_hidden: bool,
+    political_alert: bool = False,
 ) -> str:
     if strict_hidden:
         # Constant wording prevents a protected hit from leaking a manual
         # overlap, category name, exact term, internal identifier, or hit
         # count through the same alert.
+        if political_alert:
+            return "政治敏感规则命中（词条与详情已隐藏）"
         return "受保护规则命中（详情已隐藏）"
 
     displayed_matches = tuple(matches[:_MAX_REPORTED_MATCHES])

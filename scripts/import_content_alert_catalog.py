@@ -71,6 +71,7 @@ KNOWN_CATEGORY_POLICIES = {
     "graphic_violence": "management_visible",
     "terrorism": "management_visible",
 }
+GENDER_ACTIVE_REVIEW_TAG = "human-reviewed-gender-antagonism"
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _CATEGORY_ID_RE = re.compile(r"[a-z][a-z0-9_]{1,63}\Z")
@@ -574,6 +575,15 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
                 raw_entry,
                 source_ids=source_ids,
             )
+            if (
+                category_id == "gender_conflict"
+                and status == "active"
+                and GENDER_ACTIVE_REVIEW_TAG
+                not in optional_metadata.get("tags", ())
+            ):
+                raise CatalogImportError(
+                    "active gender conflict entry is missing human review"
+                )
             default_source_ref = optional_metadata.get("source_refs", source_ids)[0]
             source_ref = raw_entry.get("source_ref", default_source_ref)
             source_ref = _validate_identifier(source_ref, label="entry source_ref")
