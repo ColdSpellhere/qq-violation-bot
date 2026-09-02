@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from nonebot.adapters.onebot.v11 import MessageSegment
 
-from .exporter import export_member_list
+from .exporter import export_member_list, normalize_group_label
 from .store import (
     DepartureEvent,
     MemberSnapshot,
@@ -43,19 +43,34 @@ class HiveMemberMonitorService:
         config: Any,
         store: MemberSnapshotStore,
         output_dir: Path,
+        monitor_group_id: int | None = None,
+        group_label: str | None = None,
         clock: Callable[[], datetime] | None = None,
         runtime_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.store = store
         self.output_dir = Path(output_dir)
+        configured_group_id = (
+            monitor_group_id
+            if monitor_group_id is not None
+            else getattr(config, "hive_member_monitor_group_id", 0)
+        )
+        self._monitor_group_id = int(configured_group_id)
+        if self._monitor_group_id <= 0:
+            raise ValueError("monitor_group_id must be a positive QQ group ID")
+        self._group_label = normalize_group_label(group_label or "蜂巢")
         self.clock = clock or datetime.now
         self.runtime_enabled = runtime_enabled
         self._sync_lock = asyncio.Lock()
 
     @property
     def monitor_group_id(self) -> int:
-        return int(self.config.hive_member_monitor_group_id)
+        return self._monitor_group_id
+
+    @property
+    def group_label(self) -> str:
+        return self._group_label
 
     @property
     def report_group_id(self) -> int:
@@ -207,6 +222,7 @@ class HiveMemberMonitorService:
         path = export_member_list(
             members,
             output_dir=self.output_dir,
+            group_label=self.group_label,
             now=self.clock(),
         )
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -422,8 +438,8 @@ class HiveMemberMonitorService:
         event_type = _SUB_TYPE_LABELS.get(departure.sub_type, departure.sub_type)
         return "\n".join(
             (
-                "【蜂巢群员退群日志】",
-                f"监控群：{departure.group_id}",
+                f"【{self.group_label}群员退群日志】",
+                f"监控群：{self.group_label}（{departure.group_id}）",
                 f"成员QQ：{departure.user_id}",
                 f"QQ名字：{departure.qq_name}",
                 f"退群类型：{event_type}",

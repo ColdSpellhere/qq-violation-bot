@@ -460,9 +460,11 @@ PRIVATE_MEMORY_MAX_MESSAGES=500
 PRIVATE_MEMORY_SHUTDOWN_TIMEOUT=10
 HIVE_MEMBER_MONITOR_ENABLED=false
 HIVE_MEMBER_MONITOR_GROUP_ID=123456780
+HIVE_MEMBER_MONITOR_GROUP_IDS=123456780,123456781
+HIVE_MEMBER_MONITOR_GROUP_LABELS_JSON={"123456780":"蜂巢","123456781":"蜂窝"}
 HIVE_MEMBER_REPORT_GROUP_ID=123456789
 HIVE_MEMBER_MONITOR_RECONCILE_SECONDS=300
-MONITOR_ONLY_GROUP_IDS=123456780
+MONITOR_ONLY_GROUP_IDS=123456780,123456781
 ```
 
 `BUSINESS_ENABLED` 控制当前 `TARGET_GROUP_ID` 的违规记录、查询、导出、减数策略和全部业务提醒，也覆盖旧版自动维护与周报生成、通知和群文件上传；关闭时数据库备份与证据存储清理仍可继续。`CHAT_ENABLED` 是聊天总开关；它关闭时，群聊和私聊子功能都不能处理消息。`GROUP_CHAT_ENABLED` 与 `GROUP_CHAT_ALLOWED_GROUP_IDS` 共同控制群聊回复、消息归档和成员记忆；`PRIVATE_CHAT_ENABLED` 与 `PRIVATE_CHAT_ALLOWED_USER_IDS` 共同控制私聊回复。两个白名单都使用英文逗号分隔的正整数 QQ号，群聊白名单填群号，私聊白名单填用户 QQ号。
@@ -520,11 +522,11 @@ MONITOR_ONLY_GROUP_IDS=123456780
 
 ### 独立群员监控
 
-`HIVE_MEMBER_MONITOR_ENABLED=true` 仅为完整配置过的实例注册群员监控；未配置的 Kona 等实例不会注册通知处理器、创建监控数据库或请求成员名单。`HIVE_MEMBER_MONITOR_GROUP_ID` 是监控群，`HIVE_MEMBER_REPORT_GROUP_ID` 是接收名单与退群日志的群，两者必须不同，监控群也不得与业务 `TARGET_GROUP_ID` 相同。真实群号只放在实例私有 `.env`，不得写入仓库。
+`HIVE_MEMBER_MONITOR_ENABLED=true` 仅为完整配置过的实例注册群员监控；未配置的 Kona 等实例不会注册通知处理器、创建监控数据库或请求成员名单。`HIVE_MEMBER_MONITOR_GROUP_IDS` 使用英文逗号配置多个监控群，并与兼容变量 `HIVE_MEMBER_MONITOR_GROUP_ID` 自动去重合并；`HIVE_MEMBER_MONITOR_GROUP_LABELS_JSON` 为各群提供导出与日志标题。`HIVE_MEMBER_REPORT_GROUP_ID` 是统一接收名单与退群日志的群。全部监控群都必须与日志群及业务 `TARGET_GROUP_ID` 不同。真实群号和群名映射只放在实例私有 `.env`，不得写入仓库。
 
 监控群是硬隔离的 monitor-only 作用域：即使误加进群聊白名单，也不会进入业务、聊天回复、消息归档、成员记忆、图片理解、功能控制命令或记忆治理链路。插件只调用 OneBot V11 的群信息、成员名单和成员变动接口，不调用 LLM，也不把聊天正文写入任何数据库。现有巡检群配置不会因为启用本插件而自动增加监控群。
 
-首次有效同步只有在 `get_group_member_list` 的去重成员数与 `get_group_info.member_count` 完全一致时才会建立快照，并上传 `蜂巢群员名单_YYYY-MM-DD_HH-mm-ss.xlsx`。文件只含 `QQ号`、`QQ名字` 两列；QQ号强制为文本，群名片或昵称按不可信数据转义，避免 Excel 公式注入。上传成功状态会绑定日志群号、文件名和 SHA-256；日志群配置改变后会向新目标重新交付。远端上传与本地确认无法形成分布式事务，因此极端的“上传成功后进程立即崩溃”窗口采用 at-least-once 语义，可能重复上传同一内容。
+每个监控群首次有效同步只有在 `get_group_member_list` 的去重成员数与 `get_group_info.member_count` 完全一致时才会建立独立快照，并分别上传 `<群标签>群员名单_YYYY-MM-DD_HH-mm-ss.xlsx`。文件只含 `QQ号`、`QQ名字` 两列；QQ号强制为文本，群名片或昵称按不可信数据转义，避免 Excel 公式注入。上传成功状态按群号隔离，并绑定日志群号、文件名和 SHA-256；日志群配置改变后会向新目标重新交付。远端上传与本地确认无法形成分布式事务，因此极端的“上传成功后进程立即崩溃”窗口采用 at-least-once 语义，可能重复上传同一内容。
 
 实时 `group_decrease` 会向日志群发送带稳定事件编号的结构化日志；成员离群状态与待发日志在同一 SQLite 事务提交，待发事件逐条使用 10 分钟租约原子领取，正常的重复通知、并发工作者和延迟到达的旧事件不会重复关闭已经重新入群的成员。日志外发同样存在“QQ 已接收但进程尚未落本地成功状态便崩溃”的 at-least-once 窗口；若发生极端重复，两条日志的稳定事件编号相同，可用于审计合并。周期复核只补偿离线期间漏掉的通知：完整名单连续两次缺少同一成员后才确认；单轮差异超过 2% 或 20 人时先熔断，只有同一份完整成员集合连续出现 3 次才会一次性确认并原子写入全部待发日志，避免真实多人退群永久卡住。每轮最多发送 20 条日志，防止刷屏。`/群员监控 关` 会阻止新同步和新外发；已经进入远端 API 的单次请求无法撤回。
 

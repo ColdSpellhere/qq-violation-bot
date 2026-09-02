@@ -65,6 +65,31 @@ def _id_tuple_env(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(sorted({int(item) for item in values}))
 
 
+def _group_labels_env(name: str) -> tuple[tuple[int, str], ...]:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return ()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{name} must be a JSON object") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{name} must be a JSON object")
+
+    labels: dict[int, str] = {}
+    for raw_group_id, raw_label in payload.items():
+        group_id_text = str(raw_group_id).strip()
+        label = str(raw_label).strip() if isinstance(raw_label, str) else ""
+        if not group_id_text.isdigit() or int(group_id_text) <= 0:
+            raise RuntimeError(f"{name} keys must be positive QQ group IDs")
+        if not label or len(label) > 20 or any(ord(character) < 32 for character in label):
+            raise RuntimeError(f"{name} labels must be 1-20 printable characters")
+        if label in labels.values():
+            raise RuntimeError(f"{name} labels must be unique per monitor group")
+        labels[int(group_id_text)] = label
+    return tuple(sorted(labels.items()))
+
+
 def _string_id_tuple_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     raw = str(os.getenv(name) or "").strip()
     if not raw:
@@ -317,6 +342,12 @@ class AppConfig:
     hive_member_monitor_group_id: int = max(
         0, _int_env("HIVE_MEMBER_MONITOR_GROUP_ID", 0)
     )
+    configured_hive_member_monitor_group_ids: tuple[int, ...] = _id_tuple_env(
+        "HIVE_MEMBER_MONITOR_GROUP_IDS", ()
+    )
+    configured_hive_member_monitor_group_labels: tuple[tuple[int, str], ...] = (
+        _group_labels_env("HIVE_MEMBER_MONITOR_GROUP_LABELS_JSON")
+    )
     hive_member_report_group_id: int = max(
         0, _int_env("HIVE_MEMBER_REPORT_GROUP_ID", 0)
     )
@@ -334,20 +365,35 @@ class AppConfig:
     admin_seed: str = os.getenv("ADMIN_SEED", "")
 
     @property
+    def hive_member_monitor_group_ids(self) -> tuple[int, ...]:
+        values = set(self.configured_hive_member_monitor_group_ids)
+        if self.hive_member_monitor_group_id > 0:
+            values.add(self.hive_member_monitor_group_id)
+        return tuple(sorted(values))
+
+    def hive_member_monitor_group_label(self, group_id: int) -> str:
+        normalized = int(group_id)
+        configured = dict(self.configured_hive_member_monitor_group_labels)
+        if normalized in configured:
+            return configured[normalized]
+        if normalized == self.hive_member_monitor_group_id:
+            return "蜂巢"
+        return f"群{normalized}"
+
+    @property
     def hive_member_monitor_capable(self) -> bool:
         return (
-            self.hive_member_monitor_group_id > 0
+            bool(self.hive_member_monitor_group_ids)
             and self.hive_member_report_group_id > 0
-            and self.hive_member_monitor_group_id
-            != self.hive_member_report_group_id
-            and self.hive_member_monitor_group_id != self.target_group_id
+            and self.hive_member_report_group_id
+            not in self.hive_member_monitor_group_ids
+            and self.target_group_id not in self.hive_member_monitor_group_ids
         )
 
     @property
     def monitor_only_group_ids(self) -> tuple[int, ...]:
         values = set(self.configured_monitor_only_group_ids)
-        if self.hive_member_monitor_group_id > 0:
-            values.add(self.hive_member_monitor_group_id)
+        values.update(self.hive_member_monitor_group_ids)
         return tuple(sorted(values))
 
     @property
@@ -371,6 +417,13 @@ if (
 ):
     raise RuntimeError(
         "HIVE_MEMBER_MONITOR_GROUP_ID must differ from TARGET_GROUP_ID"
+    )
+if (
+    CONFIG.hive_member_monitor_enabled
+    and CONFIG.target_group_id in CONFIG.hive_member_monitor_group_ids
+):
+    raise RuntimeError(
+        "HIVE_MEMBER_MONITOR_GROUP_IDS monitor groups must differ from TARGET_GROUP_ID"
     )
 if CONFIG.hive_member_monitor_enabled and not CONFIG.hive_member_monitor_capable:
     raise RuntimeError(

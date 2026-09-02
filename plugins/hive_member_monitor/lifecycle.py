@@ -14,13 +14,46 @@ from .service import HiveMemberMonitorService
 from .store import MemberSnapshotStore
 
 
-_service: HiveMemberMonitorService | None = None
+_services: dict[int, HiveMemberMonitorService] = {}
 _reconcile_task: asyncio.Task[None] | None = None
 _registered_drivers: weakref.WeakSet[object] = weakref.WeakSet()
 
 
-def get_service() -> HiveMemberMonitorService | None:
-    return _service
+def get_service(group_id: int | None = None) -> HiveMemberMonitorService | None:
+    if group_id is not None:
+        return _services.get(int(group_id))
+    if len(_services) == 1:
+        return next(iter(_services.values()))
+    return None
+
+
+def build_services(
+    *,
+    config: Any,
+    store: MemberSnapshotStore,
+    runtime_enabled: Any,
+) -> dict[int, HiveMemberMonitorService]:
+    group_ids = tuple(
+        int(value)
+        for value in getattr(config, "hive_member_monitor_group_ids", ())
+        if int(value) > 0
+    )
+    if not group_ids:
+        legacy_group_id = int(
+            getattr(config, "hive_member_monitor_group_id", 0)
+        )
+        group_ids = (legacy_group_id,) if legacy_group_id > 0 else ()
+    return {
+        group_id: HiveMemberMonitorService(
+            config=config,
+            store=store,
+            output_dir=config.hive_member_monitor_export_dir,
+            monitor_group_id=group_id,
+            group_label=config.hive_member_monitor_group_label(group_id),
+            runtime_enabled=runtime_enabled,
+        )
+        for group_id in dict.fromkeys(group_ids)
+    }
 
 
 def _runtime_enabled() -> bool:
@@ -31,9 +64,10 @@ def _runtime_enabled() -> bool:
     )
 
 
-async def _sync_safely(bot: Any) -> None:
-    service = _service
-    if service is None or not _runtime_enabled():
+async def _sync_service_safely(
+    bot: Any, service: HiveMemberMonitorService
+) -> None:
+    if not _runtime_enabled():
         return
     try:
         count = await service.sync_once(bot)
@@ -41,16 +75,25 @@ async def _sync_safely(bot: Any) -> None:
         raise
     except Exception as exc:
         logger.warning(
-            "蜂巢群员同步失败 group=%s error=%s",
-            CONFIG.hive_member_monitor_group_id,
+            "群员同步失败 group=%s label=%s error=%s",
+            service.monitor_group_id,
+            service.group_label,
             type(exc).__name__,
         )
         return
     logger.info(
-        "蜂巢群员同步完成 group=%s count=%s",
-        CONFIG.hive_member_monitor_group_id,
+        "群员同步完成 group=%s label=%s count=%s",
+        service.monitor_group_id,
+        service.group_label,
         count,
     )
+
+
+async def _sync_safely(bot: Any) -> None:
+    if not _runtime_enabled():
+        return
+    for service in tuple(_services.values()):
+        await _sync_service_safely(bot, service)
 
 
 def _connected_bot() -> Any | None:
@@ -84,15 +127,17 @@ def setup_lifecycle() -> None:
 
     @driver.on_startup
     async def _startup() -> None:
-        global _service, _reconcile_task
-        if _service is None:
-            _service = HiveMemberMonitorService(
-                config=CONFIG,
-                store=MemberSnapshotStore(
-                    CONFIG.hive_member_monitor_database_path
-                ),
-                output_dir=CONFIG.hive_member_monitor_export_dir,
-                runtime_enabled=_runtime_enabled,
+        global _reconcile_task
+        if not _services:
+            store = MemberSnapshotStore(
+                CONFIG.hive_member_monitor_database_path
+            )
+            _services.update(
+                build_services(
+                    config=CONFIG,
+                    store=store,
+                    runtime_enabled=_runtime_enabled,
+                )
             )
         if _reconcile_task is None or _reconcile_task.done():
             _reconcile_task = asyncio.create_task(
@@ -109,9 +154,11 @@ def setup_lifecycle() -> None:
         task = _reconcile_task
         _reconcile_task = None
         if task is None:
+            _services.clear()
             return
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+        _services.clear()

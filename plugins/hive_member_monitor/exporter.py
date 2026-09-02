@@ -13,6 +13,7 @@ from .store import MemberSnapshot, normalize_members
 
 
 _ILLEGAL_XML_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_UNSAFE_FILE_NAME_CHARACTERS = re.compile(r"[\\/:*?\"<>|\[\]]")
 _FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
@@ -27,10 +28,17 @@ def _safe_excel_text(value: object, *, fallback: str) -> str:
     return text
 
 
+def normalize_group_label(value: object) -> str:
+    label = _ILLEGAL_XML_CONTROL_CHARACTERS.sub("", str(value or "").strip())
+    label = _UNSAFE_FILE_NAME_CHARACTERS.sub("_", label).strip(" .")
+    return label[:20] or "群"
+
+
 def export_member_list(
     members: Iterable[MemberSnapshot],
     *,
     output_dir: Path,
+    group_label: str = "蜂巢",
     now: datetime | None = None,
 ) -> Path:
     """Write the requested two-column member workbook atomically."""
@@ -46,10 +54,14 @@ def export_member_list(
         os.chmod(output_dir, 0o700)
 
     timestamp = now or datetime.now()
-    destination = output_dir / f"蜂巢群员名单_{timestamp:%Y-%m-%d_%H-%M-%S}.xlsx"
+    safe_group_label = normalize_group_label(group_label)
+    workbook_title = f"{safe_group_label}群员名单"
+    destination = output_dir / (
+        f"{workbook_title}_{timestamp:%Y-%m-%d_%H-%M-%S}.xlsx"
+    )
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = "蜂巢群员名单"
+    sheet.title = workbook_title
     sheet.append(("QQ号", "QQ名字"))
     for row_number, member in enumerate(normalized, start=2):
         qq_cell = sheet.cell(row=row_number, column=1, value=str(member.user_id))

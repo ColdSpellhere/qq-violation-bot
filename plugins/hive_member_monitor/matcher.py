@@ -23,11 +23,15 @@ def _monitor_enabled() -> bool:
     )
 
 
+def _monitored_group(group_id: int) -> bool:
+    return int(group_id) in CONFIG.hive_member_monitor_group_ids
+
+
 def _target_group_decrease(event: Event) -> bool:
     return (
         _monitor_enabled()
         and isinstance(event, GroupDecreaseNoticeEvent)
-        and int(event.group_id) == CONFIG.hive_member_monitor_group_id
+        and _monitored_group(int(event.group_id))
     )
 
 
@@ -35,7 +39,7 @@ def _target_group_increase(event: Event) -> bool:
     return (
         _monitor_enabled()
         and isinstance(event, GroupIncreaseNoticeEvent)
-        and int(event.group_id) == CONFIG.hive_member_monitor_group_id
+        and _monitored_group(int(event.group_id))
         and int(event.user_id) != int(event.self_id)
     )
 
@@ -52,9 +56,12 @@ increase_matcher = on_notice(
 async def monitor_group_decrease(
     bot: Bot, event: GroupDecreaseNoticeEvent
 ) -> None:
-    service = get_service()
+    service = get_service(int(event.group_id))
     if service is None:
-        logger.warning("蜂巢群员监控尚未完成初始化，退群事件已跳过")
+        logger.warning(
+            "群员监控尚未完成初始化，退群事件已跳过 group=%s",
+            event.group_id,
+        )
         return
     try:
         await service.handle_group_decrease(
@@ -78,7 +85,7 @@ async def monitor_group_decrease(
 async def monitor_group_increase(
     bot: Bot, event: GroupIncreaseNoticeEvent
 ) -> None:
-    service = get_service()
+    service = get_service(int(event.group_id))
     if service is None:
         return
     try:
