@@ -6,6 +6,7 @@ import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
+from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
@@ -17,6 +18,24 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _DELIVERED_CACHE_LIMIT = 4096
 _FUTURE_EVENT_TOLERANCE_SECONDS = 60
 _MAX_REPORTED_MATCHES = 20
+_MAX_REPORTED_MANAGED_MATCHES = 12
+_MAX_REPORT_CHARS = 1_800
+
+
+class _ManagedSnapshot(Protocol):
+    has_active_generation: bool
+
+
+class _ManagedMatch(Protocol):
+    term: str
+    category_names: Sequence[str]
+    disclosure_policy: str
+
+
+class _ManagedCatalog(Protocol):
+    def snapshot(self) -> _ManagedSnapshot: ...
+
+    def match_message(self, message: object) -> Sequence[_ManagedMatch]: ...
 
 
 class ContentAlertService:
@@ -27,6 +46,7 @@ class ContentAlertService:
         *,
         rule_store: KeywordRuleStore,
         background_rule_store: KeywordRuleStore | None = None,
+        managed_catalog: _ManagedCatalog | None = None,
         source_group_labels: Mapping[int, str],
         report_group_id: int,
         peer_bot_user_ids: Sequence[int | str],
@@ -37,6 +57,7 @@ class ContentAlertService:
     ) -> None:
         self._rule_store = rule_store
         self._background_rule_store = background_rule_store
+        self._managed_catalog = managed_catalog
         self._source_group_labels = {
             int(group_id): str(label)
             for group_id, label in source_group_labels.items()
@@ -58,12 +79,20 @@ class ContentAlertService:
             return False
 
         manual_rules = self._rule_store.snapshot()
-        background_rules = (
-            self._background_rule_store.snapshot()
-            if self._background_rule_store is not None
-            else ()
-        )
-        if not manual_rules and not background_rules:
+        managed_active = False
+        managed_matches: Sequence[_ManagedMatch] = ()
+        if self._managed_catalog is not None:
+            managed_active = self._managed_catalog.snapshot().has_active_generation
+            if managed_active:
+                managed_matches = self._managed_catalog.match_message(event.message)
+
+        # The legacy file remains an intentionally strict fallback.  Once a
+        # complete managed generation is active it must not be evaluated as a
+        # second, unclassified rule source.
+        background_rules = ()
+        if not managed_active and self._background_rule_store is not None:
+            background_rules = self._background_rule_store.snapshot()
+        if not manual_rules and not background_rules and not managed_matches:
             return False
         manual_matches = _match_rules(
             event.message,
@@ -73,8 +102,13 @@ class ContentAlertService:
             event.message,
             background_rules,
         )
-        if not manual_matches and not background_matches:
+        if not manual_matches and not background_matches and not managed_matches:
             return False
+
+        strict_hidden = bool(background_matches) or any(
+            match.disclosure_policy == "strict_hidden"
+            for match in managed_matches
+        )
 
         delivery_key = (
             int(event.self_id),
@@ -87,7 +121,8 @@ class ContentAlertService:
             report = self._build_report(
                 event,
                 manual_matches,
-                has_background_match=bool(background_matches),
+                managed_matches=managed_matches,
+                strict_hidden=strict_hidden,
             )
             await bot.send_group_msg(
                 group_id=self._report_group_id,
@@ -118,13 +153,14 @@ class ContentAlertService:
         event: GroupMessageEvent,
         matches: Sequence[KeywordMatch],
         *,
-        has_background_match: bool = False,
+        managed_matches: Sequence[_ManagedMatch] = (),
+        strict_hidden: bool = False,
     ) -> str:
         group_id = int(event.group_id)
         sender = event.sender
         sender_name = (
             "昵称已隐藏"
-            if has_background_match
+            if strict_hidden
             else _one_line(
                 str(
                     getattr(sender, "card", "")
@@ -136,7 +172,7 @@ class ContentAlertService:
         )
         excerpt = (
             "（内容已隐藏）"
-            if has_background_match
+            if strict_hidden
             else _message_excerpt(event, limit=self._max_excerpt_chars)
         )
         event_time = datetime.fromtimestamp(int(event.time), tz=_SHANGHAI)
@@ -146,14 +182,15 @@ class ContentAlertService:
 
         match_text = _render_matches(
             matches,
-            has_background_match=has_background_match,
+            managed_matches=managed_matches,
+            strict_hidden=strict_hidden,
         )
 
         label = _one_line(
             self._source_group_labels.get(group_id, f"群{group_id}"),
             limit=64,
         )
-        return "\n".join(
+        report = "\n".join(
             (
                 f"【{label}关键词违禁告警】",
                 f"告警编号：KA-{alert_id}",
@@ -167,6 +204,9 @@ class ContentAlertService:
                 "处置状态：仅告警，未自动撤回、禁言或记录违规",
             )
         )
+        if len(report) <= _MAX_REPORT_CHARS:
+            return report
+        return report[: _MAX_REPORT_CHARS - 1] + "…"
 
 
 def _match_rules(
@@ -184,8 +224,15 @@ def _match_rules(
 def _render_matches(
     matches: Sequence[KeywordMatch],
     *,
-    has_background_match: bool,
+    managed_matches: Sequence[_ManagedMatch] = (),
+    strict_hidden: bool,
 ) -> str:
+    if strict_hidden:
+        # Constant wording prevents a protected hit from leaking a manual
+        # overlap, category name, exact term, internal identifier, or hit
+        # count through the same alert.
+        return "受保护规则命中（详情已隐藏）"
+
     displayed_matches = tuple(matches[:_MAX_REPORTED_MATCHES])
     parts = [
         f"{item.rule_id}：{_one_line(item.pattern, limit=64)}"
@@ -193,9 +240,28 @@ def _render_matches(
     ]
     if len(matches) > len(displayed_matches):
         parts.append(f"另有 {len(matches) - len(displayed_matches)} 项人工规则")
-    if has_background_match:
-        parts.append("受保护规则命中（详情已隐藏）")
-    return "、".join(parts)
+    seen_managed: set[tuple[str, tuple[str, ...]]] = set()
+    rendered_managed = 0
+    for item in managed_matches:
+        term = _one_line(str(item.term), limit=64)
+        category_names = tuple(
+            dict.fromkeys(
+                _one_line(str(name), limit=32)
+                for name in item.category_names
+                if _one_line(str(name), limit=32)
+            )
+        )
+        key = (term, category_names)
+        if not term or not category_names or key in seen_managed:
+            continue
+        seen_managed.add(key)
+        if rendered_managed >= _MAX_REPORTED_MANAGED_MATCHES:
+            continue
+        parts.append(f"{'/'.join(category_names)}：{term}")
+        rendered_managed += 1
+    if len(seen_managed) > rendered_managed:
+        parts.append(f"另有 {len(seen_managed) - rendered_managed} 项受控规则")
+    return "、".join(parts) or "规则命中"
 
 
 def _message_excerpt(event: GroupMessageEvent, *, limit: int) -> str:

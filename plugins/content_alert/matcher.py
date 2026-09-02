@@ -16,12 +16,14 @@ from plugins.feature_control.addressing import addressed_group_admin_message
 from plugins.feature_control.runtime import FEATURES
 from plugins.violation_record.config import CONFIG
 
+from .catalog import ManagedKeywordCatalog
 from .commands import execute_keyword_command, is_keyword_command
 from .rules import KeywordRuleStore
 from .service import ContentAlertService
 
 RULE_STORE = KeywordRuleStore(CONFIG.content_alert_rules_path)
 BACKGROUND_RULE_STORE = KeywordRuleStore(CONFIG.content_alert_background_rules_path)
+MANAGED_CATALOG = ManagedKeywordCatalog(CONFIG.content_alert_managed_catalog_path)
 
 
 def _runtime_enabled() -> bool:
@@ -35,6 +37,7 @@ def _runtime_enabled() -> bool:
 ALERT_SERVICE = ContentAlertService(
     rule_store=RULE_STORE,
     background_rule_store=BACKGROUND_RULE_STORE,
+    managed_catalog=MANAGED_CATALOG,
     source_group_labels={
         int(group_id): CONFIG.hive_member_monitor_group_label(int(group_id))
         for group_id in CONFIG.content_alert_source_group_ids
@@ -135,6 +138,7 @@ async def handle_content_alert(bot: Bot, event: GroupMessageEvent) -> None:
 __all__ = (
     "ALERT_SERVICE",
     "BACKGROUND_RULE_STORE",
+    "MANAGED_CATALOG",
     "RULE_STORE",
     "alert_matcher",
     "extract_keyword_command",
