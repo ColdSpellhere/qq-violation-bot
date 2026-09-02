@@ -11,6 +11,10 @@ from scripts.check_public_tree import generic_findings, runtime_findings
 
 
 class PublicScannerTests(unittest.TestCase):
+    def test_content_alert_private_group_keys_are_runtime_sensitive(self) -> None:
+        self.assertIn("CONTENT_ALERT_SOURCE_GROUP_IDS", scanner.SENSITIVE_KEYS)
+        self.assertIn("CONTENT_ALERT_REPORT_GROUP_ID", scanner.SENSITIVE_KEYS)
+
     def test_runtime_artifact_paths_are_rejected_in_current_and_history_scans(self) -> None:
         path_findings = getattr(scanner, "path_findings", lambda path: [])
         cases = {

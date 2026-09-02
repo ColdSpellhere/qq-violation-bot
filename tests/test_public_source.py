@@ -37,6 +37,8 @@ SENSITIVE_KEYS = (
     "HIVE_MEMBER_MONITOR_GROUP_LABELS_JSON",
     "HIVE_MEMBER_REPORT_GROUP_ID",
     "MONITOR_ONLY_GROUP_IDS",
+    "CONTENT_ALERT_SOURCE_GROUP_IDS",
+    "CONTENT_ALERT_REPORT_GROUP_ID",
 )
 CHAT_VISION_EXAMPLE_DEFAULTS = {
     "CHAT_VISION_ENABLED": "false",
@@ -123,6 +125,35 @@ class PublicSourceBoundaryTests(unittest.TestCase):
         self.assertEqual(CHAT_VISION_EXAMPLE_DEFAULTS, {
             key: values.get(key) for key in CHAT_VISION_EXAMPLE_DEFAULTS
         })
+
+    def test_content_alert_example_is_safe_and_has_no_rule_data(self) -> None:
+        values = dotenv_values(ROOT / ".env.example")
+        self.assertEqual("false", values.get("CONTENT_ALERT_ENABLED"))
+        self.assertEqual("", values.get("CONTENT_ALERT_SOURCE_GROUP_IDS"))
+        self.assertEqual("0", values.get("CONTENT_ALERT_REPORT_GROUP_ID"))
+        tracked = subprocess.run(
+            ["git", "ls-files", "data/content_alert", "data/content_alert/*"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual("", tracked)
+
+    def test_content_alert_has_no_llm_or_business_dependency(self) -> None:
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((ROOT / "plugins" / "content_alert").glob("*.py"))
+        )
+        self.assertTrue(source)
+        for forbidden in (
+            "llm_gateway",
+            "AI_API_KEY",
+            "generate_chat_reply",
+            "parse_business_intent",
+            "plugins.violation_record.service",
+        ):
+            self.assertNotIn(forbidden, source)
 
     def test_private_memory_migration_docs_load_instance_dotenv_without_shell(self) -> None:
         text = (ROOT / "README.md").read_text(encoding="utf-8")

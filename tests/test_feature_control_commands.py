@@ -152,6 +152,7 @@ class FeatureControlCommandTests(unittest.TestCase):
             "/穷鬼模式 开",
             "/提示构建 开",
             "/群员监控 关",
+            "/违禁词告警 开",
         ):
             self.assertTrue(is_control_command(text), text)
 
@@ -247,6 +248,26 @@ class FeatureControlCommandTests(unittest.TestCase):
         )
         self.assertTrue(capable.snapshot().hive_member_monitor_enabled)
         self.assertIn("群员监控：开", execute_control_command("/模块状态", capable, "1"))
+
+    def test_keyword_alert_switch_requires_instance_capability(self) -> None:
+        self.assertEqual(
+            "违禁词告警不可用：当前实例未配置监控群和管理群。",
+            execute_control_command("/违禁词告警 开", self.controller, "1"),
+        )
+        capable = FeatureController(
+            Path(self.temporary_directory.name) / "keyword-alert-features.json",
+            self.controller.snapshot(),
+            content_alert_capable=True,
+        )
+        self.assertEqual(
+            "违禁词告警已开启。",
+            execute_control_command("/违禁词告警 开", capable, "1"),
+        )
+        self.assertTrue(capable.snapshot().content_alert_enabled)
+        self.assertIn(
+            "违禁词告警：开",
+            execute_control_command("/模块状态", capable, "1"),
+        )
 
     def test_executes_all_allowlist_commands(self) -> None:
         self.assertEqual(

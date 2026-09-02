@@ -29,6 +29,8 @@ SENSITIVE_KEYS = (
     "HIVE_MEMBER_MONITOR_GROUP_LABELS_JSON",
     "HIVE_MEMBER_REPORT_GROUP_ID",
     "MONITOR_ONLY_GROUP_IDS",
+    "CONTENT_ALERT_SOURCE_GROUP_IDS",
+    "CONTENT_ALERT_REPORT_GROUP_ID",
 )
 TOKEN_RE = re.compile(r"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})")
 GLM_TOKEN_RE = re.compile(r"[A-Fa-f0-9]{32}\.[A-Za-z0-9_-]{16,}")

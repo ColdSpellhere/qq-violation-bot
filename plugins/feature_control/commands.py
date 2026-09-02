@@ -15,6 +15,7 @@ _SWITCH_COMMANDS = {
     "/提示构建": ("prompt_builder_enabled", "提示构建"),
     "/联网搜索": ("web_search_enabled", "联网搜索"),
     "/群员监控": ("hive_member_monitor_enabled", "群员监控"),
+    "/违禁词告警": ("content_alert_enabled", "违禁词告警"),
 }
 _MODEL_SWITCH_COMMANDS = frozenset({"/模型切换", "/聊天模型", "/穷鬼模式"})
 _GATEWAY_DOMAIN_COMMANDS = {
@@ -105,6 +106,12 @@ def _status(controller: FeatureController) -> str:
                 if controller.hive_member_monitor_capable
                 else "不可用（未配置）"
             ),
+            "违禁词告警："
+            + (
+                _switch_text(state.content_alert_enabled)
+                if controller.content_alert_capable
+                else "不可用（未配置）"
+            ),
         )
     )
 
@@ -161,6 +168,11 @@ def _set_switch(parts: list[str], controller: FeatureController, actor: str) -> 
         and not controller.hive_member_monitor_capable
     ):
         return "群员监控不可用：当前实例未配置监控群和日志群。"
+    if (
+        field_name == "content_alert_enabled"
+        and not controller.content_alert_capable
+    ):
+        return "违禁词告警不可用：当前实例未配置监控群和管理群。"
     controller.set_switch(field_name, enabled, actor)
     return f"{label}已{'开启' if enabled else '关闭'}。"
 

@@ -25,6 +25,7 @@ FEATURES = FeatureController(
         llm_gateway_chat_enabled=CONFIG.llm_gateway_chat_enabled,
         llm_gateway_business_enabled=CONFIG.llm_gateway_business_enabled,
         hive_member_monitor_enabled=CONFIG.hive_member_monitor_enabled,
+        content_alert_enabled=CONFIG.content_alert_enabled,
     ),
     business_capable=CONFIG.business_capable,
     economy_provider_available=CONFIG.economy_provider_available,
@@ -32,6 +33,10 @@ FEATURES = FeatureController(
     hive_member_monitor_capable=(
         CONFIG.hive_member_monitor_capable
         and CONFIG.hive_member_monitor_enabled
+    ),
+    content_alert_capable=(
+        CONFIG.content_alert_capable
+        and CONFIG.content_alert_enabled
     ),
     excluded_group_chat_ids=CONFIG.monitor_only_group_ids,
 )

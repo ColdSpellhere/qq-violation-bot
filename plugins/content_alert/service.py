@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import unicodedata
+from collections import OrderedDict
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
+
+from .engine import KeywordMatch, LiteralKeywordMatcher, match_message_text_segments
+from .rules import KeywordRuleStore
+
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_DELIVERED_CACHE_LIMIT = 4096
+_FUTURE_EVENT_TOLERANCE_SECONDS = 60
+_MAX_REPORTED_MATCHES = 20
+
+
+class ContentAlertService:
+    """Detect literal text rules and send one non-enforcement alert."""
+
+    def __init__(
+        self,
+        *,
+        rule_store: KeywordRuleStore,
+        source_group_labels: Mapping[int, str],
+        report_group_id: int,
+        peer_bot_user_ids: Sequence[int | str],
+        runtime_enabled: Callable[[], bool],
+        clock: Callable[[], float],
+        max_event_age_seconds: int = 300,
+        max_excerpt_chars: int = 160,
+    ) -> None:
+        self._rule_store = rule_store
+        self._source_group_labels = {
+            int(group_id): str(label)
+            for group_id, label in source_group_labels.items()
+            if int(group_id) > 0
+        }
+        self._report_group_id = int(report_group_id)
+        self._peer_bot_user_ids = {
+            str(user_id) for user_id in peer_bot_user_ids if str(user_id).isdigit()
+        }
+        self._runtime_enabled = runtime_enabled
+        self._clock = clock
+        self._max_event_age_seconds = max(1, int(max_event_age_seconds))
+        self._max_excerpt_chars = max(16, int(max_excerpt_chars))
+        self._delivery_lock = asyncio.Lock()
+        self._delivered: OrderedDict[tuple[int, int, str], None] = OrderedDict()
+
+    async def handle_event(self, bot: Bot, event: GroupMessageEvent) -> bool:
+        if not self._eligible(event):
+            return False
+
+        rules = self._rule_store.snapshot()
+        if not rules:
+            return False
+        matches = match_message_text_segments(
+            event.message,
+            LiteralKeywordMatcher(rules),
+        )
+        if not matches:
+            return False
+
+        delivery_key = (
+            int(event.self_id),
+            int(event.group_id),
+            str(event.message_id),
+        )
+        async with self._delivery_lock:
+            if delivery_key in self._delivered:
+                return False
+            report = self._build_report(event, matches)
+            await bot.send_group_msg(
+                group_id=self._report_group_id,
+                message=MessageSegment.text(report),
+            )
+            self._delivered[delivery_key] = None
+            self._delivered.move_to_end(delivery_key)
+            while len(self._delivered) > _DELIVERED_CACHE_LIMIT:
+                self._delivered.popitem(last=False)
+        return True
+
+    def _eligible(self, event: GroupMessageEvent) -> bool:
+        if not self._runtime_enabled():
+            return False
+        group_id = int(event.group_id)
+        if group_id not in self._source_group_labels:
+            return False
+        if self._report_group_id <= 0 or self._report_group_id == group_id:
+            return False
+        actor = str(event.user_id)
+        if actor == str(event.self_id) or actor in self._peer_bot_user_ids:
+            return False
+        age = float(self._clock()) - int(event.time)
+        return -_FUTURE_EVENT_TOLERANCE_SECONDS <= age <= self._max_event_age_seconds
+
+    def _build_report(
+        self,
+        event: GroupMessageEvent,
+        matches: Sequence[KeywordMatch],
+    ) -> str:
+        group_id = int(event.group_id)
+        sender = event.sender
+        sender_name = _one_line(
+            str(
+                getattr(sender, "card", "")
+                or getattr(sender, "nickname", "")
+                or event.user_id
+            ),
+            limit=64,
+        )
+        excerpt = _message_excerpt(event, limit=self._max_excerpt_chars)
+        event_time = datetime.fromtimestamp(int(event.time), tz=_SHANGHAI)
+        alert_id = hashlib.sha256(
+            f"{event.self_id}:{group_id}:{event.message_id}".encode()
+        ).hexdigest()[:12]
+
+        displayed_matches = tuple(matches[:_MAX_REPORTED_MATCHES])
+        match_text = "、".join(
+            f"{item.rule_id}：{_one_line(item.pattern, limit=64)}"
+            for item in displayed_matches
+        )
+        if len(matches) > len(displayed_matches):
+            match_text += f"，另有 {len(matches) - len(displayed_matches)} 项"
+
+        label = _one_line(
+            self._source_group_labels.get(group_id, f"群{group_id}"),
+            limit=64,
+        )
+        return "\n".join(
+            (
+                f"【{label}关键词违禁告警】",
+                f"告警编号：KA-{alert_id}",
+                f"来源群：{label}（{group_id}）",
+                f"发送者：{sender_name}（QQ：{event.user_id}）",
+                f"命中规则：{match_text}",
+                f"消息时间：{event_time:%Y-%m-%d %H:%M:%S}",
+                f"消息ID：{event.message_id}",
+                f"内容摘录：{excerpt}",
+                "检测器：keyword-literal-v1（未调用 AI）",
+                "处置状态：仅告警，未自动撤回、禁言或记录违规",
+            )
+        )
+
+
+def _message_excerpt(event: GroupMessageEvent, *, limit: int) -> str:
+    parts = [
+        str(segment.data.get("text", ""))
+        for segment in event.message
+        if segment.type == "text" and isinstance(segment.data.get("text"), str)
+    ]
+    excerpt = _one_line(" / ".join(parts), limit=limit)
+    return excerpt or "（无可展示文本）"
+
+
+def _one_line(value: str, *, limit: int) -> str:
+    cleaned: list[str] = []
+    pending_space = False
+    for character in unicodedata.normalize("NFKC", value):
+        category = unicodedata.category(character)
+        if category == "Cf":
+            continue
+        if character.isspace():
+            pending_space = bool(cleaned)
+            continue
+        if category.startswith("C"):
+            continue
+        if pending_space:
+            cleaned.append(" ")
+            pending_space = False
+        cleaned.append(character)
+        if len(cleaned) >= limit:
+            break
+    rendered = "".join(cleaned).strip()
+    if len(rendered) >= limit and len(value) > len(rendered):
+        return rendered[:-1] + "…"
+    return rendered
+
+
+__all__ = ("ContentAlertService",)

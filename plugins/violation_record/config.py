@@ -361,6 +361,16 @@ class AppConfig:
         DATA_DIR / "hive_member_monitor.sqlite3"
     )
     hive_member_monitor_export_dir: Path = EXPORT_DIR / "hive_member_monitor"
+    content_alert_enabled: bool = _bool_env("CONTENT_ALERT_ENABLED", False)
+    content_alert_source_group_ids: tuple[int, ...] = _id_tuple_env(
+        "CONTENT_ALERT_SOURCE_GROUP_IDS", ()
+    )
+    content_alert_report_group_id: int = max(
+        0, _int_env("CONTENT_ALERT_REPORT_GROUP_ID", 0)
+    )
+    content_alert_rules_path: Path = (
+        DATA_DIR / "content_alert" / "keywords.json"
+    )
     runtime_features_path: Path = DATA_DIR / "runtime_features.json"
     admin_seed: str = os.getenv("ADMIN_SEED", "")
 
@@ -397,6 +407,17 @@ class AppConfig:
         return tuple(sorted(values))
 
     @property
+    def content_alert_capable(self) -> bool:
+        source_groups = set(self.content_alert_source_group_ids)
+        return (
+            bool(source_groups)
+            and self.content_alert_report_group_id > 0
+            and self.content_alert_report_group_id not in source_groups
+            and self.target_group_id not in source_groups
+            and source_groups.issubset(self.monitor_only_group_ids)
+        )
+
+    @property
     def economy_provider_available(self) -> bool:
         return (
             type(self.glm_base_url) is str
@@ -428,6 +449,17 @@ if (
 if CONFIG.hive_member_monitor_enabled and not CONFIG.hive_member_monitor_capable:
     raise RuntimeError(
         "HIVE_MEMBER_MONITOR_ENABLED requires distinct positive monitor and report group IDs"
+    )
+if (
+    CONFIG.content_alert_enabled
+    and not set(CONFIG.content_alert_source_group_ids).issubset(
+        CONFIG.monitor_only_group_ids
+    )
+):
+    raise RuntimeError("keyword alert source groups must be monitor-only")
+if CONFIG.content_alert_enabled and not CONFIG.content_alert_capable:
+    raise RuntimeError(
+        "CONTENT_ALERT_ENABLED requires distinct positive source and report group IDs"
     )
 
 GROUP_AREAS = {"蜂巢", "蜂窝", "蜂箱"}

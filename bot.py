@@ -20,6 +20,7 @@ nonebot.load_plugin("plugins.memory_governance.matcher")
 nonebot.load_plugin(
     "plugins.hive_member_monitor.hive_member_monitor_runtime"
 )
+nonebot.load_plugin("plugins.content_alert.content_alert_runtime")
 nonebot.load_plugin("plugins.chat_archive")
 nonebot.load_plugin("plugins.member_memory.matcher")
 nonebot.load_plugin("plugins.random_chat")

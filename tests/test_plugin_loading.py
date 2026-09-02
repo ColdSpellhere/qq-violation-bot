@@ -12,6 +12,105 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PluginLoadingTests(unittest.TestCase):
+    def test_configured_content_alert_loads_before_chat_handlers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "BOT_INSTANCE_ROOT": directory,
+                    "TARGET_GROUP_ID": "123456789",
+                    "LOG_LEVEL": "WARNING",
+                    "CONTENT_ALERT_ENABLED": "true",
+                    "CONTENT_ALERT_SOURCE_GROUP_IDS": "123456780",
+                    "CONTENT_ALERT_REPORT_GROUP_ID": "123456781",
+                    "MONITOR_ONLY_GROUP_IDS": "123456780",
+                }
+            )
+            script = """
+import nonebot
+import bot
+from nonebot.matcher import matchers
+
+loaded_modules = {plugin.module_name for plugin in nonebot.get_loaded_plugins()}
+if "plugins.content_alert.content_alert_runtime" not in loaded_modules:
+    raise SystemExit(f"content alert runtime missing: {sorted(loaded_modules)}")
+registered = {
+    matcher.module.__name__
+    for priority_matchers in matchers.values()
+    for matcher in priority_matchers
+}
+if "plugins.content_alert.matcher" not in registered:
+    raise SystemExit(f"content alert matcher missing: {sorted(registered)}")
+source = open("bot.py", encoding="utf-8").read()
+if source.index('"plugins.content_alert.content_alert_runtime"') >= source.index('nonebot.load_plugin("plugins.chat_archive")'):
+    raise SystemExit("content alert must register before chat handlers")
+"""
+            completed = subprocess.run(
+                [sys.executable, "-B", "-c", script],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                completed.returncode,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_unconfigured_instance_registers_no_content_alert_matcher_or_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "BOT_INSTANCE_ROOT": directory,
+                    "BOT_MODE": "chat_only",
+                    "TARGET_GROUP_ID": "123456789",
+                    "LOG_LEVEL": "WARNING",
+                    "CONTENT_ALERT_ENABLED": "false",
+                }
+            )
+            for key in (
+                "CONTENT_ALERT_SOURCE_GROUP_IDS",
+                "CONTENT_ALERT_REPORT_GROUP_ID",
+            ):
+                env.pop(key, None)
+            script = """
+import sys
+from pathlib import Path
+import nonebot
+import bot
+from nonebot.matcher import matchers
+
+registered = {
+    matcher.module.__name__
+    for priority_matchers in matchers.values()
+    for matcher in priority_matchers
+}
+if "plugins.content_alert.matcher" in registered:
+    raise SystemExit("unconfigured instance registered content alert matcher")
+if "plugins.content_alert.matcher" in sys.modules:
+    raise SystemExit("unconfigured instance imported content alert matcher")
+if (Path(__import__('os').environ['BOT_INSTANCE_ROOT']) / 'data' / 'content_alert').exists():
+    raise SystemExit("unconfigured instance created content alert data")
+"""
+            completed = subprocess.run(
+                [sys.executable, "-B", "-c", script],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                completed.returncode,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
     def test_configured_hive_monitor_loads_notice_plugin_before_chat_handlers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env = os.environ.copy()

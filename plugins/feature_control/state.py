@@ -26,6 +26,7 @@ SWITCH_NAMES = {
     "llm_gateway_business_enabled",
     "economy_mode_enabled",
     "hive_member_monitor_enabled",
+    "content_alert_enabled",
 }
 ALLOWLIST_KINDS = {"group_chat", "private_chat"}
 GATEWAY_DOMAIN_SWITCHES = {
@@ -58,6 +59,7 @@ class FeatureState:
     web_search_enabled: bool = False
     economy_mode_enabled: bool = False
     hive_member_monitor_enabled: bool = False
+    content_alert_enabled: bool = False
     updated_at: str = ""
     updated_by: str = ""
 
@@ -72,6 +74,7 @@ class FeatureController:
         economy_provider_available: bool = True,
         primary_provider_available: bool = True,
         hive_member_monitor_capable: bool = False,
+        content_alert_capable: bool = False,
         excluded_group_chat_ids: tuple[int, ...] = (),
     ):
         self._path = Path(path)
@@ -80,6 +83,7 @@ class FeatureController:
         self._economy_provider_available = bool(economy_provider_available)
         self._primary_provider_available = bool(primary_provider_available)
         self._hive_member_monitor_capable = bool(hive_member_monitor_capable)
+        self._content_alert_capable = bool(content_alert_capable)
         self._excluded_group_chat_ids = frozenset(
             normalized
             for value in excluded_group_chat_ids
@@ -96,6 +100,8 @@ class FeatureController:
             )
         if not self._hive_member_monitor_capable:
             unavailable_changes["hive_member_monitor_enabled"] = False
+        if not self._content_alert_capable:
+            unavailable_changes["content_alert_enabled"] = False
         self._state = replace(loaded, **unavailable_changes) if unavailable_changes else loaded
 
     @property
@@ -113,6 +119,10 @@ class FeatureController:
     @property
     def hive_member_monitor_capable(self) -> bool:
         return self._hive_member_monitor_capable
+
+    @property
+    def content_alert_capable(self) -> bool:
+        return self._content_alert_capable
 
     @property
     def _backup_path(self) -> Path:
@@ -179,6 +189,12 @@ class FeatureController:
             and not self._hive_member_monitor_capable
         ):
             raise ValueError("hive member monitor capability is unavailable")
+        if (
+            name == "content_alert_enabled"
+            and enabled
+            and not self._content_alert_capable
+        ):
+            raise ValueError("content alert capability is unavailable")
 
     def add_allowed(self, kind: str, value: str, actor: str) -> FeatureState:
         normalized = self._validate_allowed_value(kind, value)
@@ -355,6 +371,12 @@ class FeatureController:
                     raw.get(
                         "hive_member_monitor_enabled",
                         defaults.hive_member_monitor_enabled if defaults else False,
+                    )
+                ),
+                content_alert_enabled=cls._strict_bool(
+                    raw.get(
+                        "content_alert_enabled",
+                        defaults.content_alert_enabled if defaults else False,
                     )
                 ),
                 group_chat_allowed_group_ids=cls._load_allowlist(
