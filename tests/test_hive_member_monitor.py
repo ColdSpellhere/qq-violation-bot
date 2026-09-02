@@ -8,6 +8,7 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
 
@@ -22,6 +23,7 @@ USER_A = 900_000_000_000_200_001
 USER_B = 900_000_000_000_200_002
 USER_C = 900_000_000_000_200_003
 FIXED_TIME = datetime(2026, 8, 30, 14, 5, 6)
+DISPLAY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def _member(
@@ -798,7 +800,15 @@ class DepartureMonitoringTests(unittest.IsolatedAsyncioTestCase):
                 now=rejoined_at,
             )
             delayed_old_event_time = int(
-                datetime(2026, 8, 30, 14, 10, 0).timestamp()
+                datetime(
+                    2026,
+                    8,
+                    30,
+                    14,
+                    10,
+                    0,
+                    tzinfo=DISPLAY_TIMEZONE,
+                ).timestamp()
             )
 
             changed = await service.handle_group_decrease(
@@ -849,7 +859,15 @@ class DepartureMonitoringTests(unittest.IsolatedAsyncioTestCase):
 
             await service.sync_once(bot)
             event_time = int(
-                datetime(2026, 8, 30, 14, 6, 0).timestamp()
+                datetime(
+                    2026,
+                    8,
+                    30,
+                    14,
+                    6,
+                    0,
+                    tzinfo=DISPLAY_TIMEZONE,
+                ).timestamp()
             )
             changed = await service.handle_group_decrease(
                 bot,
