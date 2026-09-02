@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 import unicodedata
 from dataclasses import dataclass
@@ -112,6 +113,9 @@ class KeywordRuleStore:
 
     def __init__(self, path: Path):
         self._path = Path(path)
+        self._trusted_root = self._default_trusted_root(
+            Path(os.path.abspath(self._path))
+        )
         self._lock = RLock()
         self._document = _RuleDocument(
             revision=0,
@@ -349,27 +353,32 @@ class KeywordRuleStore:
             raise
 
     def _assert_safe_path(self, candidate: Path | None = None) -> None:
-        path = self._path if candidate is None else Path(candidate)
-        if path.is_symlink():
-            raise OSError(f"symbolic link target is not allowed: {path}")
+        path = Path(os.path.abspath(self._path if candidate is None else candidate))
+        try:
+            relative = path.relative_to(self._trusted_root)
+        except ValueError as exc:
+            raise OSError(f"path is outside the trusted instance root: {path}") from exc
 
-        # Walk through not-yet-created directories only.  Stop at the nearest
-        # existing real directory so platform aliases such as macOS /var do not
-        # make otherwise private application paths unusable.
-        parent = path.parent
-        while not parent.exists():
-            if parent.is_symlink():
-                raise OSError(f"symbolic link parent is not allowed: {parent}")
-            next_parent = parent.parent
-            if next_parent == parent:
-                break
-            parent = next_parent
-        if parent.is_symlink():
-            raise OSError(f"symbolic link parent is not allowed: {parent}")
+        current = self._trusted_root
+        components = [current]
+        for part in relative.parts:
+            current /= part
+            components.append(current)
+        for component in components:
+            try:
+                mode = os.lstat(component).st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(mode):
+                raise OSError(
+                    f"symbolic link path component is not allowed: {component}"
+                )
 
-        direct_parent = path.parent
-        if direct_parent.exists() and direct_parent.is_symlink():
-            raise OSError(f"symbolic link parent is not allowed: {direct_parent}")
+    @staticmethod
+    def _default_trusted_root(path: Path) -> Path:
+        if path.parent.name == "content_alert" and path.parent.parent.name == "data":
+            return path.parent.parent.parent
+        return path.parent
 
     @staticmethod
     def _fsync_directory(directory: Path) -> None:

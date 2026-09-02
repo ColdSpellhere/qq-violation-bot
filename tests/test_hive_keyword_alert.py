@@ -332,6 +332,26 @@ class KeywordRuleStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "symbolic link"):
                 store.add("测试词", actor="1")
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink is unavailable")
+    def test_symbolic_link_in_data_ancestor_is_rejected(self) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            instance_root = root / "instance"
+            instance_root.mkdir()
+            real_data = root / "real-data"
+            (real_data / "content_alert").mkdir(parents=True)
+            os.symlink(real_data, instance_root / "data")
+            escaped_path = real_data / "content_alert" / "keywords.json"
+            store = KeywordRuleStore(
+                instance_root / "data" / "content_alert" / "keywords.json"
+            )
+
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                store.add("测试词", actor="1")
+            self.assertFalse(escaped_path.exists())
+
 
 class KeywordCommandTests(unittest.TestCase):
     def test_superuser_command_service_adds_lists_and_deletes_by_rule_id(self) -> None:
