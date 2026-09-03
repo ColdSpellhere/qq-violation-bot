@@ -137,7 +137,7 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
                 "aliases": [],
                 "status": "active",
                 "subject_type": "leader_name",
-                "match_mode": "same_segment_context",
+                "match_mode": "direct",
                 "entity_ref": "leader.synthetic-a",
                 "rank_level": "省部级正职",
                 "rank_basis": "合成测试任职依据",
@@ -162,43 +162,6 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
                 "tags": [
                     "human-reviewed-political-scope",
                     "subject:historical_event",
-                ],
-                "source_refs": [source_ref],
-                "last_reviewed": "2026-09-03",
-            },
-            {
-                "id": "P2003",
-                "term": "合成案件语境",
-                "aliases": [],
-                "status": "active",
-                "subject_type": "political_context",
-                "match_mode": "support_only",
-                "context_class": "case_proceeding",
-                "strength": "strong",
-                "verification_status": "operator_curated",
-                "confidence": 0.95,
-                "tags": [
-                    "human-reviewed-political-scope",
-                    "subject:political_context",
-                ],
-                "source_refs": [source_ref],
-                "last_reviewed": "2026-09-03",
-            },
-            {
-                "id": "P2004",
-                "term": "合成专属职务",
-                "aliases": [],
-                "status": "active",
-                "subject_type": "political_context",
-                "match_mode": "support_only",
-                "context_class": "office_title",
-                "strength": "weak",
-                "entity_refs": ["leader.synthetic-a"],
-                "verification_status": "operator_curated",
-                "confidence": 0.8,
-                "tags": [
-                    "human-reviewed-political-scope",
-                    "subject:political_context",
                 ],
                 "source_refs": [source_ref],
                 "last_reviewed": "2026-09-03",
@@ -453,27 +416,25 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
         entries = {entry["id"]: entry for entry in shard["entries"]}
         self.assertEqual("leader_name", entries["P2001"]["subject_type"])
         self.assertEqual(
-            "same_segment_context",
+            "direct",
             entries["P2001"]["match_mode"],
         )
         self.assertEqual("leader.synthetic-a", entries["P2001"]["entity_ref"])
         self.assertEqual("省部级正职", entries["P2001"]["rank_level"])
         self.assertEqual("合成测试任职依据", entries["P2001"]["rank_basis"])
         self.assertEqual("direct", entries["P2002"]["match_mode"])
-        self.assertEqual("support_only", entries["P2003"]["match_mode"])
-        self.assertEqual("case_proceeding", entries["P2003"]["context_class"])
-        self.assertEqual("strong", entries["P2003"]["strength"])
-        self.assertEqual(
-            ["leader.synthetic-a"],
-            entries["P2004"]["entity_refs"],
-        )
+        self.assertEqual({"P2001", "P2002"}, set(entries))
 
-    def test_v2_leader_requires_context_mode_canonical_name_and_rank_metadata(
+    def test_v2_leader_requires_direct_mode_canonical_name_and_rank_metadata(
         self,
     ) -> None:
         variants: dict[str, tuple[str, object, str]] = {
             "missing-subject-type": ("subject_type", None, "subject type"),
-            "wrong-match-mode": ("match_mode", "direct", "match mode"),
+            "wrong-match-mode": (
+                "match_mode",
+                "same_segment_context",
+                "match mode",
+            ),
             "noncanonical-name": ("term", "合成 领导甲", "canonical name"),
             "missing-entity-ref": ("entity_ref", None, "entity_ref"),
             "invalid-rank-level": ("rank_level", "厅局级正职", "rank_level"),
@@ -531,6 +492,46 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
 
                 self.importer._validate_build(document)
 
+    def test_v2_direct_leader_without_context_is_a_live_catalog(self) -> None:
+        document = self._build_v2_document(revision="fixture-direct-leader")
+        political = next(
+            category
+            for category in document["categories"]
+            if category["id"] == "political_cn"
+        )
+        political["entries"][0]["match_mode"] = "direct"
+        political["entries"] = [
+            entry
+            for entry in political["entries"]
+            if entry["subject_type"] != "political_context"
+        ]
+
+        document_version, generated_at, categories = self.importer._validate_build(
+            document
+        )
+        prepared = self.importer._prepare_generation(
+            document_version,
+            generated_at,
+            categories,
+        )
+
+        political_manifest = next(
+            category
+            for category in json.loads(prepared.files[Path("manifest.json")])[
+                "categories"
+            ]
+            if category["id"] == "political_cn"
+        )
+        shard = json.loads(
+            prepared.files[Path(political_manifest["shards"][0]["path"])]
+        )
+        leader = next(
+            entry
+            for entry in shard["entries"]
+            if entry["subject_type"] == "leader_name"
+        )
+        self.assertEqual("direct", leader["match_mode"])
+
     def test_v2_historical_event_requires_direct_match_mode(self) -> None:
         document = self._build_v2_document(revision="fixture-event-mode")
         political = next(
@@ -547,63 +548,39 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
         self.assertIn("match mode", str(captured.exception))
         self.assertNotIn(event["term"], str(captured.exception))
 
-    def test_v2_political_context_is_support_only_and_has_typed_strength(self) -> None:
-        variants: dict[str, tuple[str, object, str]] = {
-            "wrong-match-mode": ("match_mode", "direct", "match mode"),
-            "missing-context-class": ("context_class", None, "context_class"),
-            "invalid-context-class": ("context_class", "generic", "context_class"),
-            "missing-strength": ("strength", None, "strength"),
-            "invalid-strength": ("strength", "critical", "strength"),
+    def test_v2_new_build_rejects_support_only_context_entries(self) -> None:
+        document = self._build_v2_document(revision="fixture-no-support-only")
+        political = next(
+            category
+            for category in document["categories"]
+            if category["id"] == "political_cn"
+        )
+        source_ref = political["sources"][0]["source_id"]
+        context = {
+            "id": "P2003",
+            "term": "合成辅助语境",
+            "aliases": [],
+            "status": "active",
+            "subject_type": "political_context",
+            "match_mode": "support_only",
+            "context_class": "case_proceeding",
+            "strength": "strong",
+            "verification_status": "operator_curated",
+            "confidence": 0.95,
+            "tags": [
+                "human-reviewed-political-scope",
+                "subject:political_context",
+            ],
+            "source_refs": [source_ref],
+            "last_reviewed": "2026-09-03",
         }
+        political["entries"].append(context)
 
-        for variant, (field, replacement, expected_error) in variants.items():
-            with self.subTest(variant=variant):
-                document = self._build_v2_document(
-                    revision=f"fixture-context-{variant}"
-                )
-                political = next(
-                    category
-                    for category in document["categories"]
-                    if category["id"] == "political_cn"
-                )
-                context = political["entries"][2]
-                if replacement is None:
-                    context.pop(field)
-                else:
-                    context[field] = replacement
+        with self.assertRaises(self.importer.CatalogImportError) as captured:
+            self.importer._validate_build(document)
 
-                with self.assertRaises(self.importer.CatalogImportError) as captured:
-                    self.importer._validate_build(document)
-
-                self.assertIn(expected_error, str(captured.exception))
-                self.assertNotIn(context["term"], str(captured.exception))
-
-    def test_v2_context_entity_refs_are_unique_known_leader_entities(self) -> None:
-        variants: dict[str, object] = {
-            "empty": [],
-            "duplicate": ["leader.synthetic-a", "leader.synthetic-a"],
-            "unknown": ["leader.synthetic-unknown"],
-            "invalid": ["bad ref"],
-        }
-
-        for variant, entity_refs in variants.items():
-            with self.subTest(variant=variant):
-                document = self._build_v2_document(
-                    revision=f"fixture-entity-refs-{variant}"
-                )
-                political = next(
-                    category
-                    for category in document["categories"]
-                    if category["id"] == "political_cn"
-                )
-                context = political["entries"][3]
-                context["entity_refs"] = entity_refs
-
-                with self.assertRaises(self.importer.CatalogImportError) as captured:
-                    self.importer._validate_build(document)
-
-                self.assertIn("entity_refs", str(captured.exception))
-                self.assertNotIn(context["term"], str(captured.exception))
+        self.assertIn("support-only", str(captured.exception))
+        self.assertNotIn(context["term"], str(captured.exception))
 
     def test_same_name_leaders_must_be_preclustered_as_one_match_subject(
         self,
@@ -721,7 +698,7 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
         cold_catalog = ManagedKeywordCatalog(self._current_path(self.instance_root))
         snapshot = cold_catalog.snapshot()
         self.assertTrue(snapshot.has_active_generation)
-        self.assertEqual(4, len(snapshot.entries))
+        self.assertEqual(2, len(snapshot.entries))
         self.assertIsNone(cold_catalog.last_error)
 
     def test_v2_operator_curated_entry_rejects_source_screened_only_tag(self) -> None:
@@ -794,8 +771,8 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
     def test_active_v2_political_terms_must_be_canonical_visible_text(self) -> None:
         variants = {
             "zero-width": (1, "合成\u200b历史事件"),
-            "variation-selector": (2, "合成\ufe0f案件语境"),
-            "whitespace": (2, "合成 案件语境"),
+            "variation-selector": (0, "合成\ufe0f领导姓名"),
+            "whitespace": (0, "合成 领导姓名"),
             "non-nfkc": (1, "合成历史事件Ａ"),
         }
 
@@ -820,7 +797,7 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
     def test_active_v2_political_terms_reject_edge_whitespace_without_trimming(
         self,
     ) -> None:
-        for entry_index in range(3):
+        for entry_index in range(2):
             for edge in ("leading", "trailing"):
                 with self.subTest(entry_index=entry_index, edge=edge):
                     document = self._build_v2_document(
@@ -846,28 +823,6 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
                     self.assertNotIn(str(original), str(captured.exception))
 
     def test_v2_political_generation_requires_live_alerting_semantics(self) -> None:
-        def leave_support_only(political: dict[str, object]) -> None:
-            political["entries"] = [
-                entry
-                for entry in political["entries"]
-                if entry["subject_type"] == "political_context"
-            ]
-            for entry in political["entries"]:
-                entry.pop("entity_refs", None)
-
-        def leave_leader_without_strong_context(
-            political: dict[str, object],
-        ) -> None:
-            political["entries"] = [
-                entry
-                for entry in political["entries"]
-                if entry["subject_type"] == "leader_name"
-                or (
-                    entry["subject_type"] == "political_context"
-                    and entry["strength"] != "strong"
-                )
-            ]
-
         variants = {
             "political-disabled": (
                 lambda political: political.update({"enabled": False}),
@@ -879,11 +834,6 @@ class ContentAlertCatalogImporterTests(unittest.TestCase):
                     for entry in political["entries"]
                 ],
                 "enabled v2 category",
-            ),
-            "support-only": (leave_support_only, "alerting semantics"),
-            "leader-without-strong-context": (
-                leave_leader_without_strong_context,
-                "alerting semantics",
             ),
         }
 

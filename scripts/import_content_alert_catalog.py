@@ -114,25 +114,13 @@ POLITICAL_SUBJECT_TAGS = frozenset(
     {
         "subject:leader_name",
         "subject:historical_event",
-        "subject:political_context",
     }
 )
-POLITICAL_SUBJECT_TYPES = frozenset(
-    {"leader_name", "historical_event", "political_context"}
-)
-POLITICAL_MATCH_MODES = frozenset({"direct", "same_segment_context", "support_only"})
+POLITICAL_SUBJECT_TYPES = frozenset({"leader_name", "historical_event"})
+POLITICAL_MATCH_MODES = frozenset({"direct"})
 POLITICAL_RANK_LEVELS = frozenset(
     {"国家级正职", "国家级副职", "省部级正职", "省部级副职"}
 )
-POLITICAL_CONTEXT_CLASSES = frozenset(
-    {
-        "office_title",
-        "case_proceeding",
-        "political_institution",
-        "historical_reference",
-    }
-)
-POLITICAL_CONTEXT_STRENGTHS = frozenset({"strong", "weak"})
 POLITICAL_VERIFICATION_STATUSES = frozenset(
     {"official_verified", "research_candidate", "operator_curated"}
 )
@@ -540,7 +528,7 @@ def _validate_v2_political_entry(
     status: str,
     optional_metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    """Validate and retain the v2 political matching contract.
+    """Validate and retain the current political matching contract.
 
     Inactive, untyped entries are accepted solely for v1 legacy-background
     migration.  They never enter the runtime matcher.  Every active v2
@@ -553,6 +541,10 @@ def _validate_v2_political_entry(
     if status != "active" and not has_v2_contract:
         return {}
 
+    if raw_subject_type == "political_context" or raw_match_mode == "support_only":
+        raise CatalogImportError(
+            "v2 new builds do not accept support-only context entries"
+        )
     if raw_subject_type not in POLITICAL_SUBJECT_TYPES:
         raise CatalogImportError("v2 political subject type is invalid")
     if raw_match_mode not in POLITICAL_MATCH_MODES:
@@ -579,7 +571,7 @@ def _validate_v2_political_entry(
         "match_mode": raw_match_mode,
     }
     if raw_subject_type == "leader_name":
-        if raw_match_mode != "same_segment_context":
+        if raw_match_mode != "direct":
             raise CatalogImportError("v2 leader match mode is invalid")
         if not _is_canonical_person_name(term):
             raise CatalogImportError("v2 leader canonical name is invalid")
@@ -611,36 +603,8 @@ def _validate_v2_political_entry(
             "strength",
             "entity_refs",
         }
-    else:
-        if raw_match_mode != "support_only":
-            raise CatalogImportError("v2 political context match mode is invalid")
-        context_class = raw_entry.get("context_class")
-        if context_class not in POLITICAL_CONTEXT_CLASSES:
-            raise CatalogImportError("v2 political context_class is invalid")
-        strength = raw_entry.get("strength")
-        if strength not in POLITICAL_CONTEXT_STRENGTHS:
-            raise CatalogImportError("v2 political context strength is invalid")
-        metadata["context_class"] = context_class
-        metadata["strength"] = strength
-        if "entity_refs" in raw_entry:
-            raw_entity_refs = raw_entry["entity_refs"]
-            if (
-                not isinstance(raw_entity_refs, list)
-                or not raw_entity_refs
-                or len(raw_entity_refs) > 64
-            ):
-                raise CatalogImportError("v2 political context entity_refs are invalid")
-            entity_refs = [
-                _validate_identifier(
-                    entity_ref,
-                    label="v2 political context entity_refs",
-                )
-                for entity_ref in raw_entity_refs
-            ]
-            if len(entity_refs) != len(set(entity_refs)):
-                raise CatalogImportError("v2 political context entity_refs are invalid")
-            metadata["entity_refs"] = entity_refs
-        forbidden = {"entity_ref", "rank_level", "rank_basis"}
+    else:  # pragma: no cover - guarded by POLITICAL_SUBJECT_TYPES
+        raise CatalogImportError("v2 political subject type is invalid")
 
     if any(field in raw_entry for field in forbidden):
         raise CatalogImportError("v2 political subject metadata is inconsistent")
@@ -751,9 +715,6 @@ def _validate_build(raw: object) -> tuple[int, str, list[dict[str, Any]]]:
         normalized_patterns: set[str] = set()
         all_leader_entity_refs: set[str] = set()
         active_leader_entity_refs: set[str] = set()
-        active_context_entity_refs: set[str] = set()
-        active_strong_context_entity_refs: set[str] = set()
-        has_global_strong_context = False
         active_event_count = 0
         for raw_entry in raw_entries:
             if not isinstance(raw_entry, dict):
@@ -851,21 +812,9 @@ def _validate_build(raw: object) -> tuple[int, str, list[dict[str, Any]]]:
                     if enabled and status == "active":
                         active_leader_entity_refs.add(entity_ref)
                 if enabled and status == "active":
-                    active_context_entity_refs.update(
-                        v2_political_metadata.get("entity_refs", ())
-                    )
                     subject_type = v2_political_metadata.get("subject_type")
                     if subject_type == "historical_event":
                         active_event_count += 1
-                    elif (
-                        subject_type == "political_context"
-                        and v2_political_metadata.get("strength") == "strong"
-                    ):
-                        entity_refs = v2_political_metadata.get("entity_refs", ())
-                        if entity_refs:
-                            active_strong_context_entity_refs.update(entity_refs)
-                        else:
-                            has_global_strong_context = True
             if category_id == "political_cn" and status == "active":
                 tags = optional_metadata.get("tags", ())
                 source_screened_candidate = (
@@ -954,24 +903,10 @@ def _validate_build(raw: object) -> tuple[int, str, list[dict[str, Any]]]:
             if len(active_patterns) > MAX_TOTAL_PATTERNS:
                 raise CatalogImportError("catalog pattern limit exceeded")
 
-        if not active_context_entity_refs.issubset(active_leader_entity_refs):
-            raise CatalogImportError(
-                "v2 political context entity_refs contain an unknown leader"
-            )
         if (
             document_version == CURRENT_DOCUMENT_VERSION
             and category_id == "political_cn"
-            and (
-                not enabled
-                or not (active_event_count or active_leader_entity_refs)
-                or (
-                    active_leader_entity_refs
-                    and not has_global_strong_context
-                    and not active_leader_entity_refs.issubset(
-                        active_strong_context_entity_refs
-                    )
-                )
-            )
+            and (not enabled or not (active_event_count or active_leader_entity_refs))
         ):
             raise CatalogImportError(
                 "v2 political category lacks live alerting semantics"

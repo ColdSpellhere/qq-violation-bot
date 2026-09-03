@@ -72,9 +72,12 @@ _DISCLOSURE_POLICIES = frozenset({STRICT_HIDDEN, MANAGEMENT_VISIBLE})
 _SEVERITIES = frozenset({"low", "medium", "high", "critical"})
 _ENTRY_STATUSES = frozenset({"active", "shadow", "disabled"})
 _POLITICAL_SUBJECT_MATCH_MODES = {
-    "historical_event": DIRECT_MATCH,
-    "leader_name": SAME_SEGMENT_CONTEXT_MATCH,
-    "political_context": SUPPORT_ONLY_MATCH,
+    "historical_event": frozenset({DIRECT_MATCH}),
+    # New generations use direct matching.  The contextual mode remains
+    # readable so a catalog-first rollback can restore the previous immutable
+    # generation before the application code is rolled back.
+    "leader_name": frozenset({DIRECT_MATCH, SAME_SEGMENT_CONTEXT_MATCH}),
+    "political_context": frozenset({SUPPORT_ONLY_MATCH}),
 }
 _CONTEXT_STRENGTHS = frozenset({STRONG_CONTEXT, "weak"})
 _CONTEXT_CLASSES = frozenset(
@@ -745,6 +748,7 @@ class ManagedKeywordCatalog:
         match_builders: dict[str, _MatchBuilder] = {}
         entry_ids: set[str] = set()
         leader_entity_refs: set[str] = set()
+        contextual_leader_entity_refs: set[str] = set()
         referenced_leader_entities: set[str] = set()
         strong_context_entity_refs: set[str] = set()
         has_global_strong_context = False
@@ -837,6 +841,8 @@ class ManagedKeywordCatalog:
                                 generation_id,
                             )
                         leader_entity_refs.add(decoded.entity_ref)
+                        if decoded.match_mode == SAME_SEGMENT_CONTEXT_MATCH:
+                            contextual_leader_entity_refs.add(decoded.entity_ref)
                     referenced_leader_entities.update(decoded.entity_refs)
                     if decoded.subject_type == "historical_event":
                         active_event_count += 1
@@ -928,9 +934,11 @@ class ManagedKeywordCatalog:
         if catalog_version >= 2 and (
             not (active_event_count or leader_entity_refs)
             or (
-                leader_entity_refs
+                contextual_leader_entity_refs
                 and not has_global_strong_context
-                and not leader_entity_refs.issubset(strong_context_entity_refs)
+                and not contextual_leader_entity_refs.issubset(
+                    strong_context_entity_refs
+                )
             )
         ):
             raise _CatalogValidationError(
@@ -1233,8 +1241,8 @@ def _decode_entry(
             )
         raw_subject_type = raw.get("subject_type")
         raw_match_mode = raw.get("match_mode")
-        expected_match_mode = _POLITICAL_SUBJECT_MATCH_MODES.get(raw_subject_type)
-        if expected_match_mode is None or raw_match_mode != expected_match_mode:
+        expected_match_modes = _POLITICAL_SUBJECT_MATCH_MODES.get(raw_subject_type)
+        if expected_match_modes is None or raw_match_mode not in expected_match_modes:
             raise _CatalogValidationError(
                 "invalid_political_match_semantics",
                 generation_id,

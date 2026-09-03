@@ -472,6 +472,38 @@ class ManagedKeywordCatalogTests(unittest.TestCase):
         self.assertEqual((), context_matches)
         self.assertEqual((), leader_matches)
 
+    def test_v2_direct_leader_matches_without_context(self) -> None:
+        from plugins.content_alert.catalog import ManagedKeywordCatalog
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "managed"
+            _write_v2_political_generation(
+                root,
+                "generation-v2-direct-leader",
+                leader_fields={
+                    "subject_type": "leader_name",
+                    "match_mode": "direct",
+                    "entity_ref": "synthetic-leader-0001",
+                    "rank_level": "省部级副职",
+                    "rank_basis": "合成测试中的官方任免依据",
+                },
+            )
+            current = _activate(
+                root,
+                "generation-v2-direct-leader",
+                catalog_version=2,
+            )
+            catalog = ManagedKeywordCatalog(current)
+
+            matches = catalog.match_message(
+                Message(MessageSegment.text(V2_LEADER_TERM))
+            )
+
+        self.assertEqual([V2_LEADER_TERM], [match.term for match in matches])
+        self.assertEqual("leader_name", matches[0].subject_type)
+        self.assertEqual("direct", matches[0].match_mode)
+        self.assertEqual("", matches[0].context_term)
+
     def test_v2_matching_ignores_unicode_default_ignorable_marks(self) -> None:
         from plugins.content_alert.catalog import ManagedKeywordCatalog
 
@@ -1004,7 +1036,7 @@ class ManagedKeywordCatalogTests(unittest.TestCase):
             "missing-subject": {
                 "match_mode": "same_segment_context",
             },
-            "leader-direct": {
+            "leader-direct-missing-required-metadata": {
                 "subject_type": "leader_name",
                 "match_mode": "direct",
             },

@@ -1446,6 +1446,61 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("keyword-literal-v2-direct（未调用 AI）", report)
         self.assertNotIn("keyword-literal-v1（未调用 AI）", report)
 
+    async def test_v2_direct_leader_alert_is_labeled_and_excerpt_is_focused(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        leader_term = "合成领导姓名乙"
+        prefix = "前" * 200
+        message_text = f"{prefix}{leader_term}{'后' * 200}"
+        catalog = self.ManagedCatalog(
+            (
+                SimpleNamespace(
+                    term=leader_term,
+                    category_ids=("political_cn",),
+                    category_names=("政治姓名",),
+                    disclosure_policy="management_visible",
+                    subject_type="leader_name",
+                    match_mode="direct",
+                    context_term="",
+                    context_class="",
+                    segment_index=0,
+                    start=len(prefix),
+                    end=len(prefix) + len(leader_term),
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+                max_excerpt_chars=48,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event(message_text),
+            )
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn("检测器：keyword-literal-v2-direct（未调用 AI）", report)
+        excerpt = next(
+            line.removeprefix("内容摘录：")
+            for line in report.splitlines()
+            if line.startswith("内容摘录：")
+        )
+        self.assertIn(leader_term, excerpt)
+        self.assertLessEqual(len(excerpt), 48)
+
     async def test_political_match_precedes_manual_matches_in_report_budget(
         self,
     ) -> None:

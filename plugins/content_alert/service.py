@@ -175,7 +175,7 @@ class ContentAlertService:
                 match.disclosure_policy == "strict_hidden" for match in managed_matches
             )
         )
-        compound_match = _first_compound_match(managed_matches)
+        excerpt_focus = _first_excerpt_focus(managed_matches)
         if not self._eligible(event):
             return False
         if strict_hidden:
@@ -188,7 +188,7 @@ class ContentAlertService:
                     _message_excerpt,
                     event,
                     limit=self._max_excerpt_chars,
-                    focus=compound_match,
+                    focus=excerpt_focus,
                 )
 
         delivery_key = (
@@ -289,8 +289,9 @@ class ContentAlertService:
             else f"【{label}关键词违禁告警】"
         )
         direct_v2_match = any(
-            getattr(match, "subject_type", "") == "historical_event"
+            getattr(match, "subject_type", "") in {"historical_event", "leader_name"}
             and getattr(match, "match_mode", "") == "direct"
+            and "political_cn" in getattr(match, "category_ids", ())
             for match in managed_matches
         )
         detector = (
@@ -354,6 +355,23 @@ def _first_compound_match(
             for match in managed_matches
             if getattr(match, "subject_type", "") == "leader_name"
             and bool(getattr(match, "context_term", ""))
+        ),
+        None,
+    )
+
+
+def _first_excerpt_focus(
+    managed_matches: Sequence[_ManagedMatch],
+) -> _ManagedMatch | None:
+    compound = _first_compound_match(managed_matches)
+    if compound is not None:
+        return compound
+    return next(
+        (
+            match
+            for match in managed_matches
+            if getattr(match, "match_mode", "") == "direct"
+            and "political_cn" in getattr(match, "category_ids", ())
         ),
         None,
     )
