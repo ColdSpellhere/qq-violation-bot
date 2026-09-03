@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from array import array
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -25,6 +27,14 @@ class ScalableLiteralMatch:
     end: int
 
 
+class ScalableLiteralScanLimitError(RuntimeError):
+    """Raised without content details when an untrusted scan exceeds a budget."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__("managed literal scan limit exceeded")
+
+
 class ScalableLiteralMatcher:
     """Compile a large, immutable set of normalized literals into a trie.
 
@@ -40,6 +50,8 @@ class ScalableLiteralMatcher:
         max_patterns: int,
         max_nodes: int | None = None,
         overlap_groups: Mapping[str, str] | None = None,
+        max_text_chars: int | None = None,
+        max_candidates: int | None = None,
     ) -> None:
         if (
             isinstance(max_patterns, bool)
@@ -53,12 +65,21 @@ class ScalableLiteralMatcher:
             or max_nodes <= 0
         ):
             raise ValueError("max_nodes must be a positive integer")
+        for label, limit in (
+            ("max_text_chars", max_text_chars),
+            ("max_candidates", max_candidates),
+        ):
+            if limit is not None and (
+                isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+            ):
+                raise ValueError(f"{label} must be a positive integer")
 
         # Each node maps one normalized character to the next node index.
         # Terminals contain exactly one key because normalized patterns are
         # required to be unique before the trie is published.
         transitions: list[dict[str, int]] = [{}]
-        terminals: list[tuple[str, str] | None] = [None]
+        terminals: list[int | None] = [None]
+        records: list[tuple[str, str]] = []
         seen_keys: set[str] = set()
         seen_patterns: set[str] = set()
         for count, (key, pattern) in enumerate(patterns, start=1):
@@ -89,7 +110,8 @@ class ScalableLiteralMatcher:
                     transitions.append({})
                     terminals.append(None)
                 node_index = next_index
-            terminals[node_index] = (key, pattern)
+            records.append((key, pattern))
+            terminals[node_index] = len(records) - 1
 
         if overlap_groups is None:
             self._overlap_groups = MappingProxyType({})
@@ -101,15 +123,58 @@ class ScalableLiteralMatcher:
                 raise ValueError("managed literal overlap groups are invalid")
             self._overlap_groups = MappingProxyType(dict(overlap_groups))
 
+        groups = tuple(
+            self._overlap_groups.get(key, "__default__") for key, _pattern in records
+        )
         self._transitions = tuple(MappingProxyType(node) for node in transitions)
         self._terminals = tuple(terminals)
+        self._records = tuple(records)
+        self._groups = groups
+        self._group_sizes = MappingProxyType(dict(Counter(groups)))
+        self._max_text_chars = max_text_chars
+        self._max_candidates = max_candidates
 
     def match_text(self, text: str) -> tuple[ScalableLiteralMatch, ...]:
-        normalized_text = normalize_literal_text(text)
-        if not normalized_text or len(self._transitions) == 1:
-            return ()
+        matches = self.match_text_all(text)
+        unique: list[ScalableLiteralMatch] = []
+        seen_match_keys: set[str] = set()
+        for match in matches:
+            if match.key in seen_match_keys:
+                continue
+            seen_match_keys.add(match.key)
+            unique.append(match)
+        return tuple(unique)
 
-        candidates: list[ScalableLiteralMatch] = []
+    def match_text_all(self, text: str) -> tuple[ScalableLiteralMatch, ...]:
+        """Return every accepted occurrence, including repeated keys.
+
+        Catalog-level compound matching must inspect each occurrence: an early
+        leader-name mention can lack context while a later mention of the same
+        name has qualifying context.  ``match_text`` retains the historical
+        one-result-per-key contract for existing callers.
+        """
+
+        if len(self._transitions) == 1:
+            return ()
+        if self._max_text_chars is not None and len(text) > self._max_text_chars:
+            raise ScalableLiteralScanLimitError("raw_text_limit")
+        normalized_text = normalize_literal_text(text)
+        if not normalized_text:
+            return ()
+        if (
+            self._max_text_chars is not None
+            and len(normalized_text) > self._max_text_chars
+        ):
+            raise ScalableLiteralScanLimitError("normalized_text_limit")
+
+        accepted: list[ScalableLiteralMatch] = []
+        # Only candidates from groups containing competing keys need overlap
+        # resolution.  Compact integer buckets preserve the historical
+        # longest-first ordering without allocating one Python object per
+        # rejected nested occurrence.
+        candidates_by_length: dict[int, array[int]] = {}
+        record_count = len(self._records)
+        candidate_count = 0
         for start in range(len(normalized_text)):
             node_index = 0
             for end in range(start, len(normalized_text)):
@@ -119,45 +184,61 @@ class ScalableLiteralMatcher:
                 node_index = next_index
                 terminal = self._terminals[node_index]
                 if terminal is not None:
-                    key, pattern = terminal
-                    candidates.append(
-                        ScalableLiteralMatch(
-                            key=key,
-                            pattern=pattern,
-                            start=start,
-                            end=end + 1,
+                    candidate_count += 1
+                    if (
+                        self._max_candidates is not None
+                        and candidate_count > self._max_candidates
+                    ):
+                        raise ScalableLiteralScanLimitError("candidate_limit")
+                    key, pattern = self._records[terminal]
+                    group = self._groups[terminal]
+                    match_length = end + 1 - start
+                    if self._group_sizes[group] == 1:
+                        accepted.append(
+                            ScalableLiteralMatch(
+                                key=key,
+                                pattern=pattern,
+                                start=start,
+                                end=end + 1,
+                            )
                         )
+                        continue
+                    bucket = candidates_by_length.setdefault(
+                        match_length,
+                        array("Q"),
                     )
+                    bucket.append(start * record_count + terminal)
 
-        accepted: list[ScalableLiteralMatch] = []
-        occupied_by_group: dict[str, bytearray] = {}
-        for candidate in sorted(
-            candidates,
-            key=lambda item: (-(item.end - item.start), item.start, item.key),
-        ):
-            group = self._overlap_groups.get(candidate.key, "__default__")
-            occupied = occupied_by_group.setdefault(
-                group,
-                bytearray(len(normalized_text)),
-            )
-            if any(occupied[candidate.start : candidate.end]):
-                continue
-            accepted.append(candidate)
-            occupied[candidate.start : candidate.end] = b"\x01" * (
-                candidate.end - candidate.start
-            )
+        # Accepted intervals of different keys in a group are disjoint.  A
+        # sparse owner map grows only with actual covered positions; it avoids
+        # allocating len(text) cells for every singleton support-context group.
+        owners_by_group: dict[str, dict[int, int]] = {}
+        for match_length in sorted(candidates_by_length, reverse=True):
+            for encoded in candidates_by_length[match_length]:
+                start, record_index = divmod(encoded, record_count)
+                key, pattern = self._records[record_index]
+                group = self._groups[record_index]
+                owners = owners_by_group.setdefault(group, {})
+                end = start + match_length
+                if any(
+                    owner is not None and owner != record_index
+                    for offset in range(start, end)
+                    if (owner := owners.get(offset)) is not None
+                ):
+                    continue
+                accepted.append(
+                    ScalableLiteralMatch(
+                        key=key,
+                        pattern=pattern,
+                        start=start,
+                        end=end,
+                    )
+                )
+                for offset in range(start, end):
+                    owners[offset] = record_index
 
-        accepted.sort(
-            key=lambda item: (item.start, -(item.end - item.start), item.key)
-        )
-        unique: list[ScalableLiteralMatch] = []
-        seen_match_keys: set[str] = set()
-        for match in accepted:
-            if match.key in seen_match_keys:
-                continue
-            seen_match_keys.add(match.key)
-            unique.append(match)
-        return tuple(unique)
+        accepted.sort(key=lambda item: (item.start, -(item.end - item.start), item.key))
+        return tuple(accepted)
 
 
 class LiteralKeywordMatcher:

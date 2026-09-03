@@ -7,7 +7,8 @@ import os
 import re
 import stat
 import unicodedata
-from collections.abc import Mapping, Sequence
+from bisect import bisect_left, bisect_right
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -15,19 +16,36 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Any
 
-from .engine import ScalableLiteralMatcher
+from .engine import (
+    ScalableLiteralMatch,
+    ScalableLiteralMatcher,
+    ScalableLiteralScanLimitError,
+)
 from .rules import (
     MAX_NORMALIZED_PATTERN_LENGTH,
     MIN_NORMALIZED_PATTERN_LENGTH,
+    is_ignored_literal_character,
     normalize_literal_text,
 )
 
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2
+SUPPORTED_CATALOG_VERSIONS = frozenset({1, CATALOG_VERSION})
 STRICT_HIDDEN = "strict_hidden"
 MANAGEMENT_VISIBLE = "management_visible"
+DIRECT_MATCH = "direct"
+SAME_SEGMENT_CONTEXT_MATCH = "same_segment_context"
+SUPPORT_ONLY_MATCH = "support_only"
+STRONG_CONTEXT = "strong"
+MAX_CONTEXT_GAP = 12
 MAX_MANAGED_PATTERNS = 50_000
 MAX_STORED_PATTERNS = 100_000
 MAX_MANAGED_TRIE_NODES = 500_000
+MAX_MANAGED_SCAN_TEXT_CHARS = 16_384
+MAX_MANAGED_SCAN_CANDIDATES = 20_000
+MAX_MANAGED_MESSAGE_SEGMENTS = 256
+MAX_MANAGED_MESSAGE_TEXT_CHARS = MAX_MANAGED_SCAN_TEXT_CHARS
+MAX_MANAGED_MESSAGE_MATCHES = MAX_MANAGED_SCAN_CANDIDATES
+MAX_MANAGED_CONTEXT_COMPARISONS = 100_000
 MAX_POINTER_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_SHARD_BYTES = 32 * 1024 * 1024
@@ -39,8 +57,10 @@ _MAX_ALIASES_PER_ENTRY = 32
 _MAX_MANAGED_ENTRIES = 100_000
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+# ``political_cn`` is intentionally omitted: the runtime loader accepts the
+# previous hidden policy and the new management-visible policy across an
+# atomic rollout.  The catalog importer owns the policy for new generations.
 _KNOWN_CATEGORY_POLICIES = {
-    "political_cn": STRICT_HIDDEN,
     "sexual_explicit": MANAGEMENT_VISIBLE,
     "gender_conflict": MANAGEMENT_VISIBLE,
     "controversial_topics": MANAGEMENT_VISIBLE,
@@ -51,6 +71,46 @@ _KNOWN_CATEGORY_POLICIES = {
 _DISCLOSURE_POLICIES = frozenset({STRICT_HIDDEN, MANAGEMENT_VISIBLE})
 _SEVERITIES = frozenset({"low", "medium", "high", "critical"})
 _ENTRY_STATUSES = frozenset({"active", "shadow", "disabled"})
+_POLITICAL_SUBJECT_MATCH_MODES = {
+    "historical_event": DIRECT_MATCH,
+    "leader_name": SAME_SEGMENT_CONTEXT_MATCH,
+    "political_context": SUPPORT_ONLY_MATCH,
+}
+_CONTEXT_STRENGTHS = frozenset({STRONG_CONTEXT, "weak"})
+_CONTEXT_CLASSES = frozenset(
+    {
+        "office_title",
+        "case_proceeding",
+        "political_institution",
+        "historical_reference",
+    }
+)
+_REQUIRED_V2_CATEGORY_IDS = frozenset(
+    {
+        "political_cn",
+        "sexual_explicit",
+        "gender_conflict",
+        "controversial_topics",
+        "anime_game_controversy",
+        "graphic_violence",
+        "terrorism",
+    }
+)
+_POLITICAL_REVIEW_TAG = "human-reviewed-political-scope"
+_POLITICAL_SOURCE_SCREENED_TAG = "source-screened-political-scope"
+_POLITICAL_SUBJECT_TAGS = frozenset(
+    {
+        "subject:leader_name",
+        "subject:historical_event",
+        "subject:political_context",
+    }
+)
+_POLITICAL_RANK_LEVELS = frozenset(
+    {"国家级正职", "国家级副职", "省部级正职", "省部级副职"}
+)
+_POLITICAL_VERIFICATION_STATUSES = frozenset(
+    {"official_verified", "research_candidate", "operator_curated"}
+)
 
 
 @dataclass(frozen=True)
@@ -59,6 +119,8 @@ class ManagedKeywordSource:
     reference: str
     license: str
     retrieved_at: str
+    revision: str = ""
+    sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,6 +143,12 @@ class ManagedKeywordEntry:
     category_names: tuple[str, ...]
     disclosure_policy: str
     source_refs: tuple[str, ...]
+    subject_type: str
+    match_mode: str
+    context_class: str
+    context_strength: str
+    entity_ref: str
+    entity_refs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -93,6 +161,14 @@ class ManagedKeywordMatch:
     source_refs: tuple[str, ...]
     start: int
     end: int
+    subject_type: str
+    match_mode: str
+    context_class: str
+    context_strength: str
+    context_term: str
+    segment_index: int
+    entity_ref: str
+    entity_refs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -109,6 +185,7 @@ class ManagedCatalogError:
 
 @dataclass(frozen=True)
 class ManagedCatalogSnapshot:
+    catalog_version: int
     generation_id: str
     generated_at: str
     categories: tuple[ManagedKeywordCategory, ...]
@@ -138,6 +215,12 @@ class _EntryBuilder:
     category_names: list[str]
     source_refs: list[str]
     disclosure_policy: str
+    subject_type: str
+    match_mode: str
+    context_class: str
+    context_strength: str
+    entity_ref: str
+    entity_refs: tuple[str, ...]
 
 
 @dataclass
@@ -148,6 +231,28 @@ class _MatchBuilder:
     category_names: list[str]
     source_refs: list[str]
     disclosure_policy: str
+    subject_type: str
+    match_mode: str
+    context_class: str
+    context_strength: str
+    entity_ref: str
+    entity_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _DecodedEntry:
+    entry_id: str
+    term: str
+    aliases: tuple[str, ...]
+    status: str
+    source_ref: str
+    source_refs: tuple[str, ...]
+    subject_type: str
+    match_mode: str
+    context_class: str
+    context_strength: str
+    entity_ref: str
+    entity_refs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -157,6 +262,7 @@ class _CatalogValidationError(Exception):
 
 
 _EMPTY_SNAPSHOT = ManagedCatalogSnapshot(
+    catalog_version=0,
     generation_id="",
     generated_at="",
     categories=(),
@@ -209,7 +315,14 @@ class ManagedKeywordCatalog:
                 error = ManagedCatalogError(exc.code, exc.generation_id)
                 self._record_failure(error, fingerprint)
                 return self._snapshot
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                RecursionError,
+                TypeError,
+                ValueError,
+            ):
                 self._record_failure(
                     ManagedCatalogError("invalid_generation"),
                     fingerprint,
@@ -225,17 +338,48 @@ class ManagedKeywordCatalog:
 
     def match_message(self, message: object) -> tuple[ManagedKeywordMatch, ...]:
         snapshot = self.snapshot()
+        return self.match_snapshot(snapshot, message)
+
+    def scan_message(
+        self,
+        message: object,
+    ) -> tuple[bool, tuple[ManagedKeywordMatch, ...]]:
+        """Atomically select one immutable snapshot and scan against it."""
+
+        snapshot = self.snapshot()
+        return (
+            snapshot.has_active_generation,
+            self.match_snapshot(snapshot, message),
+        )
+
+    def match_snapshot(
+        self,
+        snapshot: ManagedCatalogSnapshot,
+        message: object,
+    ) -> tuple[ManagedKeywordMatch, ...]:
         matcher = snapshot._matcher
         if matcher is None:
             return ()
 
-        matches: list[ManagedKeywordMatch] = []
-        seen_keys: set[str] = set()
+        selected: dict[
+            str,
+            tuple[
+                tuple[int, ...],
+                ScalableLiteralMatch,
+                ScalableLiteralMatch | None,
+                int,
+            ],
+        ] = {}
+        context_comparisons = 0
         try:
             segments = iter(message)  # type: ignore[arg-type]
         except TypeError:
             return ()
-        for segment in segments:
+        message_text_chars = 0
+        message_match_count = 0
+        for segment_index, segment in enumerate(segments):
+            if segment_index >= MAX_MANAGED_MESSAGE_SEGMENTS:
+                raise ScalableLiteralScanLimitError("message_segment_limit")
             if getattr(segment, "type", None) != "text":
                 continue
             data = getattr(segment, "data", None)
@@ -244,23 +388,142 @@ class ManagedKeywordCatalog:
             text = data.get("text")
             if not isinstance(text, str):
                 continue
-            for literal_match in matcher.match_text(text):
-                if literal_match.key in seen_keys:
-                    continue
-                seen_keys.add(literal_match.key)
-                metadata = snapshot._match_metadata[literal_match.key]
-                matches.append(
-                    ManagedKeywordMatch(
-                        term=metadata.term,
-                        category_ids=metadata.category_ids,
-                        category_names=metadata.category_names,
-                        disclosure_policy=metadata.disclosure_policy,
-                        entry_ids=metadata.entry_ids,
-                        source_refs=metadata.source_refs,
-                        start=literal_match.start,
-                        end=literal_match.end,
-                    )
+            message_text_chars += len(text)
+            if message_text_chars > MAX_MANAGED_MESSAGE_TEXT_CHARS:
+                raise ScalableLiteralScanLimitError("message_text_limit")
+            literal_matches = matcher.match_text_all(text)
+            message_match_count += len(literal_matches)
+            if message_match_count > MAX_MANAGED_MESSAGE_MATCHES:
+                raise ScalableLiteralScanLimitError("message_match_limit")
+            strong_contexts = tuple(
+                literal_match
+                for literal_match in literal_matches
+                if (
+                    snapshot._match_metadata[literal_match.key].match_mode
+                    == SUPPORT_ONLY_MATCH
+                    and snapshot._match_metadata[literal_match.key].context_strength
+                    == STRONG_CONTEXT
                 )
+            )
+            strong_context_starts = tuple(context.start for context in strong_contexts)
+            for literal_match in literal_matches:
+                metadata = snapshot._match_metadata[literal_match.key]
+                if metadata.match_mode == SUPPORT_ONLY_MATCH:
+                    continue
+                context_match: ScalableLiteralMatch | None = None
+                if metadata.match_mode == SAME_SEGMENT_CONTEXT_MATCH:
+                    context_left = bisect_left(
+                        strong_context_starts,
+                        max(
+                            0,
+                            literal_match.start
+                            - MAX_CONTEXT_GAP
+                            - MAX_NORMALIZED_PATTERN_LENGTH,
+                        ),
+                    )
+                    context_right = bisect_right(
+                        strong_context_starts,
+                        literal_match.end + MAX_CONTEXT_GAP,
+                    )
+                    context_comparisons += context_right - context_left
+                    if context_comparisons > MAX_MANAGED_CONTEXT_COMPARISONS:
+                        raise ScalableLiteralScanLimitError("context_comparison_limit")
+                    context_match = _nearest_strong_context(
+                        literal_match,
+                        (
+                            candidate
+                            for candidate in strong_contexts[context_left:context_right]
+                            if _context_applies_to_subject(
+                                subject=metadata,
+                                context=snapshot._match_metadata[candidate.key],
+                            )
+                        ),
+                    )
+                    if context_match is None:
+                        continue
+                    selection_rank = (
+                        _normalized_gap(literal_match, context_match),
+                        segment_index,
+                        literal_match.start,
+                        context_match.start,
+                        -(context_match.end - context_match.start),
+                    )
+                else:
+                    selection_rank = (
+                        segment_index,
+                        literal_match.start,
+                        -(literal_match.end - literal_match.start),
+                    )
+                previous = selected.get(literal_match.key)
+                if previous is None or selection_rank < previous[0]:
+                    selected[literal_match.key] = (
+                        selection_rank,
+                        literal_match,
+                        context_match,
+                        segment_index,
+                    )
+
+        matches: list[ManagedKeywordMatch] = []
+        ordered_selected = sorted(
+            selected.values(),
+            key=lambda item: (
+                item[3],
+                min(
+                    item[1].start,
+                    item[2].start if item[2] is not None else item[1].start,
+                ),
+                item[1].key,
+            ),
+        )
+        for _rank, literal_match, context_match, segment_index in ordered_selected:
+            metadata = snapshot._match_metadata[literal_match.key]
+            context_metadata = (
+                snapshot._match_metadata[context_match.key]
+                if context_match is not None
+                else None
+            )
+            matches.append(
+                ManagedKeywordMatch(
+                    term=metadata.term,
+                    category_ids=metadata.category_ids,
+                    category_names=metadata.category_names,
+                    disclosure_policy=metadata.disclosure_policy,
+                    entry_ids=metadata.entry_ids,
+                    source_refs=metadata.source_refs,
+                    start=(
+                        min(literal_match.start, context_match.start)
+                        if context_match is not None
+                        else literal_match.start
+                    ),
+                    end=(
+                        max(literal_match.end, context_match.end)
+                        if context_match is not None
+                        else literal_match.end
+                    ),
+                    subject_type=metadata.subject_type,
+                    match_mode=metadata.match_mode,
+                    context_class=(
+                        context_metadata.context_class
+                        if context_metadata is not None
+                        else ""
+                    ),
+                    context_strength=(
+                        context_metadata.context_strength
+                        if context_metadata is not None
+                        else ""
+                    ),
+                    context_term=(
+                        context_metadata.term if context_metadata is not None else ""
+                    ),
+                    segment_index=segment_index,
+                    entity_ref=metadata.entity_ref,
+                    entity_refs=(
+                        context_metadata.entity_refs
+                        if context_metadata is not None
+                        else ()
+                    ),
+                )
+            )
         return tuple(matches)
 
     def _probe_pointer(
@@ -305,7 +568,12 @@ class ManagedKeywordCatalog:
         if pointer_fingerprint != expected_pointer_fingerprint:
             raise _CatalogValidationError("pointer_changed")
         pointer = _decode_json_object(pointer_raw, code="invalid_pointer_json")
-        if pointer.get("version") != CATALOG_VERSION:
+        catalog_version = pointer.get("version")
+        if (
+            isinstance(catalog_version, bool)
+            or not isinstance(catalog_version, int)
+            or catalog_version not in SUPPORTED_CATALOG_VERSIONS
+        ):
             raise _CatalogValidationError("unsupported_pointer_version")
 
         generation_id = _identifier(
@@ -330,6 +598,7 @@ class ManagedKeywordCatalog:
         # safely opened and validated above.
         if (
             self._snapshot.has_active_generation
+            and catalog_version == self._snapshot.catalog_version
             and generation_id == self._snapshot.generation_id
             and manifest_reference == self._manifest_reference
         ):
@@ -356,6 +625,7 @@ class ManagedKeywordCatalog:
         return (
             self._decode_manifest(
                 manifest,
+                catalog_version=int(catalog_version),
                 generation_id=generation_id,
                 generation_root=manifest_path.parent,
             ),
@@ -366,10 +636,16 @@ class ManagedKeywordCatalog:
         self,
         manifest: Mapping[str, Any],
         *,
+        catalog_version: int,
         generation_id: str,
         generation_root: Path,
     ) -> ManagedCatalogSnapshot:
-        if manifest.get("version") != CATALOG_VERSION:
+        manifest_version = manifest.get("version")
+        if (
+            isinstance(manifest_version, bool)
+            or not isinstance(manifest_version, int)
+            or manifest_version != catalog_version
+        ):
             raise _CatalogValidationError(
                 "unsupported_manifest_version",
                 generation_id,
@@ -397,11 +673,16 @@ class ManagedKeywordCatalog:
         category_ids: set[str] = set()
         shard_references: set[str] = set()
         declared_entry_count = 0
+        political_category_enabled: bool | None = None
 
         for raw_category in raw_categories:
             if not isinstance(raw_category, dict):
                 raise _CatalogValidationError("invalid_category", generation_id)
-            category = _decode_category(raw_category, generation_id=generation_id)
+            category = _decode_category(
+                raw_category,
+                catalog_version=catalog_version,
+                generation_id=generation_id,
+            )
             if category.category_id in category_ids:
                 raise _CatalogValidationError(
                     "duplicate_category_id",
@@ -411,6 +692,8 @@ class ManagedKeywordCatalog:
             enabled = raw_category.get("enabled")
             if not isinstance(enabled, bool):
                 raise _CatalogValidationError("invalid_category", generation_id)
+            if category.category_id == "political_cn":
+                political_category_enabled = enabled
             shards = raw_category.get("shards")
             if not isinstance(shards, list) or len(shards) > _MAX_SHARDS:
                 raise _CatalogValidationError("invalid_shards", generation_id)
@@ -445,14 +728,32 @@ class ManagedKeywordCatalog:
                 categories.append(category)
             decoded_categories.append((raw_category, category, enabled))
 
+        if catalog_version >= 2 and not _REQUIRED_V2_CATEGORY_IDS.issubset(
+            category_ids
+        ):
+            raise _CatalogValidationError(
+                "missing_required_categories",
+                generation_id,
+            )
+        if catalog_version >= 2 and political_category_enabled is not True:
+            raise _CatalogValidationError(
+                "dead_political_generation",
+                generation_id,
+            )
+
         entry_builders: dict[str, _EntryBuilder] = {}
         match_builders: dict[str, _MatchBuilder] = {}
         entry_ids: set[str] = set()
+        leader_entity_refs: set[str] = set()
+        referenced_leader_entities: set[str] = set()
+        strong_context_entity_refs: set[str] = set()
+        has_global_strong_context = False
+        active_event_count = 0
         active_pattern_count = 0
         stored_pattern_count = 0
 
         for raw_category, category, enabled in decoded_categories:
-            source_ids = {source.source_id for source in category.sources}
+            sources_by_id = {source.source_id: source for source in category.sources}
             for descriptor in raw_category["shards"]:
                 reference, entry_count, expected_digest = _decode_shard_descriptor(
                     descriptor,
@@ -482,8 +783,11 @@ class ManagedKeywordCatalog:
                     code="invalid_shard_json",
                     generation_id=generation_id,
                 )
+                shard_version = shard.get("version")
                 if (
-                    shard.get("version") != CATALOG_VERSION
+                    isinstance(shard_version, bool)
+                    or not isinstance(shard_version, int)
+                    or shard_version != catalog_version
                     or shard.get("generation_id") != generation_id
                     or shard.get("category_id") != category.category_id
                 ):
@@ -501,10 +805,16 @@ class ManagedKeywordCatalog:
                 for raw_entry in raw_entries:
                     decoded = _decode_entry(
                         raw_entry,
+                        catalog_version=catalog_version,
+                        category_id=category.category_id,
                         generation_id=generation_id,
-                        source_ids=source_ids,
+                        sources_by_id=sources_by_id,
+                        category_enabled=enabled,
                     )
-                    entry_id, term, aliases, status, source_ref = decoded
+                    entry_id = decoded.entry_id
+                    term = decoded.term
+                    aliases = decoded.aliases
+                    status = decoded.status
                     if entry_id in entry_ids:
                         raise _CatalogValidationError(
                             "duplicate_entry_id",
@@ -520,6 +830,25 @@ class ManagedKeywordCatalog:
                     if not enabled or status != "active":
                         continue
 
+                    if decoded.entity_ref:
+                        if decoded.entity_ref in leader_entity_refs:
+                            raise _CatalogValidationError(
+                                "duplicate_political_entity_reference",
+                                generation_id,
+                            )
+                        leader_entity_refs.add(decoded.entity_ref)
+                    referenced_leader_entities.update(decoded.entity_refs)
+                    if decoded.subject_type == "historical_event":
+                        active_event_count += 1
+                    elif (
+                        decoded.match_mode == SUPPORT_ONLY_MATCH
+                        and decoded.context_strength == STRONG_CONTEXT
+                    ):
+                        if decoded.entity_refs:
+                            strong_context_entity_refs.update(decoded.entity_refs)
+                        else:
+                            has_global_strong_context = True
+
                     normalized_term = normalize_literal_text(term)
                     entry_builder = entry_builders.get(normalized_term)
                     if entry_builder is None:
@@ -531,13 +860,24 @@ class ManagedKeywordCatalog:
                             category_names=[],
                             source_refs=[],
                             disclosure_policy=MANAGEMENT_VISIBLE,
+                            subject_type=decoded.subject_type,
+                            match_mode=decoded.match_mode,
+                            context_class=decoded.context_class,
+                            context_strength=decoded.context_strength,
+                            entity_ref=decoded.entity_ref,
+                            entity_refs=decoded.entity_refs,
                         )
                         entry_builders[normalized_term] = entry_builder
+                    _require_compatible_semantics(
+                        entry_builder,
+                        decoded,
+                        generation_id=generation_id,
+                    )
                     _merge_builder_metadata(
                         entry_builder,
                         entry_id=entry_id,
                         category=category,
-                        source_ref=source_ref,
+                        source_refs=decoded.source_refs,
                     )
                     for alias in aliases:
                         if alias not in entry_builder.aliases:
@@ -560,14 +900,43 @@ class ManagedKeywordCatalog:
                                 category_names=[],
                                 source_refs=[],
                                 disclosure_policy=MANAGEMENT_VISIBLE,
+                                subject_type=decoded.subject_type,
+                                match_mode=decoded.match_mode,
+                                context_class=decoded.context_class,
+                                context_strength=decoded.context_strength,
+                                entity_ref=decoded.entity_ref,
+                                entity_refs=decoded.entity_refs,
                             )
                             match_builders[normalized_pattern] = match_builder
+                        _require_compatible_semantics(
+                            match_builder,
+                            decoded,
+                            generation_id=generation_id,
+                        )
                         _merge_builder_metadata(
                             match_builder,
                             entry_id=entry_id,
                             category=category,
-                            source_ref=source_ref,
+                            source_refs=decoded.source_refs,
                         )
+
+        if not referenced_leader_entities.issubset(leader_entity_refs):
+            raise _CatalogValidationError(
+                "unknown_political_entity_reference",
+                generation_id,
+            )
+        if catalog_version >= 2 and (
+            not (active_event_count or leader_entity_refs)
+            or (
+                leader_entity_refs
+                and not has_global_strong_context
+                and not leader_entity_refs.issubset(strong_context_entity_refs)
+            )
+        ):
+            raise _CatalogValidationError(
+                "dead_political_generation",
+                generation_id,
+            )
 
         entries = tuple(
             ManagedKeywordEntry(
@@ -585,6 +954,12 @@ class ManagedKeywordCatalog:
                 ),
                 disclosure_policy=builder.disclosure_policy,
                 source_refs=tuple(builder.source_refs),
+                subject_type=builder.subject_type,
+                match_mode=builder.match_mode,
+                context_class=builder.context_class,
+                context_strength=builder.context_strength,
+                entity_ref=builder.entity_ref,
+                entity_refs=builder.entity_refs,
             )
             for builder in entry_builders.values()
         )
@@ -605,6 +980,14 @@ class ManagedKeywordCatalog:
                 source_refs=tuple(builder.source_refs),
                 start=0,
                 end=0,
+                subject_type=builder.subject_type,
+                match_mode=builder.match_mode,
+                context_class=builder.context_class,
+                context_strength=builder.context_strength,
+                context_term="",
+                segment_index=-1,
+                entity_ref=builder.entity_ref,
+                entity_refs=builder.entity_refs,
             )
             for normalized, builder in match_builders.items()
         }
@@ -616,11 +999,14 @@ class ManagedKeywordCatalog:
             max_patterns=MAX_MANAGED_PATTERNS,
             max_nodes=MAX_MANAGED_TRIE_NODES,
             overlap_groups={
-                normalized: builder.disclosure_policy
+                normalized: _overlap_group(builder, normalized=normalized)
                 for normalized, builder in match_builders.items()
             },
+            max_text_chars=MAX_MANAGED_SCAN_TEXT_CHARS,
+            max_candidates=MAX_MANAGED_SCAN_CANDIDATES,
         )
         return ManagedCatalogSnapshot(
+            catalog_version=catalog_version,
             generation_id=generation_id,
             generated_at=generated_at,
             categories=tuple(categories),
@@ -633,6 +1019,7 @@ class ManagedKeywordCatalog:
 def _decode_category(
     raw: Mapping[str, Any],
     *,
+    catalog_version: int,
     generation_id: str,
 ) -> ManagedKeywordCategory:
     category_id = _identifier(
@@ -659,6 +1046,8 @@ def _decode_category(
     if disclosure_policy not in _DISCLOSURE_POLICIES:
         raise _CatalogValidationError("invalid_disclosure_policy", generation_id)
     required_policy = _KNOWN_CATEGORY_POLICIES.get(category_id)
+    if category_id == "political_cn" and catalog_version >= 2:
+        required_policy = MANAGEMENT_VISIBLE
     if required_policy is not None and disclosure_policy != required_policy:
         raise _CatalogValidationError("forbidden_policy_downgrade", generation_id)
     version = _bounded_text(
@@ -687,6 +1076,23 @@ def _decode_category(
         if source_id in source_ids:
             raise _CatalogValidationError("duplicate_source_id", generation_id)
         source_ids.add(source_id)
+        revision = raw_source.get("revision", "")
+        if revision:
+            revision = _bounded_text(
+                revision,
+                limit=512,
+                code="invalid_source_revision",
+                generation_id=generation_id,
+            )
+        elif not isinstance(revision, str):
+            raise _CatalogValidationError("invalid_source_revision", generation_id)
+        digest = raw_source.get("sha256", "")
+        if digest and (
+            not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None
+        ):
+            raise _CatalogValidationError("invalid_source_hash", generation_id)
+        if not isinstance(digest, str):
+            raise _CatalogValidationError("invalid_source_hash", generation_id)
         sources.append(
             ManagedKeywordSource(
                 source_id=source_id,
@@ -707,6 +1113,8 @@ def _decode_category(
                     code="invalid_source_timestamp",
                     generation_id=generation_id,
                 ),
+                revision=revision,
+                sha256=digest,
             )
         )
     return ManagedKeywordCategory(
@@ -749,9 +1157,12 @@ def _decode_shard_descriptor(
 def _decode_entry(
     raw: object,
     *,
+    catalog_version: int,
+    category_id: str,
     generation_id: str,
-    source_ids: set[str],
-) -> tuple[str, str, tuple[str, ...], str, str]:
+    sources_by_id: Mapping[str, ManagedKeywordSource],
+    category_enabled: bool,
+) -> _DecodedEntry:
     if not isinstance(raw, dict):
         raise _CatalogValidationError("invalid_entry", generation_id)
     entry_id = _identifier(
@@ -765,10 +1176,7 @@ def _decode_entry(
         generation_id=generation_id,
     )
     raw_aliases = raw.get("aliases")
-    if (
-        not isinstance(raw_aliases, list)
-        or len(raw_aliases) > _MAX_ALIASES_PER_ENTRY
-    ):
+    if not isinstance(raw_aliases, list) or len(raw_aliases) > _MAX_ALIASES_PER_ENTRY:
         raise _CatalogValidationError("invalid_entry_aliases", generation_id)
     aliases: list[str] = []
     alias_normalized: set[str] = {normalize_literal_text(term)}
@@ -785,6 +1193,12 @@ def _decode_entry(
     status = raw.get("status")
     if status not in _ENTRY_STATUSES:
         raise _CatalogValidationError("invalid_entry_status", generation_id)
+    if catalog_version >= 2 and category_enabled and status != "active":
+        raise _CatalogValidationError(
+            "nonalerting_entry_in_enabled_v2_category",
+            generation_id,
+        )
+    source_ids = set(sources_by_id)
     source_ref = raw.get("source_ref")
     if source_ref is None:
         if len(source_ids) != 1:
@@ -792,7 +1206,251 @@ def _decode_entry(
         source_ref = next(iter(source_ids))
     if not isinstance(source_ref, str) or source_ref not in source_ids:
         raise _CatalogValidationError("invalid_entry_source", generation_id)
-    return entry_id, term, tuple(aliases), str(status), source_ref
+    source_refs: tuple[str, ...] = (source_ref,)
+
+    if (
+        catalog_version >= 2
+        and category_enabled
+        and category_id != "political_cn"
+        and status == "active"
+    ):
+        raise _CatalogValidationError(
+            "active_v2_nonpolitical_entry",
+            generation_id,
+        )
+
+    subject_type = ""
+    match_mode = DIRECT_MATCH
+    context_class = ""
+    context_strength = ""
+    entity_ref = ""
+    entity_refs: tuple[str, ...] = ()
+    if catalog_version >= 2 and category_id == "political_cn" and status == "active":
+        if raw.get("term") != term:
+            raise _CatalogValidationError(
+                "invalid_political_canonical_term",
+                generation_id,
+            )
+        raw_subject_type = raw.get("subject_type")
+        raw_match_mode = raw.get("match_mode")
+        expected_match_mode = _POLITICAL_SUBJECT_MATCH_MODES.get(raw_subject_type)
+        if expected_match_mode is None or raw_match_mode != expected_match_mode:
+            raise _CatalogValidationError(
+                "invalid_political_match_semantics",
+                generation_id,
+            )
+        subject_type = str(raw_subject_type)
+        match_mode = str(raw_match_mode)
+        if raw_aliases:
+            raise _CatalogValidationError(
+                "invalid_political_aliases",
+                generation_id,
+            )
+
+        raw_tags = raw.get("tags")
+        if not isinstance(raw_tags, list) or not raw_tags or len(raw_tags) > 64:
+            raise _CatalogValidationError("invalid_political_review", generation_id)
+        tags = tuple(
+            _bounded_text(
+                tag,
+                limit=128,
+                code="invalid_political_review",
+                generation_id=generation_id,
+            )
+            for tag in raw_tags
+        )
+        subject_tags = {tag for tag in tags if tag.startswith("subject:")}
+        verification_status = raw.get("verification_status")
+        source_screened_candidate = (
+            verification_status == "research_candidate"
+            and _POLITICAL_SOURCE_SCREENED_TAG in tags
+        )
+        if (
+            len(tags) != len(set(tags))
+            or (_POLITICAL_REVIEW_TAG not in tags and not source_screened_candidate)
+            or subject_tags != {f"subject:{subject_type}"}
+            or not subject_tags.issubset(_POLITICAL_SUBJECT_TAGS)
+        ):
+            raise _CatalogValidationError("invalid_political_review", generation_id)
+
+        confidence = raw.get("confidence")
+        if verification_status not in _POLITICAL_VERIFICATION_STATUSES:
+            raise _CatalogValidationError(
+                "invalid_political_verification",
+                generation_id,
+            )
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0 <= confidence <= 1
+        ):
+            raise _CatalogValidationError(
+                "invalid_political_confidence",
+                generation_id,
+            )
+        _date_or_timestamp(
+            raw.get("last_reviewed"),
+            code="invalid_political_review_date",
+            generation_id=generation_id,
+        )
+
+        raw_source_refs = raw.get("source_refs")
+        if (
+            not isinstance(raw_source_refs, list)
+            or not raw_source_refs
+            or len(raw_source_refs) > 64
+        ):
+            raise _CatalogValidationError(
+                "invalid_political_provenance",
+                generation_id,
+            )
+        source_refs = tuple(
+            _identifier(
+                candidate,
+                code="invalid_political_provenance",
+                generation_id=generation_id,
+            )
+            for candidate in raw_source_refs
+        )
+        if (
+            len(source_refs) != len(set(source_refs))
+            or source_ref not in source_refs
+            or any(reference not in source_ids for reference in source_refs)
+            or any(
+                not sources_by_id[reference].revision
+                or not sources_by_id[reference].sha256
+                for reference in source_refs
+            )
+        ):
+            raise _CatalogValidationError(
+                "invalid_political_provenance",
+                generation_id,
+            )
+
+        if subject_type == "leader_name":
+            if not _is_canonical_person_name(term):
+                raise _CatalogValidationError(
+                    "invalid_political_leader_name",
+                    generation_id,
+                )
+            if not _is_canonical_political_term(term):
+                raise _CatalogValidationError(
+                    "invalid_political_canonical_term",
+                    generation_id,
+                )
+            entity_ref = _identifier(
+                raw.get("entity_ref"),
+                code="invalid_political_entity_reference",
+                generation_id=generation_id,
+            )
+            if "entity_refs" in raw:
+                raise _CatalogValidationError(
+                    "invalid_political_entity_reference",
+                    generation_id,
+                )
+            if raw.get("rank_level") not in _POLITICAL_RANK_LEVELS:
+                raise _CatalogValidationError(
+                    "invalid_political_rank",
+                    generation_id,
+                )
+            _bounded_text(
+                raw.get("rank_basis"),
+                limit=512,
+                code="invalid_political_rank",
+                generation_id=generation_id,
+            )
+            if "context_class" in raw or "strength" in raw:
+                raise _CatalogValidationError(
+                    "invalid_political_context",
+                    generation_id,
+                )
+        elif match_mode == SUPPORT_ONLY_MATCH:
+            if not _is_canonical_political_term(term):
+                raise _CatalogValidationError(
+                    "invalid_political_canonical_term",
+                    generation_id,
+                )
+            if "entity_ref" in raw:
+                raise _CatalogValidationError(
+                    "invalid_political_entity_reference",
+                    generation_id,
+                )
+            raw_context_class = raw.get("context_class")
+            raw_context_strength = raw.get("strength")
+            if (
+                raw_context_class not in _CONTEXT_CLASSES
+                or raw_context_strength not in _CONTEXT_STRENGTHS
+            ):
+                raise _CatalogValidationError(
+                    "invalid_political_context",
+                    generation_id,
+                )
+            context_class = str(raw_context_class)
+            context_strength = str(raw_context_strength)
+            if "entity_refs" in raw:
+                raw_entity_refs = raw["entity_refs"]
+                if (
+                    not isinstance(raw_entity_refs, list)
+                    or not raw_entity_refs
+                    or len(raw_entity_refs) > 64
+                ):
+                    raise _CatalogValidationError(
+                        "invalid_political_entity_reference",
+                        generation_id,
+                    )
+                entity_refs = tuple(
+                    _identifier(
+                        candidate,
+                        code="invalid_political_entity_reference",
+                        generation_id=generation_id,
+                    )
+                    for candidate in raw_entity_refs
+                )
+                if len(entity_refs) != len(set(entity_refs)):
+                    raise _CatalogValidationError(
+                        "invalid_political_entity_reference",
+                        generation_id,
+                    )
+            if "rank_level" in raw or "rank_basis" in raw:
+                raise _CatalogValidationError(
+                    "invalid_political_rank",
+                    generation_id,
+                )
+        else:
+            if not _is_canonical_political_term(term):
+                raise _CatalogValidationError(
+                    "invalid_political_canonical_term",
+                    generation_id,
+                )
+            if "context_class" in raw or "strength" in raw:
+                raise _CatalogValidationError(
+                    "invalid_political_context",
+                    generation_id,
+                )
+            if "entity_ref" in raw or "entity_refs" in raw:
+                raise _CatalogValidationError(
+                    "invalid_political_entity_reference",
+                    generation_id,
+                )
+            if "rank_level" in raw or "rank_basis" in raw:
+                raise _CatalogValidationError(
+                    "invalid_political_rank",
+                    generation_id,
+                )
+    return _DecodedEntry(
+        entry_id=entry_id,
+        term=term,
+        aliases=tuple(aliases),
+        status=str(status),
+        source_ref=source_ref,
+        source_refs=source_refs,
+        subject_type=subject_type,
+        match_mode=match_mode,
+        context_class=context_class,
+        context_strength=context_strength,
+        entity_ref=entity_ref,
+        entity_refs=entity_refs,
+    )
 
 
 def _merge_builder_metadata(
@@ -800,17 +1458,91 @@ def _merge_builder_metadata(
     *,
     entry_id: str,
     category: ManagedKeywordCategory,
-    source_ref: str,
+    source_refs: Iterable[str],
 ) -> None:
     if entry_id not in builder.entry_ids:
         builder.entry_ids.append(entry_id)
     if category.category_id not in builder.category_ids:
         builder.category_ids.append(category.category_id)
         builder.category_names.append(category.name_zh)
-    if source_ref not in builder.source_refs:
-        builder.source_refs.append(source_ref)
+    for source_ref in source_refs:
+        if source_ref not in builder.source_refs:
+            builder.source_refs.append(source_ref)
     if category.disclosure_policy == STRICT_HIDDEN:
         builder.disclosure_policy = STRICT_HIDDEN
+
+
+def _require_compatible_semantics(
+    builder: _EntryBuilder | _MatchBuilder,
+    decoded: _DecodedEntry,
+    *,
+    generation_id: str,
+) -> None:
+    if (
+        builder.subject_type != decoded.subject_type
+        or builder.match_mode != decoded.match_mode
+        or builder.context_class != decoded.context_class
+        or builder.context_strength != decoded.context_strength
+        or builder.entity_ref != decoded.entity_ref
+        or builder.entity_refs != decoded.entity_refs
+    ):
+        raise _CatalogValidationError(
+            "conflicting_match_semantics",
+            generation_id,
+        )
+
+
+def _normalized_gap(
+    left: ScalableLiteralMatch,
+    right: ScalableLiteralMatch,
+) -> int:
+    if left.end <= right.start:
+        return right.start - left.end
+    if right.end <= left.start:
+        return left.start - right.end
+    return 0
+
+
+def _nearest_strong_context(
+    subject: ScalableLiteralMatch,
+    contexts: Iterable[ScalableLiteralMatch],
+) -> ScalableLiteralMatch | None:
+    nearby = (
+        context
+        for context in contexts
+        if (
+            (subject.end <= context.start or context.end <= subject.start)
+            and _normalized_gap(subject, context) <= MAX_CONTEXT_GAP
+        )
+    )
+    return min(
+        nearby,
+        key=lambda context: (
+            _normalized_gap(subject, context),
+            context.start,
+            -(context.end - context.start),
+            context.key,
+        ),
+        default=None,
+    )
+
+
+def _context_applies_to_subject(
+    *,
+    subject: ManagedKeywordMatch,
+    context: ManagedKeywordMatch,
+) -> bool:
+    return not context.entity_refs or subject.entity_ref in context.entity_refs
+
+
+def _overlap_group(builder: _MatchBuilder, *, normalized: str) -> str:
+    semantic_group = builder.match_mode
+    if builder.match_mode == SUPPORT_ONLY_MATCH:
+        # Contexts are filtered for strength and entity scope only after the
+        # literal scan.  Preserve every distinct overlapping context here so
+        # a longer inapplicable term cannot hide a shorter applicable one.
+        semantic_group = f"{semantic_group}:{normalized}"
+    return f"{builder.disclosure_policy}:{semantic_group}"
 
 
 def _ordered_categories(
@@ -876,6 +1608,47 @@ def _timestamp(
     if parsed.tzinfo is None:
         raise _CatalogValidationError(code, generation_id)
     return text
+
+
+def _date_or_timestamp(
+    value: object,
+    *,
+    code: str,
+    generation_id: str = "",
+) -> str:
+    text = _bounded_text(
+        value,
+        limit=128,
+        code=code,
+        generation_id=generation_id,
+    )
+    try:
+        datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+    except ValueError as exc:
+        raise _CatalogValidationError(code, generation_id) from exc
+    return text
+
+
+def _is_canonical_political_term(value: str) -> bool:
+    return value == unicodedata.normalize("NFKC", value) and not any(
+        character.isspace() or is_ignored_literal_character(character)
+        for character in value
+    )
+
+
+def _is_canonical_person_name(value: str) -> bool:
+    parts = value.split("·")
+    if not 1 <= len(parts) <= 4 or sum(map(len, parts)) < 2:
+        return False
+    if any(not 1 <= len(part) <= 16 for part in parts):
+        return False
+    return all(
+        unicodedata.name(character, "").startswith(
+            ("CJK UNIFIED IDEOGRAPH-", "CJK COMPATIBILITY IDEOGRAPH-")
+        )
+        for part in parts
+        for character in part
+    )
 
 
 def _literal(
@@ -953,7 +1726,7 @@ def _decode_json_object(
             raw.decode("utf-8"),
             object_pairs_hook=_object_without_duplicate_keys,
         )
-    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise _CatalogValidationError(code, generation_id) from exc
     if not isinstance(value, dict):
         raise _CatalogValidationError(code, generation_id)

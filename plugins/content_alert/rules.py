@@ -19,6 +19,44 @@ MAX_NORMALIZED_PATTERN_LENGTH = 64
 
 _RULE_ID_RE = re.compile(r"K([0-9]{4,})\Z")
 
+# Python exposes Unicode general categories but not the derived
+# Default_Ignorable_Code_Point property.  Most default-ignorables are Cf and
+# therefore covered by the category check below.  These ranges cover the
+# remaining marks/fillers that are visually absent yet otherwise split a
+# literal match (notably CGJ and variation selectors).
+_IGNORABLE_LITERAL_RANGES = (
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x2065, 0x2065),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFFF0, 0xFFF8),
+    (0xFFA0, 0xFFA0),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
+
+def is_ignored_literal_character(character: str) -> bool:
+    """Return whether a non-whitespace code point is invisible to matching.
+
+    Incoming chat text is untrusted.  Control/format/surrogate characters and
+    the non-Cf default-ignorable ranges are discarded so an invisible
+    separator cannot split a protected literal.  Private-use and unassigned
+    characters are deliberately retained because they may render a glyph or
+    replacement box and therefore must break an exact literal match.
+    """
+
+    if not isinstance(character, str) or len(character) != 1:
+        raise TypeError("literal character must be one code point")
+    if unicodedata.category(character) in {"Cc", "Cf", "Cs"}:
+        return True
+    codepoint = ord(character)
+    return any(start <= codepoint <= end for start, end in _IGNORABLE_LITERAL_RANGES)
+
 
 def normalize_literal_text(value: str) -> str:
     """Return the canonical form used for literal rule matching.
@@ -31,10 +69,20 @@ def normalize_literal_text(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("literal text must be a string")
     normalized = unicodedata.normalize("NFKC", value).casefold()
-    return "".join(
+    filtered = "".join(
         character
         for character in normalized
-        if not character.isspace() and unicodedata.category(character) != "Cf"
+        if not character.isspace() and not is_ignored_literal_character(character)
+    )
+    # A default-ignorable such as CGJ can deliberately block composition.
+    # Normalize once more after filtering to implement stable NFKC_Casefold-
+    # style semantics and prevent that invisible blocker from changing the
+    # literal representation.
+    recomposed = unicodedata.normalize("NFKC", filtered).casefold()
+    return "".join(
+        character
+        for character in recomposed
+        if not character.isspace() and not is_ignored_literal_character(character)
     )
 
 

@@ -11,27 +11,63 @@ import shutil
 import stat
 import sys
 import unicodedata
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+def _load_project_dependencies() -> tuple[Any, ...]:
+    """Bootstrap imports when this file is executed directly from ``scripts``."""
 
-from plugins.content_alert.catalog import (  # noqa: E402
-    MAX_MANIFEST_BYTES,
+    project_root = Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+    from plugins.content_alert.catalog import (
+        MAX_MANAGED_TRIE_NODES,
+        MAX_MANIFEST_BYTES,
+        MAX_POINTER_BYTES,
+        MAX_SHARD_BYTES,
+        ManagedKeywordCatalog,
+    )
+    from plugins.content_alert.rules import (
+        is_ignored_literal_character,
+        normalize_literal_text,
+    )
+
+    return (
+        MAX_MANAGED_TRIE_NODES,
+        MAX_MANIFEST_BYTES,
+        MAX_POINTER_BYTES,
+        MAX_SHARD_BYTES,
+        ManagedKeywordCatalog,
+        is_ignored_literal_character,
+        normalize_literal_text,
+    )
+
+
+(
     MAX_MANAGED_TRIE_NODES,
+    MAX_MANIFEST_BYTES,
     MAX_POINTER_BYTES,
     MAX_SHARD_BYTES,
     ManagedKeywordCatalog,
+    is_ignored_literal_character,
+    normalize_literal_text,
+) = _load_project_dependencies()
+
+LEGACY_DOCUMENT_VERSION = 1
+CURRENT_DOCUMENT_VERSION = 2
+SUPPORTED_DOCUMENT_VERSIONS = frozenset(
+    {LEGACY_DOCUMENT_VERSION, CURRENT_DOCUMENT_VERSION}
 )
-
-
-DOCUMENT_VERSION = 1
+# Legacy rule files have their own frozen v1 schema.  Keep this compatibility
+# alias so their validation cannot accidentally follow the managed catalog
+# generation version.
+DOCUMENT_VERSION = LEGACY_DOCUMENT_VERSION
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 MAX_BUILD_BYTES = 64 * 1024 * 1024
@@ -63,7 +99,7 @@ DISCLOSURE_POLICIES = frozenset({"strict_hidden", "management_visible"})
 SEVERITIES = frozenset({"low", "medium", "high", "critical"})
 ENTRY_STATUSES = frozenset({"active", "shadow", "disabled"})
 KNOWN_CATEGORY_POLICIES = {
-    "political_cn": "strict_hidden",
+    "political_cn": "management_visible",
     "sexual_explicit": "management_visible",
     "gender_conflict": "management_visible",
     "controversial_topics": "management_visible",
@@ -72,6 +108,34 @@ KNOWN_CATEGORY_POLICIES = {
     "terrorism": "management_visible",
 }
 GENDER_ACTIVE_REVIEW_TAG = "human-reviewed-gender-antagonism"
+POLITICAL_REVIEW_TAG = "human-reviewed-political-scope"
+POLITICAL_SOURCE_SCREENED_TAG = "source-screened-political-scope"
+POLITICAL_SUBJECT_TAGS = frozenset(
+    {
+        "subject:leader_name",
+        "subject:historical_event",
+        "subject:political_context",
+    }
+)
+POLITICAL_SUBJECT_TYPES = frozenset(
+    {"leader_name", "historical_event", "political_context"}
+)
+POLITICAL_MATCH_MODES = frozenset({"direct", "same_segment_context", "support_only"})
+POLITICAL_RANK_LEVELS = frozenset(
+    {"国家级正职", "国家级副职", "省部级正职", "省部级副职"}
+)
+POLITICAL_CONTEXT_CLASSES = frozenset(
+    {
+        "office_title",
+        "case_proceeding",
+        "political_institution",
+        "historical_reference",
+    }
+)
+POLITICAL_CONTEXT_STRENGTHS = frozenset({"strong", "weak"})
+POLITICAL_VERIFICATION_STATUSES = frozenset(
+    {"official_verified", "research_candidate", "operator_curated"}
+)
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _CATEGORY_ID_RE = re.compile(r"[a-z][a-z0-9_]{1,63}\Z")
@@ -88,6 +152,7 @@ class CatalogImportError(RuntimeError):
 
 @dataclass(frozen=True)
 class PreparedGeneration:
+    document_version: int
     generation_id: str
     catalog_sha256: str
     pointer_bytes: bytes
@@ -126,7 +191,7 @@ def _decode_json(payload: bytes, *, label: str) -> Any:
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_non_finite,
         )
-    except (UnicodeError, json.JSONDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise CatalogImportError(f"{label} is not valid UTF-8 JSON") from exc
 
 
@@ -314,18 +379,28 @@ def _validate_display_text(
 
 
 def _normalize_term(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value).casefold()
-    return "".join(
-        character
-        for character in normalized
-        if not character.isspace() and unicodedata.category(character) != "Cf"
-    )
+    return normalize_literal_text(value)
 
 
 def _validate_identifier(value: object, *, label: str) -> str:
     if not isinstance(value, str) or _IDENTIFIER_RE.fullmatch(value) is None:
         raise CatalogImportError(f"{label} is invalid")
     return value
+
+
+def _is_canonical_person_name(value: str) -> bool:
+    parts = value.split("·")
+    if not 1 <= len(parts) <= 4 or sum(map(len, parts)) < 2:
+        return False
+    if any(not 1 <= len(part) <= 16 for part in parts):
+        return False
+    return all(
+        unicodedata.name(character, "").startswith(
+            ("CJK UNIFIED IDEOGRAPH-", "CJK COMPATIBILITY IDEOGRAPH-")
+        )
+        for part in parts
+        for character in part
+    )
 
 
 def _copy_source(source: object) -> dict[str, Any]:
@@ -427,6 +502,12 @@ def _validate_optional_entry_metadata(
             raise CatalogImportError("entry confidence is invalid")
         metadata["confidence"] = confidence
 
+    if "verification_status" in raw_entry:
+        verification_status = raw_entry["verification_status"]
+        if verification_status not in POLITICAL_VERIFICATION_STATUSES:
+            raise CatalogImportError("entry verification_status is invalid")
+        metadata["verification_status"] = verification_status
+
     for field in ("first_seen", "last_reviewed"):
         if field in raw_entry:
             metadata[field] = _validate_date_or_timestamp(
@@ -450,8 +531,146 @@ def _validate_optional_entry_metadata(
     return metadata
 
 
-def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
-    if not isinstance(raw, dict) or raw.get("version") != DOCUMENT_VERSION:
+def _validate_v2_political_entry(
+    raw_entry: dict[str, Any],
+    *,
+    raw_term: object,
+    term: str,
+    aliases: list[str],
+    status: str,
+    optional_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and retain the v2 political matching contract.
+
+    Inactive, untyped entries are accepted solely for v1 legacy-background
+    migration.  They never enter the runtime matcher.  Every active v2
+    political entry must use exactly one typed contract.
+    """
+
+    raw_subject_type = raw_entry.get("subject_type")
+    raw_match_mode = raw_entry.get("match_mode")
+    has_v2_contract = raw_subject_type is not None or raw_match_mode is not None
+    if status != "active" and not has_v2_contract:
+        return {}
+
+    if raw_subject_type not in POLITICAL_SUBJECT_TYPES:
+        raise CatalogImportError("v2 political subject type is invalid")
+    if raw_match_mode not in POLITICAL_MATCH_MODES:
+        raise CatalogImportError("v2 political match mode is invalid")
+
+    tags = optional_metadata.get("tags", ())
+    if f"subject:{raw_subject_type}" not in tags:
+        raise CatalogImportError("v2 political subject tag is inconsistent")
+    if aliases:
+        raise CatalogImportError("v2 political entry must not contain aliases")
+    noncanonical_term = (
+        raw_term != term
+        or term != unicodedata.normalize("NFKC", term)
+        or any(
+            character.isspace() or is_ignored_literal_character(character)
+            for character in term
+        )
+    )
+    if status == "active" and raw_subject_type != "leader_name" and noncanonical_term:
+        raise CatalogImportError("active v2 political term is not canonical")
+
+    metadata: dict[str, Any] = {
+        "subject_type": raw_subject_type,
+        "match_mode": raw_match_mode,
+    }
+    if raw_subject_type == "leader_name":
+        if raw_match_mode != "same_segment_context":
+            raise CatalogImportError("v2 leader match mode is invalid")
+        if not _is_canonical_person_name(term):
+            raise CatalogImportError("v2 leader canonical name is invalid")
+        if status == "active" and noncanonical_term:
+            raise CatalogImportError("active v2 political term is not canonical")
+        metadata["entity_ref"] = _validate_identifier(
+            raw_entry.get("entity_ref"),
+            label="v2 leader entity_ref",
+        )
+        rank_level = raw_entry.get("rank_level")
+        if rank_level not in POLITICAL_RANK_LEVELS:
+            raise CatalogImportError("v2 leader rank_level is invalid")
+        metadata["rank_level"] = rank_level
+        metadata["rank_basis"] = _validate_display_text(
+            raw_entry.get("rank_basis"),
+            label="v2 leader rank_basis",
+            minimum=2,
+            maximum=512,
+        )
+        forbidden = {"context_class", "strength", "entity_refs"}
+    elif raw_subject_type == "historical_event":
+        if raw_match_mode != "direct":
+            raise CatalogImportError("v2 historical event match mode is invalid")
+        forbidden = {
+            "entity_ref",
+            "rank_level",
+            "rank_basis",
+            "context_class",
+            "strength",
+            "entity_refs",
+        }
+    else:
+        if raw_match_mode != "support_only":
+            raise CatalogImportError("v2 political context match mode is invalid")
+        context_class = raw_entry.get("context_class")
+        if context_class not in POLITICAL_CONTEXT_CLASSES:
+            raise CatalogImportError("v2 political context_class is invalid")
+        strength = raw_entry.get("strength")
+        if strength not in POLITICAL_CONTEXT_STRENGTHS:
+            raise CatalogImportError("v2 political context strength is invalid")
+        metadata["context_class"] = context_class
+        metadata["strength"] = strength
+        if "entity_refs" in raw_entry:
+            raw_entity_refs = raw_entry["entity_refs"]
+            if (
+                not isinstance(raw_entity_refs, list)
+                or not raw_entity_refs
+                or len(raw_entity_refs) > 64
+            ):
+                raise CatalogImportError("v2 political context entity_refs are invalid")
+            entity_refs = [
+                _validate_identifier(
+                    entity_ref,
+                    label="v2 political context entity_refs",
+                )
+                for entity_ref in raw_entity_refs
+            ]
+            if len(entity_refs) != len(set(entity_refs)):
+                raise CatalogImportError("v2 political context entity_refs are invalid")
+            metadata["entity_refs"] = entity_refs
+        forbidden = {"entity_ref", "rank_level", "rank_basis"}
+
+    if any(field in raw_entry for field in forbidden):
+        raise CatalogImportError("v2 political subject metadata is inconsistent")
+    if status == "active":
+        if "verification_status" not in optional_metadata:
+            raise CatalogImportError(
+                "active v2 political entry verification_status is required"
+            )
+        if "confidence" not in optional_metadata:
+            raise CatalogImportError("active v2 political entry confidence is required")
+        if "source_refs" not in optional_metadata:
+            raise CatalogImportError(
+                "active v2 political entry source_refs are required"
+            )
+        if "last_reviewed" not in optional_metadata:
+            raise CatalogImportError(
+                "active v2 political entry is missing last_reviewed"
+            )
+    return metadata
+
+
+def _validate_build(raw: object) -> tuple[int, str, list[dict[str, Any]]]:
+    if not isinstance(raw, dict):
+        raise CatalogImportError("unsupported private build document")
+    document_version = raw.get("version")
+    if (
+        isinstance(document_version, bool)
+        or not isinstance(document_version, int)
+        or document_version not in SUPPORTED_DOCUMENT_VERSIONS
+    ):
         raise CatalogImportError("unsupported private build document")
     generated_at = _validate_date_or_timestamp(
         raw.get("generated_at"),
@@ -474,7 +693,10 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
         if not isinstance(raw_category, dict):
             raise CatalogImportError("category must be an object")
         category_id = raw_category.get("id")
-        if not isinstance(category_id, str) or _CATEGORY_ID_RE.fullmatch(category_id) is None:
+        if (
+            not isinstance(category_id, str)
+            or _CATEGORY_ID_RE.fullmatch(category_id) is None
+        ):
             raise CatalogImportError("category id is invalid")
         if category_id in seen_category_ids:
             raise CatalogImportError("category id is duplicated")
@@ -519,6 +741,7 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
         source_ids = [source["source_id"] for source in sources]
         if len(source_ids) != len(set(source_ids)):
             raise CatalogImportError("category source id is duplicated")
+        sources_by_id = {source["source_id"]: source for source in sources}
 
         raw_entries = raw_category.get("entries")
         if not isinstance(raw_entries, list):
@@ -526,6 +749,12 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
         entries: list[dict[str, Any]] = []
         entry_ids: set[str] = set()
         normalized_patterns: set[str] = set()
+        all_leader_entity_refs: set[str] = set()
+        active_leader_entity_refs: set[str] = set()
+        active_context_entity_refs: set[str] = set()
+        active_strong_context_entity_refs: set[str] = set()
+        has_global_strong_context = False
+        active_event_count = 0
         for raw_entry in raw_entries:
             if not isinstance(raw_entry, dict):
                 raise CatalogImportError("catalog entry must be an object")
@@ -536,8 +765,9 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
             if entry_id in seen_entry_ids:
                 raise CatalogImportError("entry id is duplicated across categories")
             seen_entry_ids.add(entry_id)
+            raw_term = raw_entry.get("term")
             term = _validate_display_text(
-                raw_entry.get("term"),
+                raw_term,
                 label="entry term",
                 minimum=2,
                 allow_format=True,
@@ -546,6 +776,15 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
             if not 2 <= len(normalized_term) <= MAX_NORMALIZED_TERM_LENGTH:
                 raise CatalogImportError("entry term normalizes to an invalid length")
             if normalized_term in normalized_patterns:
+                if (
+                    document_version == CURRENT_DOCUMENT_VERSION
+                    and category_id == "political_cn"
+                    and raw_entry.get("subject_type") == "leader_name"
+                ):
+                    raise CatalogImportError(
+                        "v2 leader canonical name is duplicated; "
+                        "same-name identities must share one matcher subject"
+                    )
                 raise CatalogImportError("entry term is duplicated within its category")
             normalized_patterns.add(normalized_term)
 
@@ -562,24 +801,102 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
                 )
                 normalized_alias = _normalize_term(alias)
                 if not 2 <= len(normalized_alias) <= MAX_NORMALIZED_TERM_LENGTH:
-                    raise CatalogImportError("entry alias normalizes to an invalid length")
+                    raise CatalogImportError(
+                        "entry alias normalizes to an invalid length"
+                    )
                 if normalized_alias in normalized_patterns:
-                    raise CatalogImportError("entry alias is duplicated within its category")
+                    raise CatalogImportError(
+                        "entry alias is duplicated within its category"
+                    )
                 normalized_patterns.add(normalized_alias)
                 aliases.append(alias)
 
             status = raw_entry.get("status", "active")
             if status not in ENTRY_STATUSES:
                 raise CatalogImportError("entry status is invalid")
+            if (
+                document_version == CURRENT_DOCUMENT_VERSION
+                and enabled
+                and status != "active"
+            ):
+                raise CatalogImportError(
+                    "enabled v2 category entries must all be alerting"
+                )
+            if category_id != "political_cn" and enabled and status == "active":
+                raise CatalogImportError(
+                    "enabled nonpolitical category must not contain active entries"
+                )
             optional_metadata = _validate_optional_entry_metadata(
                 raw_entry,
                 source_ids=source_ids,
             )
+            v2_political_metadata: dict[str, Any] = {}
+            if (
+                document_version == CURRENT_DOCUMENT_VERSION
+                and category_id == "political_cn"
+            ):
+                v2_political_metadata = _validate_v2_political_entry(
+                    raw_entry,
+                    raw_term=raw_term,
+                    term=term,
+                    aliases=aliases,
+                    status=status,
+                    optional_metadata=optional_metadata,
+                )
+                if v2_political_metadata.get("subject_type") == "leader_name":
+                    entity_ref = v2_political_metadata["entity_ref"]
+                    if entity_ref in all_leader_entity_refs:
+                        raise CatalogImportError("v2 leader entity_ref is duplicated")
+                    all_leader_entity_refs.add(entity_ref)
+                    if enabled and status == "active":
+                        active_leader_entity_refs.add(entity_ref)
+                if enabled and status == "active":
+                    active_context_entity_refs.update(
+                        v2_political_metadata.get("entity_refs", ())
+                    )
+                    subject_type = v2_political_metadata.get("subject_type")
+                    if subject_type == "historical_event":
+                        active_event_count += 1
+                    elif (
+                        subject_type == "political_context"
+                        and v2_political_metadata.get("strength") == "strong"
+                    ):
+                        entity_refs = v2_political_metadata.get("entity_refs", ())
+                        if entity_refs:
+                            active_strong_context_entity_refs.update(entity_refs)
+                        else:
+                            has_global_strong_context = True
+            if category_id == "political_cn" and status == "active":
+                tags = optional_metadata.get("tags", ())
+                source_screened_candidate = (
+                    document_version == CURRENT_DOCUMENT_VERSION
+                    and optional_metadata.get("verification_status")
+                    == "research_candidate"
+                    and POLITICAL_SOURCE_SCREENED_TAG in tags
+                )
+                if POLITICAL_REVIEW_TAG not in tags and not source_screened_candidate:
+                    raise CatalogImportError(
+                        "active political entry is missing scope review"
+                    )
+                subject_tags = {tag for tag in tags if tag.startswith("subject:")}
+                if len(subject_tags) != 1 or not subject_tags.issubset(
+                    POLITICAL_SUBJECT_TAGS
+                ):
+                    raise CatalogImportError(
+                        "active political entry must have exactly one subject"
+                    )
+                if aliases:
+                    raise CatalogImportError(
+                        "active political entry must not contain aliases"
+                    )
+                if "last_reviewed" not in optional_metadata:
+                    raise CatalogImportError(
+                        "active political entry is missing last_reviewed"
+                    )
             if (
                 category_id == "gender_conflict"
                 and status == "active"
-                and GENDER_ACTIVE_REVIEW_TAG
-                not in optional_metadata.get("tags", ())
+                and GENDER_ACTIVE_REVIEW_TAG not in optional_metadata.get("tags", ())
             ):
                 raise CatalogImportError(
                     "active gender conflict entry is missing human review"
@@ -589,6 +906,27 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
             source_ref = _validate_identifier(source_ref, label="entry source_ref")
             if source_ref not in source_ids:
                 raise CatalogImportError("entry source_ref is unknown")
+            if category_id == "political_cn" and status == "active":
+                source_refs = optional_metadata.get("source_refs", ())
+                if (
+                    document_version == CURRENT_DOCUMENT_VERSION
+                    and source_ref not in source_refs
+                ):
+                    raise CatalogImportError(
+                        "active political source_ref must be in source_refs"
+                    )
+                referenced_source_ids = {
+                    source_ref,
+                    *source_refs,
+                }
+                if any(
+                    "revision" not in sources_by_id[referenced_source_id]
+                    or "sha256" not in sources_by_id[referenced_source_id]
+                    for referenced_source_id in referenced_source_ids
+                ):
+                    raise CatalogImportError(
+                        "active political entry source is not pinned"
+                    )
             entries.append(
                 {
                     "id": entry_id,
@@ -598,6 +936,7 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
                     "source_ref": source_ref,
                 }
                 | optional_metadata
+                | v2_political_metadata
             )
             total_entries += 1
             if total_entries > MAX_TOTAL_ENTRIES:
@@ -607,10 +946,36 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
                 raise CatalogImportError("catalog stored pattern limit exceeded")
             if enabled and status == "active":
                 active_patterns.update(
-                    (_normalize_term(term), *(_normalize_term(alias) for alias in aliases))
+                    (
+                        _normalize_term(term),
+                        *(_normalize_term(alias) for alias in aliases),
+                    )
                 )
             if len(active_patterns) > MAX_TOTAL_PATTERNS:
                 raise CatalogImportError("catalog pattern limit exceeded")
+
+        if not active_context_entity_refs.issubset(active_leader_entity_refs):
+            raise CatalogImportError(
+                "v2 political context entity_refs contain an unknown leader"
+            )
+        if (
+            document_version == CURRENT_DOCUMENT_VERSION
+            and category_id == "political_cn"
+            and (
+                not enabled
+                or not (active_event_count or active_leader_entity_refs)
+                or (
+                    active_leader_entity_refs
+                    and not has_global_strong_context
+                    and not active_leader_entity_refs.issubset(
+                        active_strong_context_entity_refs
+                    )
+                )
+            )
+        ):
+            raise CatalogImportError(
+                "v2 political category lacks live alerting semantics"
+            )
 
         categories.append(
             {
@@ -640,10 +1005,16 @@ def _validate_build(raw: object) -> tuple[str, list[dict[str, Any]]]:
     if not REQUIRED_CATEGORY_IDS.issubset(seen_category_ids):
         raise CatalogImportError("private build is missing required categories")
     _assert_trie_node_limit(active_patterns)
-    return generated_at, sorted(categories, key=lambda item: item["id"])
+    return (
+        document_version,
+        generated_at,
+        sorted(categories, key=lambda item: item["id"]),
+    )
 
 
-def _load_legacy_rules(instance_root: Path) -> tuple[bytes | None, list[dict[str, str]]]:
+def _load_legacy_rules(
+    instance_root: Path,
+) -> tuple[bytes | None, list[dict[str, str]]]:
     path = instance_root / "data" / "content_alert" / "background_keywords.json"
     try:
         os.lstat(path)
@@ -712,11 +1083,7 @@ def _merge_legacy_rules(
         }
     )
 
-    entry_ids = {
-        entry["id"]
-        for category in copied
-        for entry in category["entries"]
-    }
+    entry_ids = {entry["id"] for category in copied for entry in category["entries"]}
     normalized_patterns = {
         _normalize_term(value)
         for entry in political["entries"]
@@ -734,7 +1101,7 @@ def _merge_legacy_rules(
                 "id": entry_id,
                 "term": legacy["term"],
                 "aliases": [],
-                "status": "active",
+                "status": "shadow",
                 "source_ref": source_id,
             }
         )
@@ -751,7 +1118,7 @@ def _allocate_legacy_entry_id(rule_id: str, existing_ids: set[str]) -> str:
     # limit, and a build may deliberately use the obvious derived hash.  Keep
     # the mapping deterministic while trying bounded, collision-safe digests.
     for nonce in range(1_024):
-        digest_input = f"{rule_id}\0{nonce}".encode("utf-8")
+        digest_input = f"{rule_id}\0{nonce}".encode()
         digest = hashlib.sha256(digest_input).hexdigest()[:24]
         candidate = f"legacy-{digest}"
         if candidate not in existing_ids:
@@ -769,11 +1136,7 @@ def _assert_trie_node_limit(active_patterns: set[str]) -> None:
 
 
 def _assert_merged_pattern_limit(categories: list[dict[str, Any]]) -> None:
-    entries = [
-        entry
-        for category in categories
-        for entry in category["entries"]
-    ]
+    entries = [entry for category in categories for entry in category["entries"]]
     if len(entries) > MAX_TOTAL_ENTRIES:
         raise CatalogImportError("catalog entry limit exceeded after legacy import")
     stored_pattern_count = sum(1 + len(entry["aliases"]) for entry in entries)
@@ -795,17 +1158,26 @@ def _assert_merged_pattern_limit(categories: list[dict[str, Any]]) -> None:
 
 
 def _prepare_generation(
+    document_version: int,
     generated_at: str,
     categories: list[dict[str, Any]],
 ) -> PreparedGeneration:
+    if (
+        isinstance(document_version, bool)
+        or not isinstance(document_version, int)
+        or document_version not in SUPPORTED_DOCUMENT_VERSIONS
+    ):
+        raise CatalogImportError("unsupported catalog generation version")
     seed = _json_bytes(
         {
-            "version": DOCUMENT_VERSION,
+            "version": document_version,
             "generated_at": generated_at,
             "categories": categories,
         }
     )
-    digest = hashlib.sha256(b"content-alert-catalog-v1\0" + seed).hexdigest()
+    digest = hashlib.sha256(
+        f"content-alert-catalog-v{document_version}\0".encode("ascii") + seed
+    ).hexdigest()
     generation_id = f"generation-{digest}"
     files: dict[Path, bytes] = {}
     manifest_categories: list[dict[str, Any]] = []
@@ -823,7 +1195,7 @@ def _prepare_generation(
             relative = Path("shards") / f"{category_id}-{shard_number:04d}.json"
             payload = _json_bytes(
                 {
-                    "version": DOCUMENT_VERSION,
+                    "version": document_version,
                     "generation_id": generation_id,
                     "category_id": category_id,
                     "entries": shard_entries,
@@ -856,18 +1228,19 @@ def _prepare_generation(
         )
 
     manifest = {
-        "version": DOCUMENT_VERSION,
+        "version": document_version,
         "generation_id": generation_id,
         "generated_at": generated_at,
         "categories": manifest_categories,
     }
     files[Path("manifest.json")] = _json_bytes(manifest)
     pointer = {
-        "version": DOCUMENT_VERSION,
+        "version": document_version,
         "generation_id": generation_id,
         "manifest": f"generations/{generation_id}/manifest.json",
     }
     return PreparedGeneration(
+        document_version=document_version,
         generation_id=generation_id,
         catalog_sha256=digest,
         pointer_bytes=_json_bytes(pointer),
@@ -882,9 +1255,7 @@ def _assert_prepared_runtime_limits(prepared: PreparedGeneration) -> None:
         raise CatalogImportError("catalog pointer exceeds runtime size limit")
     for relative, payload in prepared.files.items():
         maximum = (
-            MAX_MANIFEST_BYTES
-            if relative == Path("manifest.json")
-            else MAX_SHARD_BYTES
+            MAX_MANIFEST_BYTES if relative == Path("manifest.json") else MAX_SHARD_BYTES
         )
         if len(payload) > maximum:
             raise CatalogImportError("catalog file exceeds runtime size limit")
@@ -922,11 +1293,15 @@ def _verify_expected_generation(
         elif not stat.S_ISDIR(metadata.st_mode):
             raise CatalogImportError("generation contains a special file")
     if actual_files != set(expected_files):
-        raise CatalogImportError("generation contents conflict with deterministic build")
+        raise CatalogImportError(
+            "generation contents conflict with deterministic build"
+        )
     for relative, expected in expected_files.items():
         path = generation_root / relative
         if _read_regular_file(path, label="generation file") != expected:
-            raise CatalogImportError("generation contents conflict with deterministic build")
+            raise CatalogImportError(
+                "generation contents conflict with deterministic build"
+            )
         if stat.S_IMODE(os.lstat(path).st_mode) != PRIVATE_FILE_MODE:
             raise CatalogImportError("generation file permissions are invalid")
 
@@ -939,10 +1314,18 @@ def _decode_pointer(payload: bytes) -> dict[str, Any]:
         "manifest",
     }:
         raise CatalogImportError("catalog pointer schema is invalid")
-    if raw.get("version") != DOCUMENT_VERSION:
+    document_version = raw.get("version")
+    if (
+        isinstance(document_version, bool)
+        or not isinstance(document_version, int)
+        or document_version not in SUPPORTED_DOCUMENT_VERSIONS
+    ):
         raise CatalogImportError("catalog pointer version is invalid")
     generation_id = raw.get("generation_id")
-    if not isinstance(generation_id, str) or _IDENTIFIER_RE.fullmatch(generation_id) is None:
+    if (
+        not isinstance(generation_id, str)
+        or _IDENTIFIER_RE.fullmatch(generation_id) is None
+    ):
         raise CatalogImportError("catalog pointer generation id is invalid")
     expected_manifest = f"generations/{generation_id}/manifest.json"
     if raw.get("manifest") != expected_manifest:
@@ -955,15 +1338,17 @@ def _verify_pointer_catalog(
     pointer_bytes: bytes,
     *,
     require_gender_active_review: bool = False,
+    allow_legacy_political_hidden: bool = False,
 ) -> str:
     pointer = _decode_pointer(pointer_bytes)
+    document_version = pointer["version"]
     generation_id = pointer["generation_id"]
     manifest_path = managed_root / pointer["manifest"]
     manifest_bytes = _read_regular_file(manifest_path, label="catalog manifest")
     manifest = _decode_json(manifest_bytes, label="catalog manifest")
     if (
         not isinstance(manifest, dict)
-        or manifest.get("version") != DOCUMENT_VERSION
+        or manifest.get("version") != document_version
         or manifest.get("generation_id") != generation_id
         or not isinstance(manifest.get("categories"), list)
     ):
@@ -973,7 +1358,10 @@ def _verify_pointer_catalog(
         if not isinstance(category, dict):
             raise CatalogImportError("catalog category descriptor is invalid")
         category_id = category.get("id")
-        if not isinstance(category_id, str) or _CATEGORY_ID_RE.fullmatch(category_id) is None:
+        if (
+            not isinstance(category_id, str)
+            or _CATEGORY_ID_RE.fullmatch(category_id) is None
+        ):
             raise CatalogImportError("catalog category id is invalid")
         if category_id in seen_categories:
             raise CatalogImportError("catalog category id is duplicated")
@@ -982,7 +1370,17 @@ def _verify_pointer_catalog(
         if policy not in DISCLOSURE_POLICIES:
             raise CatalogImportError("catalog disclosure policy is invalid")
         required_policy = KNOWN_CATEGORY_POLICIES.get(category_id)
-        if required_policy is not None and policy != required_policy:
+        legacy_political_hidden = (
+            allow_legacy_political_hidden
+            and document_version == LEGACY_DOCUMENT_VERSION
+            and category_id == "political_cn"
+            and policy == "strict_hidden"
+        )
+        if (
+            required_policy is not None
+            and policy != required_policy
+            and not legacy_political_hidden
+        ):
             raise CatalogImportError("known category disclosure policy is invalid")
         shards = category.get("shards")
         if not isinstance(shards, list):
@@ -995,9 +1393,14 @@ def _verify_pointer_catalog(
                 label="catalog shard path",
             )
             if not relative.parts or relative.parts[0] != "shards":
-                raise CatalogImportError("catalog shard path is outside shard directory")
+                raise CatalogImportError(
+                    "catalog shard path is outside shard directory"
+                )
             expected_hash = descriptor.get("sha256")
-            if not isinstance(expected_hash, str) or _SHA256_RE.fullmatch(expected_hash) is None:
+            if (
+                not isinstance(expected_hash, str)
+                or _SHA256_RE.fullmatch(expected_hash) is None
+            ):
                 raise CatalogImportError("catalog shard hash is invalid")
             shard_bytes = _read_regular_file(
                 manifest_path.parent / relative,
@@ -1008,7 +1411,7 @@ def _verify_pointer_catalog(
             shard = _decode_json(shard_bytes, label="catalog shard")
             if (
                 not isinstance(shard, dict)
-                or shard.get("version") != DOCUMENT_VERSION
+                or shard.get("version") != document_version
                 or shard.get("generation_id") != generation_id
                 or shard.get("category_id") != category_id
                 or not isinstance(shard.get("entries"), list)
@@ -1095,23 +1498,21 @@ def _publish_pointer(
     previous_bytes: bytes | None,
     expected_generation_id: str,
     require_gender_active_review: bool = False,
+    allow_legacy_political_hidden: bool = False,
 ) -> None:
     try:
         _atomic_write_private(current_path, pointer_bytes)
         published = _read_regular_file(current_path, label="catalog pointer")
         if published != pointer_bytes:
-            raise CatalogImportError(
-                "catalog pointer publication verification failed"
-            )
+            raise CatalogImportError("catalog pointer publication verification failed")
         published_generation = _verify_pointer_catalog(
             managed_root,
             published,
             require_gender_active_review=require_gender_active_review,
+            allow_legacy_political_hidden=allow_legacy_political_hidden,
         )
         if published_generation != expected_generation_id:
-            raise CatalogImportError(
-                "catalog pointer publication verification failed"
-            )
+            raise CatalogImportError("catalog pointer publication verification failed")
     except Exception as exc:
         try:
             _restore_pointer(current_path, previous_bytes)
@@ -1227,20 +1628,36 @@ def _catalog_lock(managed_root: Path) -> Iterator[None]:
             os.close(descriptor)
 
 
-def import_catalog(*, instance_root: Path, build_path: Path) -> tuple[str, PreparedGeneration]:
+def import_catalog(
+    *,
+    instance_root: Path,
+    build_path: Path,
+    include_legacy_background: bool = False,
+    allow_legacy_v1_build: bool = False,
+) -> tuple[str, PreparedGeneration]:
     root = _assert_instance_root(Path(instance_root))
     build_bytes = _read_regular_file(Path(build_path), label="private build")
-    generated_at, categories = _validate_build(
+    document_version, generated_at, categories = _validate_build(
         _decode_json(build_bytes, label="private build")
     )
+    if document_version == LEGACY_DOCUMENT_VERSION and not allow_legacy_v1_build:
+        raise CatalogImportError(
+            "new v1 catalog activation requires explicit legacy opt-in"
+        )
+    if document_version == CURRENT_DOCUMENT_VERSION and include_legacy_background:
+        raise CatalogImportError(
+            "v2 catalog does not support shadow entries; "
+            "review eligible rules into the private build"
+        )
     legacy_bytes, legacy_rules = _load_legacy_rules(root)
-    categories = _merge_legacy_rules(
-        categories,
-        legacy_rules,
-        generated_at=generated_at,
-    )
+    if include_legacy_background:
+        categories = _merge_legacy_rules(
+            categories,
+            legacy_rules,
+            generated_at=generated_at,
+        )
     _assert_merged_pattern_limit(categories)
-    prepared = _prepare_generation(generated_at, categories)
+    prepared = _prepare_generation(document_version, generated_at, categories)
     _assert_prepared_runtime_limits(prepared)
 
     data_root = root / "data"
@@ -1273,7 +1690,11 @@ def import_catalog(*, instance_root: Path, build_path: Path) -> tuple[str, Prepa
             else None
         )
         if current_bytes is not None:
-            current_generation = _verify_pointer_catalog(managed_root, current_bytes)
+            current_generation = _verify_pointer_catalog(
+                managed_root,
+                current_bytes,
+                allow_legacy_political_hidden=True,
+            )
             _verify_runtime_pointer(
                 managed_root,
                 current_bytes,
@@ -1317,12 +1738,13 @@ def rollback_catalog(*, instance_root: Path) -> str:
     current_path = managed_root / "current.json"
     with _catalog_lock(managed_root):
         current_bytes = _read_regular_file(current_path, label="catalog pointer")
-        current_generation = _verify_pointer_catalog(managed_root, current_bytes)
+        current_generation = _verify_pointer_catalog(
+            managed_root,
+            current_bytes,
+            allow_legacy_political_hidden=True,
+        )
         transaction = (
-            root
-            / "backups"
-            / "content-alert"
-            / f"before-{current_generation}"
+            root / "backups" / "content-alert" / f"before-{current_generation}"
         )
         _assert_existing_path_chain(transaction, leaf_kind="directory")
         previous = transaction / "current.json"
@@ -1337,6 +1759,7 @@ def rollback_catalog(*, instance_root: Path) -> str:
                 managed_root,
                 previous_bytes,
                 require_gender_active_review=True,
+                allow_legacy_political_hidden=True,
             )
             _verify_runtime_pointer(
                 managed_root,
@@ -1350,6 +1773,7 @@ def rollback_catalog(*, instance_root: Path) -> str:
                 previous_bytes=current_bytes,
                 expected_generation_id=previous_generation,
                 require_gender_active_review=True,
+                allow_legacy_political_hidden=True,
             )
             return previous_generation
         _restore_pointer(current_path, None)
@@ -1362,6 +1786,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--instance-root", required=True, type=Path)
     parser.add_argument("--build", type=Path)
+    parser.add_argument("--include-legacy-background", action="store_true")
+    parser.add_argument(
+        "--allow-legacy-v1-build",
+        action="store_true",
+        help=(
+            "explicitly allow a new legacy v1 activation; rollback does not "
+            "require this unsafe migration-only option"
+        ),
+    )
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--apply", action="store_true")
     modes.add_argument("--rollback", action="store_true")
@@ -1372,12 +1805,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.rollback and (
+            args.include_legacy_background or args.allow_legacy_v1_build
+        ):
+            raise CatalogImportError("legacy apply options are only valid with apply")
         if args.apply:
             if args.build is None:
                 raise CatalogImportError("apply requires a private build document")
             status, prepared = import_catalog(
                 instance_root=args.instance_root,
                 build_path=args.build,
+                include_legacy_background=args.include_legacy_background,
+                allow_legacy_v1_build=args.allow_legacy_v1_build,
             )
             print(
                 f"catalog_import={status} generation_id={prepared.generation_id} "

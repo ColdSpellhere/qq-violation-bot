@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -164,13 +167,7 @@ print(json.dumps({
             payload["background_rule_path"],
         )
         self.assertEqual(
-            str(
-                root
-                / "data"
-                / "content_alert"
-                / "managed"
-                / "current.json"
-            ),
+            str(root / "data" / "content_alert" / "managed" / "current.json"),
             payload["managed_catalog_path"],
         )
 
@@ -209,6 +206,74 @@ class LiteralKeywordEngineTests(unittest.TestCase):
             tuple(item.key for item in matcher.match_text("abc")),
         )
 
+    def test_scalable_matcher_singleton_groups_do_not_allocate_dense_owner_maps(
+        self,
+    ) -> None:
+        import tracemalloc
+
+        from plugins.content_alert.engine import ScalableLiteralMatcher
+
+        patterns = tuple((f"key-{index}", f"p{index:04d}") for index in range(500))
+        matcher = ScalableLiteralMatcher(
+            patterns,
+            max_patterns=len(patterns),
+            overlap_groups={key: f"group-{key}" for key, _pattern in patterns},
+        )
+        text = "|".join(pattern for _key, pattern in patterns)
+
+        tracemalloc.start()
+        try:
+            matches = matcher.match_text_all(text)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertEqual(len(patterns), len(matches))
+        self.assertLess(peak, 4_000_000)
+
+    def test_scalable_matcher_nested_patterns_keep_exact_longest_semantics(
+        self,
+    ) -> None:
+        from plugins.content_alert.engine import ScalableLiteralMatcher
+
+        patterns = tuple((f"key-{length:02d}", "a" * length) for length in range(1, 64))
+        matcher = ScalableLiteralMatcher(
+            patterns,
+            max_patterns=len(patterns),
+            overlap_groups={key: "same-group" for key, _pattern in patterns},
+        )
+
+        matches = matcher.match_text_all("a" * 3_000)
+
+        self.assertEqual(3_000 - 63 + 1, len(matches))
+        self.assertEqual({"key-63"}, {match.key for match in matches})
+        self.assertEqual((0, 63), (matches[0].start, matches[0].end))
+        self.assertEqual((2_937, 3_000), (matches[-1].start, matches[-1].end))
+
+    def test_scalable_matcher_fails_closed_at_text_and_candidate_budgets(self) -> None:
+        from plugins.content_alert.engine import (
+            ScalableLiteralMatcher,
+            ScalableLiteralScanLimitError,
+        )
+
+        text_limited = ScalableLiteralMatcher(
+            (("key", "safe"),),
+            max_patterns=1,
+            max_text_chars=8,
+        )
+        with self.assertRaises(ScalableLiteralScanLimitError):
+            text_limited.match_text_all("x" * 9)
+
+        patterns = tuple((f"key-{length}", "a" * length) for length in range(1, 9))
+        candidate_limited = ScalableLiteralMatcher(
+            patterns,
+            max_patterns=len(patterns),
+            max_candidates=20,
+            overlap_groups={key: f"group-{key}" for key, _term in patterns},
+        )
+        with self.assertRaises(ScalableLiteralScanLimitError):
+            candidate_limited.match_text_all("a" * 20)
+
     def test_nfkc_casefold_whitespace_and_zero_width_are_normalized(self) -> None:
         from plugins.content_alert.engine import LiteralKeywordMatcher
         from plugins.content_alert.rules import KeywordRule
@@ -220,6 +285,24 @@ class LiteralKeywordEngineTests(unittest.TestCase):
         matches = matcher.match_text("前缀 aB\u200b禁\t词 后缀")
 
         self.assertEqual(["K0001"], [item.rule_id for item in matches])
+
+    def test_default_ignorable_cgj_cannot_block_canonical_composition(self) -> None:
+        from plugins.content_alert.engine import LiteralKeywordMatcher
+        from plugins.content_alert.rules import KeywordRule
+
+        matcher = LiteralKeywordMatcher((KeywordRule(rule_id="K0001", pattern="éx"),))
+
+        matches = matcher.match_text("前缀 e\u034f\u0301x 后缀")
+
+        self.assertEqual(["K0001"], [item.rule_id for item in matches])
+
+    def test_private_use_character_is_not_removed_or_joined_for_matching(self) -> None:
+        from plugins.content_alert.engine import LiteralKeywordMatcher
+        from plugins.content_alert.rules import KeywordRule
+
+        matcher = LiteralKeywordMatcher((KeywordRule(rule_id="K0001", pattern="违禁"),))
+
+        self.assertEqual((), matcher.match_text("违\ue000禁"))
 
     def test_longest_overlapping_keyword_wins_and_distinct_hits_merge(self) -> None:
         from plugins.content_alert.engine import LiteralKeywordMatcher
@@ -485,9 +568,7 @@ class KeywordCommandTests(unittest.TestCase):
 
             responses = (
                 execute_keyword_command("/违禁词", reloaded_manual, actor="42"),
-                execute_keyword_command(
-                    "/违禁词 状态", reloaded_manual, actor="42"
-                ),
+                execute_keyword_command("/违禁词 状态", reloaded_manual, actor="42"),
                 execute_keyword_command("/违禁词 添加 a", reloaded_manual, actor="42"),
                 execute_keyword_command(
                     f"/违禁词 删除 {background.rule_id}",
@@ -542,17 +623,38 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
         def match_message(self, _message: object) -> tuple[SimpleNamespace, ...]:
             from plugins.content_alert.rules import normalize_literal_text
 
-            text = "".join(
-                str(segment.data.get("text", ""))
+            normalized_segments = tuple(
+                normalize_literal_text(str(segment.data.get("text", "")))
                 for segment in _message
                 if getattr(segment, "type", None) == "text"
             )
-            normalized_text = normalize_literal_text(text)
-            return tuple(
-                match
-                for match in self.matches
-                if normalize_literal_text(match.term) in normalized_text
-            )
+            selected: list[SimpleNamespace] = []
+            for match in self.matches:
+                normalized_term = normalize_literal_text(match.term)
+                normalized_context = normalize_literal_text(
+                    str(getattr(match, "context_term", ""))
+                )
+                if any(
+                    normalized_term in segment
+                    and (not normalized_context or normalized_context in segment)
+                    for segment in normalized_segments
+                ):
+                    selected.append(match)
+            return tuple(selected)
+
+        def scan_message(
+            self,
+            message: object,
+        ) -> tuple[bool, tuple[SimpleNamespace, ...]]:
+            active = bool(self.snapshot().has_active_generation)
+            return active, self.match_message(message) if active else ()
+
+        def match_snapshot(
+            self,
+            _snapshot: SimpleNamespace,
+            message: object,
+        ) -> tuple[SimpleNamespace, ...]:
+            return self.match_message(message)
 
     def _service(self, directory: str, *, enabled: bool = True):
         from plugins.content_alert.rules import KeywordRuleStore
@@ -573,6 +675,358 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             max_excerpt_chars=160,
         )
         return service
+
+    async def test_managed_catalog_scan_is_offloaded_from_the_event_loop(self) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        catalog = self.ManagedCatalog(())
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+            offload = AsyncMock(return_value=(True, (), False))
+            with patch("plugins.content_alert.service.asyncio.to_thread", offload):
+                delivered = await service.handle_event(
+                    self.Bot(), _group_event("安全内容")
+                )
+
+        self.assertFalse(delivered)
+        offload.assert_awaited_once()
+        from plugins.content_alert.service import _scan_managed_catalog
+
+        self.assertEqual(_scan_managed_catalog, offload.await_args.args[0])
+        self.assertIs(catalog, offload.await_args.args[1])
+
+    async def test_service_fixture_never_combines_text_across_segment_boundaries(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        match = SimpleNamespace(
+            term="合成领导姓名甲",
+            category_ids=("political_cn",),
+            category_names=("政治占位分类",),
+            disclosure_policy="management_visible",
+            subject_type="leader_name",
+            context_term="接受合成调查",
+            context_class="case_proceeding",
+        )
+        catalog = self.ManagedCatalog((match,))
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+            bot = self.Bot()
+            event = _group_event("占位")
+            event.message = Message(
+                [
+                    MessageSegment.text("合成领导姓名甲"),
+                    MessageSegment.at(BOT_USER_ID),
+                    MessageSegment.text("接受合成调查"),
+                ]
+            )
+
+            delivered = await service.handle_event(bot, event)
+
+        self.assertFalse(delivered)
+        self.assertEqual([], bot.calls)
+
+    async def test_visible_excerpt_is_prepared_off_the_event_loop(self) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        event_loop_thread = threading.get_ident()
+        excerpt_thread = event_loop_thread
+        match = SimpleNamespace(
+            term="合成领导姓名甲",
+            category_ids=("political_cn",),
+            category_names=("政治占位分类",),
+            disclosure_policy="management_visible",
+            subject_type="leader_name",
+            context_term="接受合成调查",
+            context_class="case_proceeding",
+            segment_index=0,
+            start=0,
+            end=12,
+        )
+        catalog = self.ManagedCatalog((match,))
+
+        def prepare_excerpt(*_args: object, **_kwargs: object) -> str:
+            nonlocal excerpt_thread
+            excerpt_thread = threading.get_ident()
+            return "合成摘录"
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+            bot = self.Bot()
+            with patch(
+                "plugins.content_alert.service._message_excerpt",
+                side_effect=prepare_excerpt,
+            ):
+                delivered = await service.handle_event(
+                    bot,
+                    _group_event("合成领导姓名甲接受合成调查"),
+                )
+
+        self.assertTrue(delivered)
+        self.assertNotEqual(event_loop_thread, excerpt_thread)
+        self.assertIn("内容摘录：合成摘录", str(bot.calls[0]["message"]))
+
+    async def test_managed_snapshot_is_offloaded_and_inactive_catalog_uses_fallback(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        event_loop_thread = threading.get_ident()
+
+        class ThreadCheckingCatalog(self.ManagedCatalog):
+            snapshot_thread = event_loop_thread
+
+            def snapshot(self) -> SimpleNamespace:
+                self.snapshot_thread = threading.get_ident()
+                return super().snapshot()
+
+        catalog = ThreadCheckingCatalog((), active=False)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            background_store = KeywordRuleStore(root / "background_keywords.json")
+            background_store.add("旧版后台占位词", actor="legacy-import")
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(root / "keywords.json"),
+                background_rule_store=background_store,
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event("旧版后台占位词"),
+            )
+
+        self.assertTrue(delivered)
+        self.assertNotEqual(event_loop_thread, catalog.snapshot_thread)
+        self.assertEqual(1, len(bot.calls))
+
+    async def test_runtime_switch_is_rechecked_after_managed_scan_before_delivery(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        enabled = True
+        match = SimpleNamespace(
+            term="普通占位词甲",
+            category_ids=("controversial_topics",),
+            category_names=("普通占位分类三",),
+            disclosure_policy="management_visible",
+        )
+        catalog = self.ManagedCatalog((match,))
+
+        async def turn_off_during_scan(
+            *_args: object,
+        ) -> tuple[bool, tuple[SimpleNamespace, ...], bool]:
+            nonlocal enabled
+            enabled = False
+            return True, (match,), False
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: enabled,
+                clock=lambda: 2_000,
+            )
+            bot = self.Bot()
+            with patch(
+                "plugins.content_alert.service.asyncio.to_thread",
+                side_effect=turn_off_during_scan,
+            ):
+                delivered = await service.handle_event(
+                    bot,
+                    _group_event("普通占位词甲"),
+                )
+
+        self.assertFalse(delivered)
+        self.assertEqual([], bot.calls)
+
+    async def test_event_age_is_rechecked_after_managed_scan_before_delivery(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        now = 2_000
+        match = SimpleNamespace(
+            term="普通占位词甲",
+            category_ids=("controversial_topics",),
+            category_names=("普通占位分类三",),
+            disclosure_policy="management_visible",
+        )
+        catalog = self.ManagedCatalog((match,))
+
+        async def age_event_during_scan(
+            *_args: object,
+        ) -> tuple[bool, tuple[SimpleNamespace, ...], bool]:
+            nonlocal now
+            now = 2_301
+            return True, (match,), False
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: now,
+                max_event_age_seconds=300,
+            )
+            bot = self.Bot()
+            with patch(
+                "plugins.content_alert.service.asyncio.to_thread",
+                side_effect=age_event_during_scan,
+            ):
+                delivered = await service.handle_event(
+                    bot,
+                    _group_event("普通占位词甲"),
+                )
+
+        self.assertFalse(delivered)
+        self.assertEqual([], bot.calls)
+
+    async def test_managed_scans_have_a_small_per_service_concurrency_limit(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        active = 0
+        maximum_active = 0
+        match = SimpleNamespace(
+            term="普通占位词甲",
+            category_ids=("controversial_topics",),
+            category_names=("普通占位分类三",),
+            disclosure_policy="management_visible",
+        )
+        catalog = self.ManagedCatalog((match,))
+
+        async def controlled_offload(
+            function: Callable[..., object],
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            from plugins.content_alert.service import _scan_managed_catalog
+
+            if function is _scan_managed_catalog:
+                return True, (match,), False
+            return function(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+            bot = self.Bot()
+            with patch(
+                "plugins.content_alert.service.asyncio.to_thread",
+                side_effect=controlled_offload,
+            ):
+                delivered = await asyncio.gather(
+                    *(
+                        service.handle_event(
+                            bot,
+                            _group_event(
+                                "普通占位词甲",
+                                message_id=message_id,
+                            ),
+                        )
+                        for message_id in (501, 502, 503)
+                    )
+                )
+
+        self.assertEqual([True, True, True], delivered)
+        self.assertLessEqual(maximum_active, 2)
+        self.assertEqual(3, len(bot.calls))
+
+    async def test_managed_scan_limit_sends_one_hidden_protection_alert(self) -> None:
+        from plugins.content_alert.engine import ScalableLiteralScanLimitError
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        class LimitedCatalog(self.ManagedCatalog):
+            def match_snapshot(
+                self,
+                _snapshot: SimpleNamespace,
+                _message: object,
+            ) -> tuple[SimpleNamespace, ...]:
+                raise ScalableLiteralScanLimitError("candidate_limit")
+
+        catalog = LimitedCatalog(())
+        secret_input = "合成超限输入" * 100
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(bot, _group_event(secret_input))
+
+        self.assertTrue(delivered)
+        self.assertEqual(1, len(bot.calls))
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn("关键词扫描保护告警", report)
+        self.assertIn("未判定具体词条", report)
+        self.assertIn(f"QQ：{MEMBER_USER_ID}", report)
+        self.assertIn("内容摘录：（内容已隐藏）", report)
+        self.assertNotIn(secret_input, report)
 
     async def test_matching_message_sends_one_plain_text_alert_without_ai(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -731,7 +1185,7 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(excerpt_line.removeprefix("内容摘录：")), 49)
         self.assertLessEqual(len(report), 1_800)
 
-    async def test_political_or_mixed_catalog_hit_identifies_sender_but_hides_content(
+    async def test_political_or_mixed_catalog_hit_shows_sender_term_and_bounded_excerpt(
         self,
     ) -> None:
         from plugins.content_alert.rules import KeywordRuleStore
@@ -739,18 +1193,12 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
 
         manual_term = "人工占位词甲"
         visible_term = "普通占位词乙"
-        protected_term = "受保护占位词丙"
+        political_term = "政治完整占位词丙"
         internal_tokens = (
-            manual_term,
-            visible_term,
-            protected_term,
-            "普通占位分类二",
-            "受保护占位分类",
             "gender_conflict",
             "political_cn",
             "synthetic-generation",
             "shards/political_cn-0001.json",
-            "完整原文尾部",
         )
         catalog = self.ManagedCatalog(
             (
@@ -761,10 +1209,10 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
                     disclosure_policy="management_visible",
                 ),
                 SimpleNamespace(
-                    term=protected_term,
+                    term=political_term,
                     category_ids=("political_cn",),
-                    category_names=("受保护占位分类",),
-                    disclosure_policy="strict_hidden",
+                    category_names=("政治占位分类",),
+                    disclosure_policy="management_visible",
                 ),
             )
         )
@@ -780,13 +1228,15 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
                 runtime_enabled=lambda: True,
                 clock=lambda: 2_000,
                 max_event_age_seconds=300,
+                max_excerpt_chars=64,
             )
             bot = self.Bot()
 
             delivered = await service.handle_event(
                 bot,
                 _group_event(
-                    f"{manual_term} {visible_term} {protected_term} 完整原文尾部",
+                    f"{manual_term} {visible_term} {political_term} "
+                    + "无害占位尾部" * 80,
                     nickname="合成敏感昵称",
                 ),
             )
@@ -802,28 +1252,516 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             f"发送者：合成敏感昵称（QQ：{MEMBER_USER_ID}）",
             report,
         )
-        self.assertIn("内容已隐藏", report)
-        self.assertIn("政治敏感规则命中（词条与详情已隐藏）", report)
+        self.assertIn(f"政治占位分类：{political_term}", report)
+        self.assertIn(f"K0001：{manual_term}", report)
+        self.assertIn(f"普通占位分类二：{visible_term}", report)
+        excerpt_line = next(
+            line for line in report.splitlines() if line.startswith("内容摘录：")
+        )
+        self.assertIn(political_term, excerpt_line)
+        self.assertLessEqual(len(excerpt_line.removeprefix("内容摘录：")), 65)
+        self.assertNotIn("内容已隐藏", report)
         self.assertNotIn("昵称已隐藏", report)
         self.assertIn("消息ID：456", report)
         for token in internal_tokens:
             self.assertNotIn(token, report)
         self.assertLessEqual(len(report), 1_800)
 
-    async def test_political_category_forces_hidden_disclosure_if_policy_is_wrong(
+    async def test_v2_leader_match_renders_compound_reason_and_centered_excerpt(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore, normalize_literal_text
+        from plugins.content_alert.service import ContentAlertService
+
+        leader = "合成领导甲"
+        context = "接受审查调查"
+        text = f"{'无害长前缀' * 30}{leader}随后{context}{'无害长后缀' * 30}"
+        normalized = normalize_literal_text(text)
+        start = normalized.index(normalize_literal_text(leader))
+        end = normalized.index(normalize_literal_text(context)) + len(
+            normalize_literal_text(context)
+        )
+        catalog = self.ManagedCatalog(
+            (
+                SimpleNamespace(
+                    term=leader,
+                    category_ids=("political_cn",),
+                    category_names=("政治敏感",),
+                    disclosure_policy="management_visible",
+                    subject_type="leader_name",
+                    match_mode="same_segment_context",
+                    context_term=context,
+                    context_class="case_proceeding",
+                    segment_index=0,
+                    start=start,
+                    end=end,
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+                max_event_age_seconds=300,
+                max_excerpt_chars=48,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(bot, _group_event(text))
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn(
+            f"省部级及以上姓名+案件语境：{leader} / {context}",
+            report,
+        )
+        excerpt_line = next(
+            line for line in report.splitlines() if line.startswith("内容摘录：")
+        )
+        excerpt = excerpt_line.removeprefix("内容摘录：")
+        self.assertIn(leader, excerpt)
+        self.assertIn(context, excerpt)
+        self.assertTrue(excerpt.startswith("…"))
+        self.assertTrue(excerpt.endswith("…"))
+        self.assertLessEqual(len(excerpt), 49)
+        self.assertIn("keyword-literal-context-v2（未调用 AI）", report)
+
+    async def test_maximum_visible_compound_matches_preserve_report_structure(
         self,
     ) -> None:
         from plugins.content_alert.rules import KeywordRuleStore
         from plugins.content_alert.service import ContentAlertService
 
-        protected_term = "受保护占位词己"
+        managed_matches = tuple(
+            SimpleNamespace(
+                term=f"姓名{index:02d}" + "甲" * 60,
+                category_ids=("political_cn",),
+                category_names=("政治占位分类" + "乙" * 24,),
+                disclosure_policy="management_visible",
+                subject_type="leader_name",
+                match_mode="same_segment_context",
+                context_term=f"语境{index:02d}" + "丙" * 60,
+                context_class="case_proceeding",
+                segment_index=0,
+                start=0,
+                end=1,
+            )
+            for index in range(12)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+            event = _group_event("用于验证告警报告结构的占位消息")
+
+            report = service._build_report(
+                event,
+                (),
+                managed_matches=managed_matches,
+                political_alert=True,
+                prepared_excerpt="用于验证告警报告结构的占位消息",
+            )
+
+        self.assertLessEqual(len(report), 1_800)
+        self.assertIn("消息时间：1970-01-01 08:33:20", report)
+        self.assertIn("消息ID：456", report)
+        self.assertIn(
+            "内容摘录：用于验证告警报告结构的占位消息",
+            report,
+        )
+        self.assertIn(
+            "检测器：keyword-literal-context-v2（未调用 AI）",
+            report,
+        )
+        self.assertIn(
+            "处置状态：仅告警，未自动撤回、禁言或记录违规",
+            report,
+        )
+        match_line = next(
+            line for line in report.splitlines() if line.startswith("命中规则：")
+        )
+        displayed = 0
+        for index, match in enumerate(managed_matches):
+            marker = f"姓名{index:02d}"
+            if marker not in match_line:
+                continue
+            displayed += 1
+            self.assertIn(match.term, match_line)
+            self.assertIn(match.context_term, match_line)
+        self.assertLess(displayed, len(managed_matches))
+        self.assertTrue(
+            match_line.endswith(f"另有 {len(managed_matches) - displayed} 项受控规则")
+        )
+
+    async def test_v2_historical_event_direct_match_uses_v2_detector_label(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        event_term = "合成历史事件占位词"
+        catalog = self.ManagedCatalog(
+            (
+                SimpleNamespace(
+                    term=event_term,
+                    category_ids=("political_cn",),
+                    category_names=("历史事件",),
+                    disclosure_policy="management_visible",
+                    subject_type="historical_event",
+                    match_mode="direct",
+                    context_term="",
+                    context_class="",
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event(f"消息中含{event_term}"),
+            )
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn("keyword-literal-v2-direct（未调用 AI）", report)
+        self.assertNotIn("keyword-literal-v1（未调用 AI）", report)
+
+    async def test_political_match_precedes_manual_matches_in_report_budget(
+        self,
+    ) -> None:
+        from plugins.content_alert.engine import KeywordMatch
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        manual_matches = tuple(
+            KeywordMatch(
+                rule_id=f"K{index:04d}",
+                pattern=f"人工{index:02d}" + "甲" * 60,
+                start=0,
+                end=64,
+            )
+            for index in range(20)
+        )
+        political_term = "政治" + "乙" * 62
+        managed_match = SimpleNamespace(
+            term=political_term,
+            category_ids=("political_cn",),
+            category_names=("历史事件",),
+            disclosure_policy="management_visible",
+            subject_type="historical_event",
+            match_mode="direct",
+            context_term="",
+            context_class="",
+        )
+        label = "群" * 64
+        nickname = "昵称" * 32
+        excerpt = "摘" * 160
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                source_group_labels={SOURCE_GROUP_ID: label},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+
+            report = service._build_report(
+                _group_event("占位", nickname=nickname),
+                manual_matches,
+                managed_matches=(managed_match,),
+                political_alert=True,
+                prepared_excerpt=excerpt,
+            )
+
+        self.assertLessEqual(len(report), 1_800)
+        match_line = next(
+            line for line in report.splitlines() if line.startswith("命中规则：")
+        )
+        self.assertIn(f"历史事件：{political_term}", match_line)
+        displayed_manual = sum(match.pattern in match_line for match in manual_matches)
+        self.assertLess(displayed_manual, len(manual_matches))
+        self.assertIn(
+            f"另有 {len(manual_matches) - displayed_manual} 项人工规则",
+            match_line,
+        )
+        self.assertIn("消息时间：1970-01-01 08:33:20", report)
+        self.assertIn("消息ID：456", report)
+        self.assertIn(f"内容摘录：{excerpt}", report)
+        self.assertIn("检测器：keyword-literal-v2-direct（未调用 AI）", report)
+        self.assertIn(
+            "处置状态：仅告警，未自动撤回、禁言或记录违规",
+            report,
+        )
+
+    async def test_transparent_unicode_composition_far_from_hit_keeps_excerpt_focused(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore, normalize_literal_text
+        from plugins.content_alert.service import ContentAlertService
+
+        leader = "合成领导乙"
+        context = "进入合成程序"
+        prefixes = (
+            "e\u0301",
+            "e \u0301",
+            "e\u200d\u0301",
+            "e\u00b4",
+            "A\u00a0\u030a",
+            "\u1100\u200b\u1161\u11a8",
+            "\u1100\u2065\u1161",
+            "\u1100\ufff0\u1161",
+        )
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix.encode("unicode_escape").decode("ascii")):
+                text = (
+                    f"{'无害长前缀' * 30}{prefix}{'安全填充' * 30}"
+                    f"{leader}随后{context}{'无害长后缀' * 30}"
+                )
+                normalized = normalize_literal_text(text)
+                start = normalized.index(normalize_literal_text(leader))
+                end = normalized.index(normalize_literal_text(context)) + len(
+                    normalize_literal_text(context)
+                )
+                catalog = self.ManagedCatalog(
+                    (
+                        SimpleNamespace(
+                            term=leader,
+                            category_ids=("political_cn",),
+                            category_names=("政治占位分类",),
+                            disclosure_policy="management_visible",
+                            subject_type="leader_name",
+                            match_mode="same_segment_context",
+                            context_term=context,
+                            context_class="case_proceeding",
+                            segment_index=0,
+                            start=start,
+                            end=end,
+                        ),
+                    )
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    service = ContentAlertService(
+                        rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                        managed_catalog=catalog,
+                        source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                        report_group_id=REPORT_GROUP_ID,
+                        peer_bot_user_ids=(),
+                        runtime_enabled=lambda: True,
+                        clock=lambda: 2_000,
+                        max_event_age_seconds=300,
+                        max_excerpt_chars=48,
+                    )
+                    bot = self.Bot()
+
+                    delivered = await service.handle_event(bot, _group_event(text))
+
+                self.assertTrue(delivered)
+                report = str(Message(bot.calls[0]["message"])[0].data["text"])
+                excerpt = next(
+                    line.removeprefix("内容摘录：")
+                    for line in report.splitlines()
+                    if line.startswith("内容摘录：")
+                )
+                self.assertIn(leader, excerpt)
+                self.assertIn(context, excerpt)
+                self.assertLessEqual(len(excerpt), 49)
+
+    def test_normalized_span_mapping_does_not_overmerge_hangul_starters(self) -> None:
+        from plugins.content_alert.rules import normalize_literal_text
+        from plugins.content_alert.service import _normalized_original_spans
+
+        raw = "\u1100" * 20 + "\u1161"
+        spans = _normalized_original_spans(raw)
+
+        self.assertEqual(len(normalize_literal_text(raw)), len(spans))
+        self.assertEqual((0, 1), spans[0])
+        self.assertEqual((19, 21), spans[-1])
+        self.assertNotIn((0, len(raw)), spans)
+
+    def test_focused_excerpt_covers_reordered_combining_mark_raw_span(self) -> None:
+        from plugins.content_alert.rules import normalize_literal_text
+        from plugins.content_alert.service import _focused_message_excerpt
+
+        raw = "a\u0315\u0300"
+        self.assertEqual("à\u0315", normalize_literal_text(raw))
+        excerpt = _focused_message_excerpt(
+            _group_event(raw),
+            focus=SimpleNamespace(segment_index=0, start=0, end=2),
+            limit=3,
+        )
+
+        self.assertEqual("à\u0315", excerpt)
+
+    def test_centered_excerpt_preserves_focus_after_nfkc_expansion(self) -> None:
+        from plugins.content_alert.service import _centered_one_line
+
+        focus = "合成领导姓名甲合成案件语境"
+        raw = "\ufdfa" * 80 + focus + "尾" * 80
+        excerpt = _centered_one_line(
+            raw,
+            raw_start=80,
+            raw_end=80 + len(focus),
+            limit=160,
+        )
+
+        self.assertIn(focus, excerpt)
+        self.assertLessEqual(len(excerpt), 160)
+
+    def test_centered_excerpt_preserves_whitespace_at_focus_boundaries(self) -> None:
+        from plugins.content_alert.service import _centered_one_line
+
+        raw = "前文 目标 后文"
+        excerpt = _centered_one_line(
+            raw,
+            raw_start=3,
+            raw_end=5,
+            limit=32,
+        )
+
+        self.assertEqual("前文 目标 后文", excerpt)
+
+    def test_match_rendering_never_walks_past_the_display_cap(self) -> None:
+        from plugins.content_alert.service import _render_matches
+
+        visible = tuple(
+            SimpleNamespace(
+                term=f"普通占位词{index}",
+                category_names=("普通占位分类",),
+                context_term="",
+                context_class="",
+                subject_type="historical_event",
+            )
+            for index in range(12)
+        )
+
+        class ExplodingMatch:
+            @property
+            def term(self) -> str:
+                raise AssertionError("renderer walked beyond its display cap")
+
+        rendered = _render_matches(
+            (),
+            managed_matches=(*visible, ExplodingMatch()),
+            strict_hidden=False,
+        )
+
+        self.assertIn("另有 1 项受控规则", rendered)
+
+    def test_political_match_is_selected_before_managed_display_cap(self) -> None:
+        from plugins.content_alert.service import _render_matches
+
+        ordinary = tuple(
+            SimpleNamespace(
+                term=f"普通占位词{index:02d}",
+                category_ids=("ordinary",),
+                category_names=("普通分类",),
+                context_term="",
+                context_class="",
+                subject_type="historical_event",
+            )
+            for index in range(12)
+        )
+        political_term = "政治占位词优先"
+        political = SimpleNamespace(
+            term=political_term,
+            category_ids=("political_cn",),
+            category_names=("历史事件",),
+            context_term="",
+            context_class="",
+            subject_type="historical_event",
+        )
+
+        rendered = _render_matches(
+            (),
+            managed_matches=(*ordinary, political),
+            strict_hidden=False,
+            political_alert=True,
+        )
+
+        self.assertIn(f"历史事件：{political_term}", rendered)
+        self.assertIn("另有 1 项受控规则", rendered)
+
+    async def test_political_category_does_not_force_hidden_disclosure(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        political_term = "政治完整占位词己"
+        catalog = self.ManagedCatalog(
+            (
+                SimpleNamespace(
+                    term=political_term,
+                    category_ids=("political_cn",),
+                    category_names=("政治占位分类",),
+                    disclosure_policy="management_visible",
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+                max_event_age_seconds=300,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event(
+                    f"消息中含{political_term}且有完整原文",
+                    nickname="安全测试昵称",
+                ),
+            )
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn("【蜂巢政治敏感告警】", report)
+        self.assertIn(f"政治占位分类：{political_term}", report)
+        self.assertIn(f"发送者：安全测试昵称（QQ：{MEMBER_USER_ID}）", report)
+        self.assertIn(f"内容摘录：消息中含{political_term}且有完整原文", report)
+        self.assertNotIn("内容已隐藏", report)
+
+    async def test_legacy_strict_hidden_political_match_keeps_details_hidden(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        protected_term = "旧版受保护占位词"
         catalog = self.ManagedCatalog(
             (
                 SimpleNamespace(
                     term=protected_term,
                     category_ids=("political_cn",),
-                    category_names=("错误披露策略占位分类",),
-                    disclosure_policy="management_visible",
+                    category_names=("旧版受保护占位分类",),
+                    disclosure_policy="strict_hidden",
                 ),
             )
         )
@@ -844,20 +1782,22 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
                 bot,
                 _group_event(
                     f"消息中含{protected_term}且有完整原文",
-                    nickname="安全测试昵称",
+                    nickname="普通测试昵称",
                 ),
             )
 
         self.assertTrue(delivered)
         report = str(Message(bot.calls[0]["message"])[0].data["text"])
         self.assertIn("【蜂巢政治敏感告警】", report)
+        self.assertIn(
+            f"发送者：普通测试昵称（QQ：{MEMBER_USER_ID}）",
+            report,
+        )
         self.assertIn("内容摘录：（内容已隐藏）", report)
         self.assertIn("政治敏感规则命中（词条与详情已隐藏）", report)
         self.assertNotIn(protected_term, report)
-        self.assertNotIn("错误披露策略占位分类", report)
-        self.assertNotIn("完整原文", report)
 
-    async def test_political_alert_hides_protected_sender_name_but_keeps_qq(
+    async def test_strict_hidden_catalog_alert_hides_sender_rule_and_excerpt(
         self,
     ) -> None:
         from plugins.content_alert.rules import KeywordRuleStore
@@ -868,7 +1808,7 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             (
                 SimpleNamespace(
                     term=protected_term,
-                    category_ids=("political_cn",),
+                    category_ids=("restricted_internal",),
                     category_names=("受保护占位分类",),
                     disclosure_policy="strict_hidden",
                 ),
@@ -891,7 +1831,65 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
                 bot,
                 _group_event(
                     f"消息中含{protected_term}",
-                    nickname=f"成员-{protected_term}",
+                    nickname="普通测试昵称",
+                ),
+            )
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn("【蜂巢关键词违禁告警】", report)
+        self.assertIn(
+            f"发送者：昵称已隐藏（QQ：{MEMBER_USER_ID}）",
+            report,
+        )
+        self.assertIn("受保护规则命中（详情已隐藏）", report)
+        self.assertIn("内容摘录：（内容已隐藏）", report)
+        self.assertNotIn(protected_term, report)
+        self.assertNotIn("受保护占位分类", report)
+        self.assertNotIn("普通测试昵称", report)
+
+    async def test_strict_hidden_match_still_hides_mixed_political_alert(
+        self,
+    ) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        political_term = "政治完整占位词戊"
+        protected_term = "受保护占位词辛"
+        catalog = self.ManagedCatalog(
+            (
+                SimpleNamespace(
+                    term=political_term,
+                    category_ids=("political_cn",),
+                    category_names=("政治占位分类",),
+                    disclosure_policy="management_visible",
+                ),
+                SimpleNamespace(
+                    term=protected_term,
+                    category_ids=("restricted_internal",),
+                    category_names=("受保护占位分类",),
+                    disclosure_policy="strict_hidden",
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+                max_event_age_seconds=300,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event(
+                    f"消息中含{political_term}和{protected_term}",
+                    nickname="普通测试昵称",
                 ),
             )
 
@@ -899,34 +1897,38 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
         report = str(Message(bot.calls[0]["message"])[0].data["text"])
         self.assertIn("【蜂巢政治敏感告警】", report)
         self.assertIn(
-            f"发送者：昵称含受保护内容，已隐藏（QQ：{MEMBER_USER_ID}）",
+            f"发送者：普通测试昵称（QQ：{MEMBER_USER_ID}）",
             report,
         )
+        self.assertIn("内容摘录：（内容已隐藏）", report)
+        self.assertNotIn(political_term, report)
         self.assertNotIn(protected_term, report)
 
-    async def test_political_alert_scans_full_sender_name_before_display_truncation(
+    async def test_strict_hidden_sender_name_cannot_bypass_with_variation_marks(
         self,
     ) -> None:
         from plugins.content_alert.rules import KeywordRuleStore
         from plugins.content_alert.service import ContentAlertService
 
-        protected_term = "受保护占位词戊"
-        # The matcher removes Cf characters, while report rendering also drops
-        # other controls.  Put both across the display limit so the privacy
-        # check must cover the full rendered form, not only raw or truncated
-        # nickname text.
-        split_protected_term = "\u200b\x01".join(protected_term)
-        nickname = "安" * 60 + split_protected_term + "尾部"
+        political_term = "政治完整占位词壬"
+        protected_term = "受保护占位昵称"
         catalog = self.ManagedCatalog(
             (
                 SimpleNamespace(
-                    term=protected_term,
+                    term=political_term,
                     category_ids=("political_cn",),
+                    category_names=("政治占位分类",),
+                    disclosure_policy="management_visible",
+                ),
+                SimpleNamespace(
+                    term=protected_term,
+                    category_ids=("restricted_internal",),
                     category_names=("受保护占位分类",),
                     disclosure_policy="strict_hidden",
                 ),
             )
         )
+        disguised_name = "\ufe0f".join(protected_term)
         with tempfile.TemporaryDirectory() as directory:
             service = ContentAlertService(
                 rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
@@ -943,8 +1945,8 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             delivered = await service.handle_event(
                 bot,
                 _group_event(
-                    f"消息中含{protected_term}",
-                    nickname=nickname,
+                    f"消息中含{political_term}和{protected_term}",
+                    nickname=disguised_name,
                 ),
             )
 
@@ -954,24 +1956,107 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             f"发送者：昵称含受保护内容，已隐藏（QQ：{MEMBER_USER_ID}）",
             report,
         )
-        self.assertNotIn("安" * 20, report)
-        self.assertNotIn(protected_term, report)
+        self.assertNotIn(disguised_name, report)
 
-    async def test_political_sender_scan_failure_hides_name_but_keeps_qq(self) -> None:
+    async def test_sender_redaction_uses_same_managed_snapshot_as_message_scan(
+        self,
+    ) -> None:
         from plugins.content_alert.rules import KeywordRuleStore
         from plugins.content_alert.service import ContentAlertService
 
-        protected_term = "受保护占位词庚"
+        political_term = "政治完整占位词快照"
+        protected_term = "受保护占位昵称快照"
+
+        class SwitchingCatalog(self.ManagedCatalog):
+            def __init__(self) -> None:
+                old_matches = (
+                    SimpleNamespace(
+                        term=political_term,
+                        category_ids=("political_cn",),
+                        category_names=("政治占位分类",),
+                        disclosure_policy="management_visible",
+                    ),
+                    SimpleNamespace(
+                        term=protected_term,
+                        category_ids=("restricted_internal",),
+                        category_names=("受保护占位分类",),
+                        disclosure_policy="strict_hidden",
+                    ),
+                )
+                super().__init__(old_matches)
+                self._snapshot = SimpleNamespace(
+                    has_active_generation=True,
+                    generation_id="synthetic-old-generation",
+                    matches=old_matches,
+                )
+                self.calls = 0
+
+            def match_snapshot(
+                self,
+                snapshot: SimpleNamespace,
+                value: object,
+            ) -> tuple[SimpleNamespace, ...]:
+                self.calls += 1
+                current_matches = self.matches
+                self.matches = tuple(snapshot.matches)
+                try:
+                    result = super().match_message(value)
+                finally:
+                    self.matches = current_matches
+                if self.calls == 1:
+                    # Simulate a pointer switch immediately after the source
+                    # message scan. Sender redaction must stay on that snapshot.
+                    self._snapshot = SimpleNamespace(
+                        has_active_generation=True,
+                        generation_id="synthetic-new-generation",
+                        matches=(),
+                    )
+                return result
+
+        catalog = SwitchingCatalog()
+        with tempfile.TemporaryDirectory() as directory:
+            service = ContentAlertService(
+                rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
+                managed_catalog=catalog,
+                source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
+                report_group_id=REPORT_GROUP_ID,
+                peer_bot_user_ids=(),
+                runtime_enabled=lambda: True,
+                clock=lambda: 2_000,
+            )
+            bot = self.Bot()
+
+            delivered = await service.handle_event(
+                bot,
+                _group_event(
+                    f"消息中含{political_term}和{protected_term}",
+                    nickname=protected_term,
+                ),
+            )
+
+        self.assertTrue(delivered)
+        report = str(Message(bot.calls[0]["message"])[0].data["text"])
+        self.assertIn(
+            f"发送者：昵称含受保护内容，已隐藏（QQ：{MEMBER_USER_ID}）",
+            report,
+        )
+        self.assertNotIn(protected_term, report)
+
+    async def test_visible_political_alert_does_not_rescan_sender_name(self) -> None:
+        from plugins.content_alert.rules import KeywordRuleStore
+        from plugins.content_alert.service import ContentAlertService
+
+        political_term = "政治完整占位词庚"
 
         class FailingNameCatalog(self.ManagedCatalog):
             def __init__(self) -> None:
                 super().__init__(
                     (
                         SimpleNamespace(
-                            term=protected_term,
+                            term=political_term,
                             category_ids=("political_cn",),
-                            category_names=("受保护占位分类",),
-                            disclosure_policy="strict_hidden",
+                            category_names=("政治占位分类",),
+                            disclosure_policy="management_visible",
                         ),
                     )
                 )
@@ -983,10 +2068,11 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
                     raise RuntimeError("synthetic sender scan failure")
                 return super().match_message(value)
 
+        catalog = FailingNameCatalog()
         with tempfile.TemporaryDirectory() as directory:
             service = ContentAlertService(
                 rule_store=KeywordRuleStore(Path(directory) / "keywords.json"),
-                managed_catalog=FailingNameCatalog(),
+                managed_catalog=catalog,
                 source_group_labels={SOURCE_GROUP_ID: "蜂巢"},
                 report_group_id=REPORT_GROUP_ID,
                 peer_bot_user_ids=(),
@@ -999,19 +2085,20 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             delivered = await service.handle_event(
                 bot,
                 _group_event(
-                    f"消息中含{protected_term}",
+                    f"消息中含{political_term}",
                     nickname="原本安全的昵称",
                 ),
             )
 
         self.assertTrue(delivered)
+        self.assertEqual(1, catalog.calls)
         report = str(Message(bot.calls[0]["message"])[0].data["text"])
         self.assertIn(
-            f"发送者：昵称含受保护内容，已隐藏（QQ：{MEMBER_USER_ID}）",
+            f"发送者：原本安全的昵称（QQ：{MEMBER_USER_ID}）",
             report,
         )
-        self.assertNotIn("原本安全的昵称", report)
-        self.assertNotIn(protected_term, report)
+        self.assertIn(f"政治占位分类：{political_term}", report)
+        self.assertIn(f"内容摘录：消息中含{political_term}", report)
 
     async def test_active_managed_generation_disables_legacy_background_fallback(
         self,
@@ -1112,9 +2199,7 @@ class ContentAlertMatcherTests(unittest.IsolatedAsyncioTestCase):
                     new=AsyncMock(),
                 ) as finish,
             ):
-                await matcher.handle_keyword_command(
-                    _private_event("/违禁词 列表")
-                )
+                await matcher.handle_keyword_command(_private_event("/违禁词 列表"))
 
         finish.assert_awaited_once()
         response = finish.await_args.args[0]
