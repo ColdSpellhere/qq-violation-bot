@@ -19,6 +19,7 @@ from .client import describe_image
 from .download import download_chat_image, write_chat_image
 from .paths import exact_configured_root, validate_existing_managed_root
 from .store import ChatImageAsset, ChatVisionStore
+from .storage_io import drain_storage_calls, storage_call
 
 if TYPE_CHECKING:
     from typing import Any
@@ -32,6 +33,7 @@ _RETRY_BASE_SECONDS = 5.0
 _WORKER_POLL_SECONDS = 1.0
 _workers: list[asyncio.Task[None]] = []
 _wake: asyncio.Event | None = None
+_lifecycle_lock: asyncio.Lock | None = None
 _RECOVERY_BATCH_SIZE = 50
 _LIVE_EVENT_FUTURE_SKEW_SECONDS = 5 * 60
 
@@ -114,16 +116,16 @@ async def cleanup_expired(store: ChatVisionStore, root: Path, *, now_text: str) 
     if root is None:
         return
     if not root.exists():
-        for asset in store.expired(now_text):
+        for asset in await storage_call(store.expired, now_text):
             relative_path = Path(asset.relative_path or "")
             if not relative_path.is_absolute() and not any(part in {"", ".", ".."} for part in relative_path.parts):
-                store.mark_deleted(asset.id, now_text)
+                await storage_call(store.mark_deleted, asset.id, now_text)
         return
     safe_root = _safe_root(root)
     if safe_root is None:
         return
     root, root_resolved = safe_root
-    for asset in store.expired(now_text):
+    for asset in await storage_call(store.expired, now_text):
         if asset.relative_path is None:
             continue
         relative_path = Path(asset.relative_path)
@@ -141,7 +143,7 @@ async def cleanup_expired(store: ChatVisionStore, root: Path, *, now_text: str) 
         try:
             mode = candidate.lstat().st_mode
         except FileNotFoundError:
-            store.mark_deleted(asset.id, now_text)
+            await storage_call(store.mark_deleted, asset.id, now_text)
             continue
         except OSError:
             continue
@@ -154,7 +156,7 @@ async def cleanup_expired(store: ChatVisionStore, root: Path, *, now_text: str) 
             pass
         except OSError:
             continue
-        store.mark_deleted(asset.id, now_text)
+        await storage_call(store.mark_deleted, asset.id, now_text)
 
 
 def _image_segments(event: GroupMessageEvent) -> list[tuple[int, str]]:
@@ -245,7 +247,7 @@ async def _finish_claim(
             image=image,
         )
         try:
-            store.mark_downloaded(
+            await storage_call(store.mark_downloaded,
                 asset.id,
                 relative_path,
                 image.mime_type,
@@ -271,13 +273,30 @@ async def _finish_claim(
     )
     if not _allowed(asset.group_id):
         raise VisionGateClosed()
-    store.mark_ready(asset.id, description)
+    await storage_call(store.mark_ready, asset.id, description)
 
 
 def _allowed(group_id: int) -> bool:
     return (bool(getattr(CONFIG, "chat_vision_enabled", True))
         and FEATURES.image_understanding_allowed()
         and bool(getattr(FEATURES, "group_chat_allowed", lambda _group: True)(group_id)))
+
+
+async def _claim_asset(store: ChatVisionStore, asset_id: int) -> ChatImageAsset | None:
+    # Claim completion decides ownership. A cancelled losing claimant must not
+    # release a different worker's claim for the same asset.
+    task = asyncio.create_task(storage_call(store.claim, asset_id, CONFIG.chat_vision_max_retries),
+        name="chat-vision-claim")
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        try:
+            claimed = await task
+            if claimed is not None:
+                await storage_call(store.release_claim, asset_id)
+        except Exception as exc:
+            logger.warning(f"群聊图片取消领取清理失败 asset_id={asset_id} error={type(exc).__name__}")
+        raise cancelled
 
 
 async def process_pending_asset(
@@ -294,22 +313,25 @@ async def process_pending_asset(
             if not _allowed(asset.group_id):
                 raise VisionGateClosed()
             await _finish_claim(active_store, claimed, use_gateway=use_gateway)
-    claimed = active_store.claim(asset.id, CONFIG.chat_vision_max_retries)
+    claimed = await _claim_asset(active_store, asset.id)
     if claimed is None:
         return
     try:
         await run_while_allowed(process, allowed=lambda: _allowed(asset.group_id),
             timeout=2 * CONFIG.chat_vision_timeout)
     except (asyncio.CancelledError, VisionGateClosed) as exc:
-        active_store.release_claim(asset.id)
+        try:
+            await storage_call(active_store.release_claim, asset.id)
+        except Exception as release_exc:
+            logger.warning(f"群聊图片领取释放失败 asset_id={asset.id} error={type(release_exc).__name__}")
         if isinstance(exc, asyncio.CancelledError):
-            raise
+            raise exc
     except Exception as exc:
         error_type = type(exc).__name__
         if getattr(exc, "retryable", True) is False:
             error_type = str(getattr(exc, "code", "") or error_type)
         try:
-            active_store.mark_failed(asset.id, error_type,
+            await storage_call(active_store.mark_failed, asset.id, error_type,
                 retry_delay=min(60, _RETRY_BASE_SECONDS * 2 ** max(0, claimed.attempts-1)))
         except Exception as mark_exc:
             logger.warning("群聊图片失败状态写入失败 "
@@ -322,10 +344,10 @@ async def enqueue_image_event(event: GroupMessageEvent) -> list[ChatImageAsset]:
     store = _active_store()
     group_id, message_id = int(event.group_id), str(event.message_id)
     if not _allowed(group_id) or not live_event_time_allowed(int(event.time)):
-        return store.for_message(group_id, message_id)
+        return await storage_call(store.for_message, group_id, message_id)
     for ordinal, source_url in _image_segments(event):
         try:
-            asset = store.admit_pending(group_id, message_id, ordinal, source_url, int(event.time),
+            asset = await storage_call(store.admit_pending, group_id, message_id, ordinal, source_url, int(event.time),
                 max_pending=_MAX_PENDING_ASSETS, max_retries=CONFIG.chat_vision_max_retries,
                 min_event_time=_now_timestamp()-CONFIG.chat_vision_recovery_window_seconds)
             if asset is None:
@@ -336,7 +358,7 @@ async def enqueue_image_event(event: GroupMessageEvent) -> list[ChatImageAsset]:
                 f"ordinal={ordinal} error={type(exc).__name__}")
     if _wake is not None:
         _wake.set()
-    return store.for_message(group_id, message_id)
+    return await storage_call(store.for_message, group_id, message_id)
 
 
 async def wait_for_message_assets(
@@ -344,11 +366,22 @@ async def wait_for_message_assets(
 ) -> list[ChatImageAsset]:
     """Wait only for this message, for at most 30 seconds; cancellation is local."""
     store = _active_store()
-    deadline = asyncio.get_running_loop().time() + max(0.0, min(float(timeout), 30.0))
+    budget = max(0.0, min(float(timeout), 30.0))
+    deadline = asyncio.get_running_loop().time() + budget
+    assets: list[ChatImageAsset] = []
     if _wake is not None:
         _wake.set()
     while True:
-        assets = store.for_message(int(group_id), str(message_id))
+        remaining = deadline - asyncio.get_running_loop().time()
+        # A zero timeout means one bounded snapshot, with no model waiting.
+        read_timeout = remaining if budget > 0 else .05
+        if read_timeout <= 0:
+            return assets
+        try:
+            assets = await asyncio.wait_for(
+                storage_call(store.for_message, int(group_id), str(message_id)), timeout=read_timeout)
+        except asyncio.TimeoutError:
+            return assets
         unfinished = any(asset.status in {"pending", "processing", "failed"}
             and asset.attempts < CONFIG.chat_vision_max_retries
             and asset.error_type not in {"payment_required", "GatewayPaymentRequiredError"}
@@ -363,7 +396,7 @@ async def _worker_loop(store: ChatVisionStore) -> None:
     while True:
         try:
             if bool(getattr(CONFIG, "chat_vision_enabled", True)) and FEATURES.image_understanding_allowed():
-                candidates = store.claimable(CONFIG.chat_vision_max_retries,
+                candidates = await storage_call(store.claimable, CONFIG.chat_vision_max_retries,
                     min_event_time=_now_timestamp()-CONFIG.chat_vision_recovery_window_seconds,
                     limit=_MAX_PENDING_ASSETS)
                 asset = next((item for item in candidates if _allowed(item.group_id) and live_event_time_allowed(item.event_time)), None)
@@ -382,33 +415,45 @@ async def _worker_loop(store: ChatVisionStore) -> None:
             pass
 
 
-def start_workers(store: ChatVisionStore) -> None:
-    global _wake
-    if _workers:
-        return
-    set_store(store)
-    store.recover_interrupted_claims()
-    _wake = asyncio.Event()
-    for index in range(_PROCESS_CONCURRENCY):
-        _workers.append(asyncio.create_task(_worker_loop(store), name=f"chat-vision-worker-{index}"))
+async def start_workers(store: ChatVisionStore) -> None:
+    global _wake, _lifecycle_lock
+    if _lifecycle_lock is None:
+        _lifecycle_lock = asyncio.Lock()
+    async with _lifecycle_lock:
+        if _workers:
+            return
+        set_store(store)
+        await storage_call(store.recover_interrupted_claims)
+        _wake = asyncio.Event()
+        for index in range(_PROCESS_CONCURRENCY):
+            _workers.append(asyncio.create_task(_worker_loop(store), name=f"chat-vision-worker-{index}"))
 
 
 async def stop_workers() -> None:
-    global _wake
-    tasks = list(_workers)
-    for task in tasks:
-        task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    _workers.clear()
-    _wake = None
+    global _wake, _lifecycle_lock
+    lock = _lifecycle_lock
+    if lock is not None:
+        await lock.acquire()
+    try:
+        tasks = list(_workers)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await drain_storage_calls()
+        _workers.clear()
+        _wake = None
+    finally:
+        if lock is not None:
+            lock.release()
+        _lifecycle_lock = None
 
 
 async def process_image_event(event: GroupMessageEvent) -> list[ChatImageAsset]:
     """Explicit inline helper for tools/tests; production ingestion uses enqueue only."""
     assets = await enqueue_image_event(event)
     await asyncio.gather(*(process_pending_asset(asset) for asset in assets))
-    return _active_store().for_message(int(event.group_id), str(event.message_id))
+    return await storage_call(_active_store().for_message, int(event.group_id), str(event.message_id))
 
 
 async def recover_pending(
@@ -428,7 +473,7 @@ async def recover_pending(
         limit = batch_size
         if max_assets is not None:
             limit = min(limit, max_assets - processed)
-        assets = store.claimable(
+        assets = await storage_call(store.claimable,
             max_retries,
             after_id=after_id,
             limit=limit,

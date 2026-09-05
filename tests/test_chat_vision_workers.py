@@ -60,7 +60,7 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
             finally:active-=1
             return '合成描述'
         self.describe.side_effect=describe
-        service.start_workers(self.store)
+        await service.start_workers(self.store)
         for index in range(15):
             await service.enqueue_image_event(_event(_image('https://cdn.invalid/a.jpg'),message_id=100+index))
         await asyncio.wait_for(all_started.wait(),1)
@@ -79,7 +79,7 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
         async def stuck(*args,**kwargs):
             begun.set();await asyncio.Event().wait()
         self.describe.side_effect=stuck
-        service.start_workers(self.store)
+        await service.start_workers(self.store)
         await service.enqueue_image_event(_event(_image('https://cdn.invalid/a.jpg')))
         await asyncio.wait_for(begun.wait(),1)
         await service.stop_workers()
@@ -89,7 +89,7 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([],service._workers)
         self.describe.side_effect=None
         reopened=ChatVisionStore(self.root/'archive.db')
-        service.start_workers(reopened)
+        await service.start_workers(reopened)
         done=await service.wait_for_message_assets(GROUP_ID,'456',timeout=2)
         self.assertEqual('ready',done[0].status)
         self.assertEqual(1,self.download.await_count)
@@ -97,7 +97,7 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_retry_is_durable_and_bounded(self):
         self.describe.side_effect=[RuntimeError('synthetic'), '恢复后的描述']
         with patch.object(service,'_RETRY_BASE_SECONDS',.03),patch.object(service,'_WORKER_POLL_SECONDS',.01):
-            service.start_workers(self.store)
+            await service.start_workers(self.store)
             await service.enqueue_image_event(_event(_image('https://cdn.invalid/a.jpg')))
             result=await service.wait_for_message_assets(GROUP_ID,'456',timeout=1)
         self.assertEqual('ready',result[0].status)
@@ -111,7 +111,7 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
             try:await asyncio.Event().wait()
             finally:cancelled.set()
         self.describe.side_effect=stuck
-        service.start_workers(self.store)
+        await service.start_workers(self.store)
         await service.enqueue_image_event(_event(_image('https://cdn.invalid/a.jpg')))
         await asyncio.wait_for(started.wait(),1)
         self.allowed=False
@@ -127,7 +127,7 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
         async def slow(*args,**kwargs):
             started.set();await release.wait();return '合成描述'
         self.describe.side_effect=slow
-        service.start_workers(self.store)
+        await service.start_workers(self.store)
         await service.enqueue_image_event(_event(_image('https://cdn.invalid/a.jpg')))
         await asyncio.wait_for(started.wait(),1)
         waiter=asyncio.create_task(service.wait_for_message_assets(GROUP_ID,'456',timeout=1))
@@ -147,9 +147,9 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_hard_restart_recovers_processing_claim_only_once(self):
         asset=self.store.ensure_pending(GROUP_ID,'restart',1,'https://cdn.invalid/a.jpg',int(time.time()))
         self.store.claim(asset.id,3)
-        service.start_workers(self.store)
+        await service.start_workers(self.store)
         tasks=list(service._workers)
-        service.start_workers(self.store)
+        await service.start_workers(self.store)
         self.assertEqual(tasks,service._workers)
         result=await service.wait_for_message_assets(GROUP_ID,'restart',timeout=1)
         self.assertEqual('ready',result[0].status)
@@ -165,7 +165,7 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
             if calls==1:raise sqlite3.OperationalError('synthetic busy')
             return original(*args,**kwargs)
         with patch.object(self.store,'claimable',side_effect=first_failed), patch.object(service,'_WORKER_POLL_SECONDS',.01):
-            service.start_workers(self.store)
+            await service.start_workers(self.store)
             await service.enqueue_image_event(_event(_image('https://cdn.invalid/a.jpg')))
             result=await service.wait_for_message_assets(GROUP_ID,'456',timeout=1)
         self.assertEqual('ready',result[0].status)
@@ -176,5 +176,5 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.store.ensure_pending(GROUP_ID+1,'outside',1,'https://cdn.invalid/a.jpg',int(time.time()))
         self.store.ensure_pending(GROUP_ID,'future',1,'https://cdn.invalid/a.jpg',int(time.time())+3600)
         with patch.object(service,'_WORKER_POLL_SECONDS',.01):
-            service.start_workers(self.store);await asyncio.sleep(.05)
+            await service.start_workers(self.store);await asyncio.sleep(.05)
         self.download.assert_not_awaited()

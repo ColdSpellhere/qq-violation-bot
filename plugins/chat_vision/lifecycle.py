@@ -16,6 +16,7 @@ from .service import (
     set_store,
 )
 from .store import ChatVisionStore
+from .storage_io import storage_call
 
 
 _CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
@@ -58,12 +59,12 @@ def setup_lifecycle() -> None:
     async def _startup() -> None:
         global _cleanup_task, _store
         if _store is None:
-            _store = ChatVisionStore(CONFIG.chat_archive_path)
+            _store = await storage_call(ChatVisionStore, CONFIG.chat_archive_path)
         store = _store
         set_store(store)
 
         if CONFIG.chat_vision_enabled:
-            start_workers(store)
+            await start_workers(store)
         await _cleanup_once(store)
         if _cleanup_task is None or _cleanup_task.done():
             _cleanup_task = asyncio.create_task(

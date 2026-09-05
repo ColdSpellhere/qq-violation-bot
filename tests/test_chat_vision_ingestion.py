@@ -804,7 +804,7 @@ class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch.object(lifecycle, "_now_timestamp", return_value=2_000_000_000),
             patch.object(lifecycle, "CONFIG", config),
             patch.object(lifecycle, "ChatVisionStore", new=store_factory),
-            patch.object(lifecycle, "start_workers", side_effect=lambda store: steps.append("start-workers")),
+            patch.object(lifecycle, "start_workers", new=AsyncMock(side_effect=lambda store: steps.append("start-workers"))),
             patch.object(lifecycle, "cleanup_expired", new=cleanup),
             patch.object(lifecycle, "_daily_cleanup_loop", new=forever),
         ):
