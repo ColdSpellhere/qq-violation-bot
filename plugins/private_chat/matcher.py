@@ -19,9 +19,9 @@ from plugins.private_memory.models import RelationshipState
 from plugins.private_memory.relationship import RelationshipStore
 from plugins.private_memory.store import PrivateMemoryStore
 from plugins.random_chat.ai import RandomChatAIError, generate_reply
-from plugins.random_chat.delivery import deliver_replies
+from plugins.random_chat.delivery import DeliveryNotSent, deliver_replies
 from plugins.random_chat.delivery_store import DeliveryLedger, delivery_event_key
-from plugins.random_chat.admission import run_chat_turn
+from plugins.random_chat.admission import chat_turn_allowed, run_chat_io, run_chat_turn
 from plugins.random_chat.stickers import choose_sticker
 from plugins.violation_record.config import CONFIG
 
@@ -152,9 +152,9 @@ def _enqueue_private_jobs(
     user_id: str,
     input_through_id: int,
 ) -> None:
-    if _persistent_allowed(user_id):
+    if chat_turn_allowed() and _persistent_allowed(user_id):
         summary_version, _ = store.get_summary_version_state(user_id=user_id)
-        if _persistent_allowed(user_id):
+        if chat_turn_allowed() and _persistent_allowed(user_id):
             queue.enqueue(
                 job_type="private_summary",
                 conversation_kind="private",
@@ -163,7 +163,7 @@ def _enqueue_private_jobs(
                 input_through_id=input_through_id,
                 expected_version=summary_version,
             )
-        if _persistent_allowed(user_id):
+        if chat_turn_allowed() and _persistent_allowed(user_id):
             queue.enqueue(
                 job_type="private_facts",
                 conversation_kind="private",
@@ -172,11 +172,11 @@ def _enqueue_private_jobs(
                 input_through_id=input_through_id,
                 expected_version=0,
             )
-    if _persistent_allowed(user_id) and FEATURES.snapshot().relationship_state_enabled:
+    if chat_turn_allowed() and _persistent_allowed(user_id) and FEATURES.snapshot().relationship_state_enabled:
         relationship = relationship_store.get_private(
             user_id=user_id, persona_id="radish-cat"
         )
-        if _persistent_allowed(user_id) and FEATURES.snapshot().relationship_state_enabled:
+        if chat_turn_allowed() and _persistent_allowed(user_id) and FEATURES.snapshot().relationship_state_enabled:
             queue.enqueue(
                 job_type="relationship",
                 conversation_kind="private",
@@ -217,10 +217,12 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             return
         conversation.user_id = user_id
         persistent = FEATURES.snapshot().private_memory_enabled
-        ledger = await asyncio.to_thread(DeliveryLedger, CONFIG.chat_archive_path) if persistent else None
+        ledger = await run_chat_io(DeliveryLedger, CONFIG.chat_archive_path) if persistent else conversation.delivery_ledger
         delivery_key = delivery_event_key(event.self_id, "private", "", event.user_id, event.message_id)
-        saved_parts = await asyncio.to_thread(ledger.parts, delivery_key) if ledger else []
+        saved_parts = await run_chat_io(ledger.parts, delivery_key) if ledger else []
         if saved_parts and all(row["status"] == "archived" for row in saved_parts):
+            return
+        if saved_parts and all(row.get("error") == "no_reply" for row in saved_parts):
             return
         if any(row["status"] in {"unknown", "sending", "cancelled"} for row in saved_parts):
             logger.warning("私聊投递等待核对 key={}", delivery_key[:16])
@@ -230,17 +232,17 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
         relationship_store: RelationshipStore | None = None
         if persistent:
             try:
-                store = PrivateMemoryStore(
+                store = await run_chat_io(PrivateMemoryStore,
                     CONFIG.chat_archive_path,
                     retention_days=CONFIG.private_memory_retention_days,
                 )
-                queue = MemoryJobQueue(CONFIG.chat_archive_path)
-                relationship_store = RelationshipStore(CONFIG.chat_archive_path)
+                queue = await run_chat_io(MemoryJobQueue, CONFIG.chat_archive_path)
+                relationship_store = await run_chat_io(RelationshipStore, CONFIG.chat_archive_path)
             except Exception as exc:
                 logger.warning(f"私聊记忆初始化失败：{type(exc).__name__}")
                 return
         conversation.use_store(store)
-        context = conversation.snapshot()
+        context = await run_chat_io(conversation.snapshot)
         current = ContextMessage(
             event.sender.nickname or str(event.user_id),
             text,
@@ -252,11 +254,13 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
         else:
             source_kind = "text"
         try:
-            user_event_state = conversation.append_user_state(
-                current,
-                event_time=int(event.time),
-                source_kind=source_kind,
-            )
+            def append_user_if_allowed():
+                if not chat_turn_allowed() or not FEATURES.private_chat_allowed(user_id):
+                    return None
+                if persistent and not _persistent_allowed(user_id):
+                    return None
+                return conversation.append_user_state(current, event_time=int(event.time), source_kind=source_kind)
+            user_event_state = await run_chat_io(append_user_if_allowed)
         except Exception as exc:
             logger.warning(f"私聊用户消息持久化失败：{type(exc).__name__}")
             return
@@ -267,7 +271,8 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             assert store is not None
             assert queue is not None
             assert relationship_store is not None
-            assert user_event_state is not None
+            if user_event_state is None:
+                return
             if not user_event_state.live or (
                 not user_event_state.created and user_event_state.assistant_exists and not saved_parts
             ):
@@ -282,24 +287,36 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                     )
                 )
 
-        def current_event_is_live() -> bool:
+        source_live = True
+
+        async def current_event_is_live() -> bool:
+            nonlocal source_live
             if store is None or user_event_state is None:
                 return True
             try:
-                return store.user_event_is_live(
-                    user_id=user_id,
-                    message_id=str(event.message_id),
-                    row_id=user_event_state.row_id,
+                source_live = await run_chat_io(store.user_event_is_live,
+                    user_id=user_id, message_id=str(event.message_id), row_id=user_event_state.row_id,
                 )
+                return source_live
             except Exception as exc:
                 logger.warning(
                     f"私聊用户消息存活检查失败：{type(exc).__name__}"
                 )
+                source_live = False
                 return False
+
+        def turn_allowed() -> bool:
+            return (chat_turn_allowed() and FEATURES.private_chat_allowed(user_id)
+                    and (not persistent or _persistent_allowed(user_id)) and source_live)
+
+        async def monitor_source() -> None:
+            while await current_event_is_live():
+                await asyncio.sleep(0.05)
 
         images = ()
         descriptions: tuple[str, ...] = ()
         if vision_enabled and not saved_parts:
+            monitor = asyncio.create_task(monitor_source()) if persistent else None
             try:
                 vision = await understand_private_images(
                     event.message,
@@ -309,17 +326,22 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                     base_url=CONFIG.ai_base_url,
                     api_key=CONFIG.ai_api_key,
                     model=CONFIG.chat_vision_model,
+                    still_allowed=lambda: turn_allowed() and bool(image_allowed()),
                 )
                 images = vision.images
                 descriptions = vision.descriptions
             except Exception as exc:
                 logger.warning(f"私聊图片理解失败：{type(exc).__name__}")
+            finally:
+                if monitor is not None:
+                    monitor.cancel()
+                    await asyncio.gather(monitor, return_exceptions=True)
 
         if not FEATURES.private_chat_allowed(user_id):
             return
         if persistent and not _persistent_allowed(user_id):
             return
-        if not current_event_is_live():
+        if not await current_event_is_live():
             return
         if has_image and not real_text and not images and not descriptions and not saved_parts:
             return
@@ -329,7 +351,7 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             conversation.replace_user_turn(current)
             if store is not None:
                 try:
-                    updated = store.update_user_image_descriptions(
+                    updated = await run_chat_io(store.update_user_image_descriptions,
                         user_id=user_id,
                         message_id=str(event.message_id),
                         image_descriptions=descriptions,
@@ -348,7 +370,7 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             return
         if persistent and not _persistent_allowed(user_id):
             return
-        if not current_event_is_live():
+        if not await current_event_is_live():
             return
         if has_image and not real_text and not bool(image_allowed()):
             return
@@ -364,20 +386,20 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             assert user_event_state is not None
             try:
                 if user_event_state.created and real_text:
-                    _enqueue_private_jobs(
+                    await run_chat_io(_enqueue_private_jobs,
                         queue=queue,
                         store=store,
                         relationship_store=relationship_store,
                         user_id=user_id,
                         input_through_id=user_event_state.row_id,
                     )
-                profiles = _private_profile(
+                profiles = await run_chat_io(_private_profile,
                     store=store,
                     user_id=user_id,
                     nickname=current.nickname,
                 )
                 if FEATURES.snapshot().relationship_state_enabled:
-                    relationship = relationship_store.get_private(
+                    relationship = await run_chat_io(relationship_store.get_private,
                         user_id=user_id, persona_id="radish-cat"
                     )
                     if relationship is not None:
@@ -395,6 +417,8 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             if not FEATURES.snapshot().relationship_state_enabled:
                 relationship = None
                 open_topics = ()
+        if not await current_event_is_live() or not turn_allowed():
+            return
         try:
             reply = tuple(row["reply_text"] for row in saved_parts) if saved_parts else await generate_reply(
                 text,
@@ -416,13 +440,21 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                 exc.retry_later
                 and FEATURES.private_chat_allowed(user_id)
                 and (not persistent or _persistent_allowed(user_id))
-                and current_event_is_live()
+                and await current_event_is_live()
+                and turn_allowed()
             )
             if can_send_notice:
                 try:
-                    await bot.send_private_msg(
-                        user_id=int(event.user_id), message=_BUSY_NOTICE
-                    )
+                    async def send_notice(value):
+                        try:
+                            if not await current_event_is_live() or not turn_allowed():
+                                raise DeliveryNotSent("private notice access changed")
+                        except (asyncio.CancelledError, asyncio.TimeoutError) as interrupted:
+                            raise DeliveryNotSent("private notice preflight interrupted") from interrupted
+                        return await bot.send_private_msg(user_id=int(event.user_id), message=value)
+                    await deliver_replies((_BUSY_NOTICE,), send=send_notice, ledger=ledger,
+                        delivery_key=delivery_key, kind="private", user_id=user_id,
+                        source_message_id=str(event.message_id), allowed=turn_allowed)
                 except Exception as send_exc:
                     logger.warning(
                         f"私聊繁忙提示发送失败：{type(send_exc).__name__}"
@@ -430,16 +462,19 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             return
         replies = (reply,) if isinstance(reply, str) else tuple(reply or ())
         if not replies:
+            if turn_allowed() and await current_event_is_live():
+                await run_chat_io(ledger.complete_without_reply, delivery_key, kind="private",
+                    user_id=user_id, source_message_id=str(event.message_id))
             return
         if not FEATURES.private_chat_allowed(user_id):
             return
         if persistent and not _persistent_allowed(user_id):
             return
-        if not current_event_is_live():
+        if not await current_event_is_live():
             return
 
         try:
-            sticker = choose_sticker(
+            sticker = await run_chat_io(choose_sticker,
                 CONFIG.random_chat_sticker_root,
                 special_filename=CONFIG.random_chat_special_sticker,
                 attachment_probability=CONFIG.random_chat_sticker_probability,
@@ -455,7 +490,7 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             return message
 
         async def persist(value: str, index: int) -> None:
-            if not current_event_is_live():
+            if not await current_event_is_live():
                 raise RuntimeError("private message was cleared")
             assistant = ContextMessage(
                 "机器人自己",
@@ -464,15 +499,18 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                 user_id=str(event.self_id),
                 is_bot=True,
             )
-            conversation.append_assistant(assistant, event_time=int(event.time))
+            await run_chat_io(conversation.append_assistant, assistant, event_time=int(event.time))
 
         async def send(message: object) -> object:
             if not FEATURES.private_chat_allowed(user_id):
-                raise RuntimeError("private chat access changed")
+                raise DeliveryNotSent("private chat access changed")
             if persistent and not _persistent_allowed(user_id):
-                raise RuntimeError("private memory access changed")
-            if not current_event_is_live():
-                raise RuntimeError("private message was cleared")
+                raise DeliveryNotSent("private memory access changed")
+            try:
+                if not await current_event_is_live() or not turn_allowed():
+                    raise DeliveryNotSent("private message was cleared or turn ended")
+            except (asyncio.CancelledError, asyncio.TimeoutError) as interrupted:
+                raise DeliveryNotSent("private send preflight interrupted") from interrupted
             if not isinstance(message, Message):
                 message = Message(MessageSegment.text(str(message)))
             return await bot.send_private_msg(user_id=int(event.user_id), message=message)
@@ -487,11 +525,7 @@ async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             kind="private",
             user_id=user_id,
             source_message_id=str(event.message_id),
-            allowed=lambda: (
-                FEATURES.private_chat_allowed(user_id)
-                and (not persistent or _persistent_allowed(user_id))
-                and current_event_is_live()
-            ),
+            allowed=turn_allowed,
         )
         if not delivered:
             logger.warning("私聊消息发送失败")

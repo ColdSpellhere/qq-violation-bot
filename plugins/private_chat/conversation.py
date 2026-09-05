@@ -4,6 +4,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from plugins.chat_archive.db import ContextMessage
+from plugins.random_chat.delivery_store import MemoryDeliveryLedger
 
 if TYPE_CHECKING:
     from plugins.private_memory.store import PrivateMemoryStore, PrivateUserEventState
@@ -36,10 +37,12 @@ class PrivateConversation:
         self.store = store
         self._turns: deque[ContextMessage] = deque(maxlen=limit)
         self.lock = _user_lock(user_id)
+        self.delivery_ledger = MemoryDeliveryLedger()
 
     def use_store(self, store: "PrivateMemoryStore | None") -> None:
         if (self.store is None) != (store is None):
             self._turns.clear()
+            self.delivery_ledger.clear()
         self.store = store
 
     def append(self, turn: ContextMessage) -> None:

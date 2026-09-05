@@ -18,7 +18,7 @@ from nonebot.adapters.onebot.v11 import Message, PrivateMessageEvent
 from plugins.private_chat import matcher as private_matcher
 
 
-def _private_event(text: str, *, user_id: int = 123456) -> PrivateMessageEvent:
+def _private_event(text: str, *, user_id: int = 123456, message_id: int = 456) -> PrivateMessageEvent:
     message = Message(text)
     return PrivateMessageEvent(
         time=2000,
@@ -27,7 +27,7 @@ def _private_event(text: str, *, user_id: int = 123456) -> PrivateMessageEvent:
         sub_type="friend",
         user_id=user_id,
         message_type="private",
-        message_id=456,
+        message_id=message_id,
         message=message,
         original_message=message,
         raw_message=text,
@@ -207,7 +207,7 @@ class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
                 bot, _private_event("乙的第一条", user_id=654321)
             )
             await private_matcher.handle_private_message(
-                bot, _private_event("甲的第二条", user_id=123456)
+                bot, _private_event("甲的第二条", user_id=123456, message_id=457)
             )
 
         first_context = generate.await_args_list[0].kwargs["context"]
@@ -253,7 +253,7 @@ class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
             "generate_reply",
             new=AsyncMock(return_value="未发出的回复"),
         ), patch.object(private_matcher, "choose_sticker", return_value=None):
-            await private_matcher.handle_private_message(bot, _private_event("第二条"))
+            await private_matcher.handle_private_message(bot, _private_event("第二条", message_id=457))
 
         self.assertEqual(["第一条", "第二条"], [item.text for item in conversation.snapshot()])
 
@@ -278,7 +278,7 @@ class PrivateChatMatcherTests(unittest.IsolatedAsyncioTestCase):
             )
             await first_started.wait()
             second = asyncio.create_task(
-                private_matcher.handle_private_message(bot, _private_event("第二条"))
+                private_matcher.handle_private_message(bot, _private_event("第二条", message_id=457))
             )
             await asyncio.sleep(0)
             self.assertEqual(1, generate.await_count)

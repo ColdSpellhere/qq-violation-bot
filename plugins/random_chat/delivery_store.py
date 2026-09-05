@@ -1,6 +1,8 @@
 """A durable send ledger; ambiguous OneBot results are never blindly retried."""
 from __future__ import annotations
 
+from collections import OrderedDict
+import threading
 import hashlib
 import json
 from pathlib import Path
@@ -47,7 +49,7 @@ class DeliveryLedger:
             return [dict(row) for row in db.execute(
                 "SELECT * FROM chat_delivery_parts WHERE event_key=? ORDER BY part", (key,))]
 
-    def plan(self, key: str, replies, *, kind: str = "group", user_id: str = "", group_id: str = "", source_message_id: str = "") -> list[dict]:
+    def plan(self, key: str, replies, *, kind: str = "group", user_id: str = "", group_id: str = "", source_message_id: str = "", _terminal_no_reply: bool = False) -> list[dict]:
         values = tuple(replies)
         if not values or len(values) > 3 or any(type(item) is not str or len(item) > 1200 for item in values):
             raise ValueError("invalid delivery plan")
@@ -61,9 +63,15 @@ class DeliveryLedger:
                     return []
             if not db.execute("SELECT 1 FROM chat_delivery_parts WHERE event_key=? LIMIT 1", (key,)).fetchone():
                 db.executemany("""INSERT INTO chat_delivery_parts
-                    (event_key,part,kind,user_id,group_id,reply_text,updated_at) VALUES(?,?,?,?,?,?,?)""",
-                    [(key, i, kind, str(user_id), str(group_id), value, time.time()) for i, value in enumerate(values)])
+                    (event_key,part,kind,user_id,group_id,reply_text,updated_at,status,error) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    [(key, i, kind, str(user_id), str(group_id), value, time.time(),
+                      "cancelled" if _terminal_no_reply else "pending", "no_reply" if _terminal_no_reply else "")
+                     for i, value in enumerate(values)])
         return self.parts(key)
+
+    def complete_without_reply(self, key: str, **scope) -> None:
+        """Retain an empty terminal decision so duplicate events do not rerun AI."""
+        self.plan(key, ("",), _terminal_no_reply=True, **scope)
 
     def claim(self, key: str, part: int) -> bool:
         with self._connect() as db:
@@ -77,4 +85,67 @@ class DeliveryLedger:
                 (after, receipt[:200], error[:80], time.time(), key, part, before)).rowcount == 1
 
 
-__all__ = ["DeliveryLedger", "delivery_event_key"]
+class MemoryDeliveryLedger:
+    """Per-conversation replay protection for users who disabled persistence."""
+    def __init__(self, *, max_events: int = 128, ttl_seconds: float = 3600):
+        if type(max_events) is not int or max_events < 1 or ttl_seconds <= 0:
+            raise ValueError("invalid memory delivery bounds")
+        self.max_events = max_events
+        self.ttl_seconds = ttl_seconds
+        self._events: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _prune(self):
+        now = time.monotonic()
+        for key, (created, _) in tuple(self._events.items()):
+            if now - created >= self.ttl_seconds:
+                del self._events[key]
+        while len(self._events) > self.max_events:
+            self._events.popitem(last=False)
+
+    def clear(self):
+        with self._lock:
+            self._events.clear()
+
+    def parts(self, key: str) -> list[dict]:
+        with self._lock:
+            self._prune()
+            event = self._events.get(key)
+            return [dict(row) for row in event[1]] if event else []
+
+    def plan(self, key: str, replies, *, kind="private", user_id="", group_id="", source_message_id="", _terminal_no_reply=False) -> list[dict]:
+        values = tuple(replies)
+        if not values or len(values) > 3 or any(type(item) is not str or len(item) > 1200 for item in values):
+            raise ValueError("invalid delivery plan")
+        with self._lock:
+            self._prune()
+            if key not in self._events:
+                rows = [dict(event_key=key, part=index, kind=kind, user_id=user_id, group_id=group_id,
+                             reply_text=value, status="cancelled" if _terminal_no_reply else "pending",
+                             receipt="", error="no_reply" if _terminal_no_reply else "")
+                        for index,value in enumerate(values)]
+                self._events[key] = (time.monotonic(), rows)
+                self._prune()
+            return [dict(row) for row in self._events[key][1]]
+
+    def complete_without_reply(self, key: str, **scope) -> None:
+        """Retain an empty terminal decision so duplicate events do not rerun AI."""
+        self.plan(key, ("",), _terminal_no_reply=True, **scope)
+
+    def claim(self, key: str, part: int) -> bool:
+        return self.transition(key,part,before="pending",after="sending")
+
+    def transition(self, key: str, part: int, *, before: str, after: str, receipt="", error="") -> bool:
+        with self._lock:
+            self._prune()
+            event = self._events.get(key)
+            if event is None or part >= len(event[1]) or part < 0:
+                return False
+            row = event[1][part]
+            if row["status"] != before:
+                return False
+            row.update(status=after,receipt=str(receipt)[:200],error=str(error)[:80])
+            return True
+
+
+__all__ = ["DeliveryLedger", "MemoryDeliveryLedger", "delivery_event_key"]

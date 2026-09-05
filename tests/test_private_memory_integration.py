@@ -25,7 +25,7 @@ from plugins.private_memory.store import PrivateMemoryStore
 def _event(text: str, *, user_id: int = 200, message_id: int = 456) -> PrivateMessageEvent:
     message = Message(text)
     return PrivateMessageEvent(
-        time=2_000,
+        time=int(datetime.now(timezone.utc).timestamp()),
         self_id=999_999,
         post_type="message",
         sub_type="friend",

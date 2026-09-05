@@ -20,9 +20,9 @@ from plugins.violation_record.config import CONFIG
 
 from .ai import RandomChatAIError, generate_reply
 from .context import context_candidate_limit, select_chat_context
-from .delivery import deliver_replies
+from .delivery import DeliveryNotSent, deliver_replies
 from .delivery_store import DeliveryLedger, delivery_event_key
-from .admission import run_chat_turn
+from .admission import chat_turn_allowed, run_chat_io, run_chat_turn
 from .stickers import choose_sticker
 
 if TYPE_CHECKING:
@@ -144,17 +144,19 @@ async def _send_random_reply_locked(
 ) -> bool:
     if not FEATURES.group_chat_allowed(int(event.group_id)):
         return False
-    ledger = await asyncio.to_thread(DeliveryLedger, CONFIG.chat_archive_path)
+    ledger = await run_chat_io(DeliveryLedger, CONFIG.chat_archive_path)
     delivery_key = delivery_event_key(event.self_id, "group", event.group_id, event.user_id, event.message_id)
-    saved_parts = await asyncio.to_thread(ledger.parts, delivery_key)
+    saved_parts = await run_chat_io(ledger.parts, delivery_key)
     if saved_parts and all(row["status"] == "archived" for row in saved_parts):
         return True
+    if saved_parts and all(row.get("error") == "no_reply" for row in saved_parts):
+        return False
     if any(row["status"] in {"unknown", "sending", "cancelled"} for row in saved_parts):
         logger.warning("群聊投递等待核对 key={}", delivery_key[:16])
         return False
     context_limit = getattr(CONFIG, "chat_context_messages", 20)
     try:
-        context = recent_text_context(
+        context = await run_chat_io(recent_text_context,
             CONFIG.chat_archive_path,
             group_id=int(event.group_id),
             since_epoch=int(event.time)
@@ -183,18 +185,34 @@ async def _send_random_reply_locked(
     referenced_descriptions: tuple[str, ...] = ()
     images: list[VisionImage] = []
     raw_budget_exceeded = False
+    async def image_unavailable() -> bool:
+        if not addressed or not chat_turn_allowed() or not FEATURES.group_chat_allowed(int(event.group_id)):
+            return False
+        async def send_notice(value):
+            if not chat_turn_allowed() or not FEATURES.group_chat_allowed(int(event.group_id)):
+                raise DeliveryNotSent("group chat access changed")
+            return await bot.send_group_msg(group_id=int(event.group_id), message=Message(MessageSegment.text(str(value))))
+        return bool(await deliver_replies(("图片暂时没处理好，稍后再试一下吧。",),send=send_notice,
+            ledger=ledger,delivery_key=delivery_key,kind="group",user_id=str(event.user_id),group_id=str(event.group_id),
+            allowed=lambda: chat_turn_allowed() and FEATURES.group_chat_allowed(int(event.group_id))))
+
+    if current_has_image and image_understanding_enabled:
+        from plugins.chat_vision.service import wait_for_message_assets
+        await wait_for_message_assets(int(event.group_id), str(event.message_id), timeout=8.0)
+        if not chat_turn_allowed() or not FEATURES.group_chat_allowed(int(event.group_id)):
+            return False
     if image_understanding_enabled and (current_has_image or reply_message_id):
         try:
             from plugins.chat_vision.client import VisionImage
             from plugins.chat_vision.store import ChatVisionStore, read_original_image
 
-            store = ChatVisionStore(CONFIG.chat_archive_path)
+            store = await run_chat_io(ChatVisionStore, CONFIG.chat_archive_path)
             assets = []
             seen_asset_ids: set[int] = set()
             for message_id in (str(event.message_id), reply_message_id):
                 if message_id is None:
                     continue
-                for asset in store.for_message(int(event.group_id), message_id):
+                for asset in await run_chat_io(store.for_message, int(event.group_id), message_id):
                     if asset.id in seen_asset_ids:
                         continue
                     seen_asset_ids.add(asset.id)
@@ -217,7 +235,7 @@ async def _send_random_reply_locked(
                 and asset.description.strip()
             )
             for asset in assets:
-                content = read_original_image(asset, CONFIG.chat_vision_root)
+                content = await run_chat_io(read_original_image, asset, CONFIG.chat_vision_root)
                 if content is None or not asset.mime_type:
                     continue
                 if (
@@ -246,7 +264,7 @@ async def _send_random_reply_locked(
         if raw_budget_exceeded and current_descriptions:
             pass
         elif not stripped_text:
-            return False
+            return await image_unavailable()
         else:
             current_descriptions = ()
             images.clear()
@@ -254,7 +272,7 @@ async def _send_random_reply_locked(
         return False
     if not stripped_text and not bool(image_allowed()):
         return False
-    replied_to_user_id = _reply_sender_user_id(event) or archived_message_author(
+    replied_to_user_id = _reply_sender_user_id(event) or await run_chat_io(archived_message_author,
         CONFIG.chat_archive_path,
         group_id=int(event.group_id),
         message_id=reply_message_id,
@@ -292,7 +310,7 @@ async def _send_random_reply_locked(
         *(item for item in (replied_to_user_id, *at_user_ids) if item),
         *(item.user_id for item in reversed(context)),
     ]
-    profiles = load_profiles(
+    profiles = await run_chat_io(load_profiles,
         CONFIG.chat_archive_path,
         group_id=int(event.group_id),
         user_ids=memory_user_ids,
@@ -310,7 +328,8 @@ async def _send_random_reply_locked(
         try:
             from plugins.private_memory.relationship import RelationshipStore
 
-            relationship = RelationshipStore(CONFIG.chat_archive_path).get_group(
+            relationship_store = await run_chat_io(RelationshipStore, CONFIG.chat_archive_path)
+            relationship = await run_chat_io(relationship_store.get_group,
                 group_id=int(event.group_id),
                 user_id=str(event.user_id),
                 persona_id="radish-cat",
@@ -326,6 +345,8 @@ async def _send_random_reply_locked(
     if not relationship_prompt_enabled:
         relationship = None
         open_topics = ()
+    if not chat_turn_allowed() or not FEATURES.group_chat_allowed(int(event.group_id)):
+        return False
     try:
         reply = tuple(row["reply_text"] for row in saved_parts) if saved_parts else await generate_reply(
             current_text,
@@ -346,21 +367,28 @@ async def _send_random_reply_locked(
             addressed
             and exc.retry_later
             and FEATURES.group_chat_allowed(int(event.group_id))
+            and chat_turn_allowed()
         ):
             try:
-                await bot.send_group_msg(
-                    group_id=int(event.group_id), message=_BUSY_NOTICE
-                )
-                return True
+                async def send_notice(value):
+                    if not chat_turn_allowed() or not FEATURES.group_chat_allowed(int(event.group_id)):
+                        raise DeliveryNotSent("group notice access changed")
+                    return await bot.send_group_msg(group_id=int(event.group_id), message=value)
+                return bool(await deliver_replies((_BUSY_NOTICE,), send=send_notice, ledger=ledger,
+                    delivery_key=delivery_key, kind="group", user_id=str(event.user_id), group_id=str(event.group_id),
+                    allowed=lambda: chat_turn_allowed() and FEATURES.group_chat_allowed(int(event.group_id))))
             except Exception as send_exc:
                 logger.warning(
                     f"随机闲聊繁忙提示发送失败：{type(send_exc).__name__}"
                 )
         return False
     replies = (reply,) if isinstance(reply, str) else tuple(reply or ())
+    if not replies and chat_turn_allowed() and FEATURES.group_chat_allowed(int(event.group_id)):
+        await run_chat_io(ledger.complete_without_reply, delivery_key, kind="group",
+            user_id=str(event.user_id), group_id=str(event.group_id))
     if replies:
         try:
-            sticker = choose_sticker(
+            sticker = await run_chat_io(choose_sticker,
                 CONFIG.random_chat_sticker_root,
                 special_filename=CONFIG.random_chat_special_sticker,
                 attachment_probability=CONFIG.random_chat_sticker_probability,
@@ -377,8 +405,8 @@ async def _send_random_reply_locked(
                 send_results[index] = {"message_id": receipt}
 
             async def send(message: object) -> object:
-                if not FEATURES.group_chat_allowed(int(event.group_id)):
-                    raise RuntimeError("group chat access changed")
+                if not chat_turn_allowed() or not FEATURES.group_chat_allowed(int(event.group_id)):
+                    raise DeliveryNotSent("group chat access changed")
                 if not isinstance(message, Message):
                     message = Message(MessageSegment.text(str(message)))
                 result = await bot.send_group_msg(
@@ -396,7 +424,7 @@ async def _send_random_reply_locked(
                 if message_id in (None, ""):
                     message_id = f"bot:{event.self_id}:{event.message_id}:{index}"
                 try:
-                    await asyncio.to_thread(archive_payload,
+                    await run_chat_io(archive_payload,
                         CONFIG.chat_archive_path,
                         int(event.group_id),
                         {
@@ -411,6 +439,7 @@ async def _send_random_reply_locked(
                             "plaintext": value,
                             "reply_message_id": str(event.message_id),
                         },
+                        check_deadline=False,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -428,7 +457,7 @@ async def _send_random_reply_locked(
                 kind="group",
                 user_id=str(event.user_id),
                 group_id=str(event.group_id),
-                allowed=lambda: FEATURES.group_chat_allowed(int(event.group_id)),
+                allowed=lambda: chat_turn_allowed() and FEATURES.group_chat_allowed(int(event.group_id)),
                 restore_receipt=restore_receipt,
             )
             return bool(delivered)
