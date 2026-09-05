@@ -70,7 +70,7 @@ class ProviderRouterTransport:
         async with self._admission_lock:
             if not self._accepting or self._closed:
                 raise GatewayConfigurationError(task=request.task)
-            if len(self._active_tasks) >= self._admission_limit:
+            if request.task is not LLMTask.BUSINESS_INTENT and len(self._active_tasks) >= self._admission_limit:
                 raise GatewayRateLimitError(task=request.task)
             task = asyncio.current_task()
             if task is None:
@@ -78,6 +78,10 @@ class ProviderRouterTransport:
             self._active_tasks.add(task)
             self._drained.clear()
         try:
+            if request.task is LLMTask.BUSINESS_INTENT:
+                async with self._lanes[request.task.value]:
+                    async with self._total:
+                        return await resource.complete(request)
             deadline = asyncio.get_running_loop().time() + request.timeout
             try:
                 return await asyncio.wait_for(

@@ -142,7 +142,7 @@ class LLMTransport:
         async with self._admission_lock:
             if not self._accepting or self._closed:
                 raise GatewayConfigurationError(task=request.task)
-            if len(self._active_tasks) >= self._admission_limit:
+            if request.task is not LLMTask.BUSINESS_INTENT and len(self._active_tasks) >= self._admission_limit:
                 raise GatewayRateLimitError(task=request.task)
             task = asyncio.current_task()
             if task is None:
@@ -151,6 +151,10 @@ class LLMTransport:
             self._drained.clear()
         try:
             started = self._clock()
+            if request.task is LLMTask.BUSINESS_INTENT:
+                # Business semantics and its original per-attempt timeout are
+                # outside the authorized chat/memory optimization boundary.
+                return await self._complete_admitted(request, started)
             # One wall-clock budget includes queueing, HTTP attempts and backoff.
             # wait_for also cancels and joins the admitted call on timeout.
             try:
