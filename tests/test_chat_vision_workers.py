@@ -94,6 +94,43 @@ class ChatVisionWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual('ready',done[0].status)
         self.assertEqual(1,self.download.await_count)
 
+    async def test_worker_cancel_propagates_when_idle_wake_just_finished(self):
+        wake=asyncio.Event()
+        with patch.object(self.config,'chat_vision_enabled',False),patch.object(service,'_wake',wake):
+            worker=asyncio.create_task(service._worker_loop(self.store))
+            try:
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                wake.set()
+                # Finish Event.wait but cancel before its owner resumes. Python
+                # 3.10 wait_for can otherwise return the result and lose cancel.
+                await asyncio.sleep(0)
+                worker.cancel()
+                done,_=await asyncio.wait({worker},timeout=.2)
+                self.assertIn(worker,done,'worker lost shutdown cancellation')
+                self.assertTrue(worker.cancelled())
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker,return_exceptions=True)
+        self.assertFalse(any(task.get_name()=='chat-vision-idle-wait'
+            for task in asyncio.all_tasks() if not task.done()))
+
+    async def test_worker_idle_timeout_and_cancel_leave_no_wait_tasks(self):
+        wake=asyncio.Event()
+        with patch.object(self.config,'chat_vision_enabled',False),patch.object(service,'_wake',wake), \
+                patch.object(service,'_WORKER_POLL_SECONDS',.005):
+            worker=asyncio.create_task(service._worker_loop(self.store))
+            try:
+                await asyncio.sleep(.03)
+                waiters=[task for task in asyncio.all_tasks()
+                    if task.get_name()=='chat-vision-idle-wait' and not task.done()]
+                self.assertLessEqual(len(waiters),1)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker,return_exceptions=True)
+        self.assertFalse(any(task.get_name()=='chat-vision-idle-wait'
+            for task in asyncio.all_tasks() if not task.done()))
+
     async def test_runtime_retry_is_durable_and_bounded(self):
         self.describe.side_effect=[RuntimeError('synthetic'), '恢复后的描述']
         with patch.object(service,'_RETRY_BASE_SECONDS',.03),patch.object(service,'_WORKER_POLL_SECONDS',.01):

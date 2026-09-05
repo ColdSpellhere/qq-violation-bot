@@ -405,14 +405,22 @@ async def _worker_loop(store: ChatVisionStore) -> None:
                     continue
         except Exception as exc:
             logger.warning(f"群聊图片工作单元失败 error={type(exc).__name__}")
+        wake = _wake
+        if wake is None:
+            await asyncio.sleep(_WORKER_POLL_SECONDS)
+            continue
+        # Python 3.10 wait_for may swallow cancellation if Event.wait completes
+        # simultaneously. Keep cancellation on this owner and always reap its
+        # bounded idle waiter, so stop_workers cannot wait on a revived loop.
+        waiter = asyncio.create_task(wake.wait(), name="chat-vision-idle-wait")
         try:
-            if _wake is not None:
-                await asyncio.wait_for(_wake.wait(), timeout=_WORKER_POLL_SECONDS)
-                _wake.clear()
-            else:
-                await asyncio.sleep(_WORKER_POLL_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+            done, _ = await asyncio.wait({waiter}, timeout=_WORKER_POLL_SECONDS)
+            if done:
+                wake.clear()
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
 
 
 async def start_workers(store: ChatVisionStore) -> None:
