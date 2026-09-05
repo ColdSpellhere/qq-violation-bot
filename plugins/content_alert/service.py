@@ -36,6 +36,27 @@ _MAX_REPORT_CHARS = 1_800
 _MAX_CONCURRENT_MANAGED_SCANS = 2
 _MAX_ADMITTED_SCANS = 8
 _SEND_TIMEOUT_SECONDS = 30
+
+
+async def _scan_in_thread(function, *args, **kwargs):
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Cancellation cannot stop a Python thread. Retain the scan admission
+        # and semaphore until its bounded work ends, including repeated cancel.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if task.done() and not task.cancelled():
+            task.exception()  # Observe any scan error without logging text.
+        raise
+
+
 _CONTEXT_CLASS_LABELS = {
     "case_proceeding": "案件语境",
     "office_title": "职务语境",
@@ -151,7 +172,7 @@ class ContentAlertService:
                 async with self._scan_semaphore:
                     if not self._eligible(event):
                         return False
-                    result = await asyncio.to_thread(
+                    result = await _scan_in_thread(
                         _scan_managed_catalog,
                         self._managed_catalog,
                         event.message,
@@ -186,7 +207,7 @@ class ContentAlertService:
                 async with self._scan_semaphore:
                     if not self._eligible(event):
                         return False
-                    manual_matches, background_matches = await asyncio.to_thread(
+                    manual_matches, background_matches = await _scan_in_thread(
                         _scan_literal_sources, event.message, manual_rules, background_rules
                     )
         except ScalableLiteralScanLimitError:
@@ -218,7 +239,7 @@ class ContentAlertService:
             async with self._scan_semaphore:
                 if not self._eligible(event):
                     return False
-                prepared_excerpt = await asyncio.to_thread(
+                prepared_excerpt = await _scan_in_thread(
                     _message_excerpt,
                     event,
                     limit=self._max_excerpt_chars,
