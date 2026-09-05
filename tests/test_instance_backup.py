@@ -5,11 +5,48 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scripts.instance_backup import create_backup, verify_backup
 
 
 class InstanceBackupTests(unittest.TestCase):
+    def test_state_keeps_configuration_recovery_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            instance = root / 'instances' / 'kona'
+            (instance / 'data').mkdir(parents=True)
+            (instance / '.env').write_text('BOT_MODE=chat_only\n')
+            for name in ('runtime_features.json.bak', 'keywords.json.bak'):
+                (instance / 'data' / name).write_text('{"recovery":true}')
+            manifest = verify_backup(create_backup(root, 'kona'))
+            self.assertIn('data/runtime_features.json.bak', manifest['files'])
+            self.assertIn('data/keywords.json.bak', manifest['files'])
+
+    def test_damaged_sqlite_header_fails_backup_instead_of_omitting_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            instance = root / 'instances' / 'kona'
+            (instance / 'data').mkdir(parents=True)
+            (instance / '.env').write_text('BOT_MODE=chat_only\n')
+            (instance / 'data' / 'chat_archive.db').write_bytes(b'damaged database')
+            with self.assertRaisesRegex(ValueError, 'database header'):
+                create_backup(root, 'kona')
+
+    def test_failed_verification_removes_only_its_incomplete_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            instance = root / 'instances' / 'kona'
+            (instance / 'data').mkdir(parents=True)
+            (instance / '.env').write_text('BOT_MODE=chat_only\n')
+            existing = create_backup(root, 'kona')
+            with patch('scripts.instance_backup.verify_backup', side_effect=ValueError('synthetic failure')):
+                with self.assertRaises(ValueError):
+                    create_backup(root, 'kona')
+            self.assertEqual([], list(existing.parent.glob('.pending-*')))
+            self.assertTrue(existing.is_dir())
+            verify_backup(existing)
+
     def test_canonical_external_database_and_restore_integrity_are_recorded(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

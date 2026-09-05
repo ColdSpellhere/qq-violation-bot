@@ -14,6 +14,7 @@ import re
 import shutil
 import sqlite3
 import tarfile
+import tempfile
 import time
 
 FORMAT = "qqbot-instance-backup-v1"
@@ -83,66 +84,74 @@ def create_backup(root: Path, instance: str, *, mode: str = "state", extra_dirs:
         lock_path.chmod(0o600)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + mode
-        pending = managed / (".pending-" + stamp)
-        pending.mkdir(mode=0o700)
-        (pending / "databases").mkdir(mode=0o700)
-        files: dict[str, Path] = {}
-        roots = [source / ".env", source / "character.md", source / "data"]
-        if mode == "full":
-            roots.extend([source / "evidence", source / "exports"])
-        for index, directory in enumerate([*roots, *extra_dirs]):
-            if not directory.exists():
-                if directory in extra_dirs:
-                    raise ValueError("explicit extra backup directory is missing")
-                continue
-            _safe(directory)
-            candidates = [directory] if directory.is_file() else sorted(directory.rglob("*"))
-            for item in candidates:
-                _safe(item)
-                if not item.is_file() or item.name.endswith(("-wal", "-shm", "-journal", ".lock")):
+        # An incomplete snapshot is never a recovery point; retain completed backups only.
+        with tempfile.TemporaryDirectory(prefix=".pending-" + stamp + "-", dir=managed) as raw_pending:
+            pending = Path(raw_pending)
+            (pending / "databases").mkdir(mode=0o700)
+            files: dict[str, Path] = {}
+            roots = [source / ".env", source / "character.md", source / "data"]
+            if mode == "full":
+                roots.extend([source / "evidence", source / "exports"])
+            for index, directory in enumerate([*roots, *extra_dirs]):
+                if not directory.exists():
+                    if directory in extra_dirs:
+                        raise ValueError("explicit extra backup directory is missing")
                     continue
-                name = str(item.relative_to(source)) if item.is_relative_to(source) else f"extra-{index}/" + str(item.relative_to(directory))
-                files[name] = item
-        databases = set()
-        for item in files.values():
-            with item.open("rb") as stream:
-                if stream.read(16) == b"SQLite format 3\x00":
+                _safe(directory)
+                candidates = [directory] if directory.is_file() else sorted(directory.rglob("*"))
+                for item in candidates:
+                    _safe(item)
+                    if not item.is_file() or item.name.endswith(("-wal", "-shm", "-journal", ".lock")):
+                        continue
+                    name = str(item.relative_to(source)) if item.is_relative_to(source) else f"extra-{index}/" + str(item.relative_to(directory))
+                    files[name] = item
+            databases = set()
+            for item in files.values():
+                with item.open("rb") as stream:
+                    sqlite_header = stream.read(16) == b"SQLite format 3\x00"
+                suffixes = item.suffixes
+                known_database = item.suffix.lower() in {".db", ".sqlite", ".sqlite3"} or (
+                    len(suffixes) > 1 and suffixes[-1].lower() == ".bak" and suffixes[-2].lower() in {".db", ".sqlite", ".sqlite3"})
+                if known_database and not sqlite_header:
+                    raise ValueError("invalid database header in backup source")
+                if sqlite_header:
                     databases.add(item)
-        url = values.get("DATABASE_URL", "")
-        if url.startswith("sqlite:///"):
-            configured = Path(url[len("sqlite:///"):])
-            if not configured.is_absolute():
-                configured = (source / "current").resolve() / configured
-            if configured.exists():
-                databases.add(_safe(configured))
-            elif values.get("BOT_MODE", "full") != "chat_only":
-                raise ValueError("configured business database is missing")
-        manifest = {"format": FORMAT, "instance": instance, "mode": mode,
-            "created_at": datetime.now(timezone.utc).isoformat(), "source_root": str(source),
-            "consistency": "per-database online snapshot; files captured during the stated interval",
-            "current": str((source / "current").resolve()), "databases": [], "files": {},
-            "media_included": mode == "full"}
-        for index, database in enumerate(sorted(databases)):
-            manifest["databases"].append(_sqlite_copy(database, pending / "databases" / f"{index}-{database.name}.sqlite3", time.monotonic() + 120))
-        archive = pending / "files.tar.gz"
-        with tarfile.open(archive, "w:gz", compresslevel=1) as tar:
-            for name, path in files.items():
-                if path in databases:
-                    continue
-                if mode == "state" and path.name not in {".env", "character.md"} and path.suffix.lower() not in _STATE_SUFFIXES:
-                    continue
-                manifest["files"][name] = {"bytes": path.stat().st_size, "sha256": _hash(path)}
-                tar.add(path, arcname=name, recursive=False)
-        archive.chmod(0o600)
-        manifest["archive_sha256"] = _hash(archive)
-        manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
-        output = pending / "manifest.json"
-        output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        output.chmod(0o600)
-        verify_backup(pending)
-        final = managed / stamp
-        os.replace(pending, final)
-        return final
+            url = values.get("DATABASE_URL", "")
+            if url.startswith("sqlite:///"):
+                configured = Path(url[len("sqlite:///"):])
+                if not configured.is_absolute():
+                    configured = (source / "current").resolve() / configured
+                if configured.exists():
+                    databases.add(_safe(configured))
+                elif values.get("BOT_MODE", "full") != "chat_only":
+                    raise ValueError("configured business database is missing")
+            manifest = {"format": FORMAT, "instance": instance, "mode": mode,
+                "created_at": datetime.now(timezone.utc).isoformat(), "source_root": str(source),
+                "consistency": "per-database online snapshot; files captured during the stated interval",
+                "current": str((source / "current").resolve()), "databases": [], "files": {},
+                "media_included": mode == "full"}
+            for index, database in enumerate(sorted(databases)):
+                manifest["databases"].append(_sqlite_copy(database, pending / "databases" / f"{index}-{database.name}.sqlite3", time.monotonic() + 120))
+            archive = pending / "files.tar.gz"
+            with tarfile.open(archive, "w:gz", compresslevel=1) as tar:
+                for name, path in files.items():
+                    if path in databases:
+                        continue
+                    recovery_copy = path.suffix.lower() == ".bak" and Path(path.stem).suffix.lower() in _STATE_SUFFIXES
+                    if mode == "state" and path.name not in {".env", "character.md"} and path.suffix.lower() not in _STATE_SUFFIXES and not recovery_copy:
+                        continue
+                    manifest["files"][name] = {"bytes": path.stat().st_size, "sha256": _hash(path)}
+                    tar.add(path, arcname=name, recursive=False)
+            archive.chmod(0o600)
+            manifest["archive_sha256"] = _hash(archive)
+            manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
+            output = pending / "manifest.json"
+            output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            output.chmod(0o600)
+            verify_backup(pending)
+            final = managed / stamp
+            os.replace(pending, final)
+            return final
 
 
 def verify_backup(snapshot: Path) -> dict:
