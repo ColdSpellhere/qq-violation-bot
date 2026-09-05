@@ -60,7 +60,8 @@ class MemberSummaryDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(expected,raised.exception.code)
                 self.assertEqual(expected,str(raised.exception))
                 self.assertTrue(raised.exception.retryable)  # Existing bounded retry policy is unchanged.
-                completion.assert_awaited_once()
+                self.assertEqual(2 if expected == 'member_summary_too_long' else 1,
+                                 completion.await_count)
                 self.assertEqual('旧'*278,self.profile().summary)
                 self.assertEqual(0,self.profile().summary_through_fact_id)
 
@@ -147,7 +148,7 @@ class MemberSummaryDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         async def processor(job):
             return await self.refresh()
         worker = MemoryJobWorker(queue,processor,worker_id='synthetic-worker',allowed_job_types=lambda:{'member_facts'})
-        with patch.object(ai,'_complete',AsyncMock(return_value='合'*301)):
+        with patch.object(ai,'_complete',AsyncMock(return_value='合'*301)) as completion:
             for index in range(3):
                 current = queue.claim(worker_id='synthetic-worker',now=now+timedelta(seconds=60*(index+1)),
                                       limit=1,allowed_job_types={'member_facts'})[0]
@@ -156,4 +157,5 @@ class MemberSummaryDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual('member_summary_too_long',row.error_code)
                 self.assertEqual('pending' if index<2 else 'failed',row.status)
                 self.assertEqual(index+1,row.attempts)
+        self.assertEqual(6, completion.await_count)  # 2 logical generations per queue attempt.
         self.assertEqual(0,self.profile().summary_through_fact_id)

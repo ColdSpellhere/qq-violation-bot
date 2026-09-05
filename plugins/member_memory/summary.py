@@ -35,8 +35,13 @@ async def refresh_member_summary(path: Path, root: Path, *, group_id: int, user_
             raise
         if work is None:
             return refreshed
-        text = await generate_memory_summary(work.summary, work.facts, **({"strict": True} if strict else {}))
+        generation_options = {"strict": True} if strict else {}
+        if allowed is not None:
+            generation_options["still_allowed"] = allowed
+        text = await generate_memory_summary(work.summary, work.facts, **generation_options)
         if text is None:
+            if allowed is not None and not allowed():
+                return refreshed
             if strict:
                 raise MemberSummaryError("member_summary_generation_failed")
             return refreshed

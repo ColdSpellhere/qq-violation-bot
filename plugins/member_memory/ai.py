@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import httpx
 
@@ -15,6 +16,7 @@ from plugins.llm_gateway.errors import (
     GatewayTimeout, GatewayTransportError,
 )
 from .errors import MemberMemoryError, MemberSummaryError
+from .safety import contains_secret
 from plugins.member_memory.store import MemoryTrait
 from plugins.violation_record.config import CONFIG
 
@@ -49,6 +51,8 @@ def _summary_messages(
             "role": "system",
             "content": (
                 "将已有摘要和新增的本人记忆合并为不超过300字的中文摘要。"
+                "目标为180～220个字符，总字符数必须≤300；汉字、字母、数字、标点和空白"
+                "（包括空格、换行）都计入字符数。不要添加首尾空白。"
                 "只保留输入中的明确非敏感事实，不推测、不扩写、不评价，只输出摘要正文。"
             ),
         },
@@ -175,7 +179,10 @@ def _summary_request_error(error: Exception) -> MemberSummaryError:
     return MemberSummaryError("member_summary_" + code)
 
 
-async def generate_memory_summary(existing: str, facts: Sequence[MemoryTrait], *, strict: bool = False) -> str | None:
+async def generate_memory_summary(
+    existing: str, facts: Sequence[MemoryTrait], *, strict: bool = False,
+    still_allowed: Callable[[], bool] | None = None,
+) -> str | None:
     use_gateway, economy_mode = _request_policy()
     api_available = bool(
         getattr(CONFIG, "glm_api_key", "") if economy_mode else CONFIG.ai_api_key
@@ -186,28 +193,45 @@ async def generate_memory_summary(existing: str, facts: Sequence[MemoryTrait], *
         if strict:
             raise MemberSummaryError("member_summary_configuration_error")
         return None
-    try:
-        content = await _complete(
-            "summary",
-            _summary_messages(existing, facts),
-            use_gateway=use_gateway,
-            economy_mode=economy_mode,
-        )
-    except (OSError, ValueError, KeyError, TypeError, IndexError, httpx.HTTPError, GatewayError) as exc:
-        if strict:
-            raise _summary_request_error(exc) from None
-        return None
-    rejection = None
-    if not isinstance(content, str):
-        rejection = "member_summary_invalid_response"
-    else:
-        text = content.strip()
-        if not text:
-            rejection = "member_summary_empty_response"
-        elif len(text) > 300:
-            rejection = "member_summary_too_long"
+    # Snapshot the original inputs once. A correction never includes rejected output.
+    original_messages = _summary_messages(existing, facts)
+    messages = original_messages
+    for attempt in range(2):
+        if still_allowed is not None and not still_allowed():
+            return None
+        try:
+            content = await _complete(
+                "summary", messages,
+                use_gateway=use_gateway, economy_mode=economy_mode,
+            )
+        except (OSError, ValueError, KeyError, TypeError, IndexError, httpx.HTTPError, GatewayError) as exc:
+            if strict:
+                raise _summary_request_error(exc) from None
+            return None
+        if not isinstance(content, str):
+            rejection = "member_summary_invalid_response"
         else:
-            return text
+            text = content.strip()
+            if not text:
+                rejection = "member_summary_empty_response"
+            elif len(text) <= 300:
+                return text  # The existing commit boundary also checks secrets and CAS.
+            elif contains_secret(text):
+                rejection = "member_summary_secret_blocked"
+            else:
+                rejection = "member_summary_too_long"
+                if attempt == 0:
+                    messages = (
+                        {**original_messages[0], "content": str(original_messages[0]["content"])
+                         + "上一次生成超过字符上限。请仅根据下方原始输入重新合并、精简措辞，"
+                         "优先保留重要的明确事实，控制在180～220个字符，绝不能超过300个字符。"},
+                        original_messages[1],
+                    )
+                    del content, text
+                    # Honor pending cancellation before spending the single correction.
+                    await asyncio.sleep(0)
+                    continue
+        break
     if strict:
         raise MemberSummaryError(rejection)
     return None
