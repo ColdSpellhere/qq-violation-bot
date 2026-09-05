@@ -4,10 +4,15 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from nonebot import get_driver
+
 from .admin_resolver import resolve_operator
 from .config import CONFIG, GROUP_AREAS, LOCKED_STATUSES
 from .db import connect, dump_json, now_str
 from .deduction_policy import (
+    policy_review_fingerprint,
+    resolve_policy_review,
+    classify_severity,
     clear_manual_stop,
     reject_stop_suggestion,
     renew_manual_stop,
@@ -27,10 +32,13 @@ class PolicyCommand:
     group_area: str | None = None
     qq_number: str | None = None
     reason: str | None = None
+    pending_action_id: int | None = None
+    recovery_mode: str | None = None
 
     @property
     def is_write(self) -> bool:
         return self.name in {
+            "resolve_review",
             "manual_stop",
             "manual_clear",
             "manual_renew",
@@ -52,7 +60,7 @@ _LIST_NAMES = {
 }
 _POLICY_PREFIXES = tuple(
     sorted(
-        [*_WRITE_NAMES, *_LIST_NAMES, "查询减数状态", "查询减数日志"],
+        [*_WRITE_NAMES, *_LIST_NAMES, "查询减数状态", "查询减数日志", "复核减数冲突"],
         key=len,
         reverse=True,
     )
@@ -72,6 +80,16 @@ def parse_policy_command(text: str) -> PolicyCommand | None:
         return None
     if source in _LIST_NAMES:
         return PolicyCommand(_LIST_NAMES[source])
+
+    review = re.fullmatch(r"复核减数冲突\s+(\S+)\s+(\S+)\s+(\d+)\s+(保留周期|重新计时)\s+(.+)", source)
+    if review:
+        area,qq,pending_id,mode,reason = review.groups()
+        _validate_area_qq(area,qq)
+        if int(pending_id) <= 0:
+            raise PolicyCommandError("复核待办编号必须为正整数")
+        return PolicyCommand("resolve_review",area,qq,reason.strip(),int(pending_id),mode)
+    if source.startswith("复核减数冲突"):
+        raise PolicyCommandError("格式：复核减数冲突 <群域> <QQ号> <待办编号> <保留周期|重新计时> <事由>")
 
     write = re.fullmatch(
         r"(减停|清除减停|续期减停|拒绝减停建议)\s+(\S+)\s+(\S+)(?:\s+(.+))?",
@@ -182,6 +200,7 @@ def _validate_write_context(
 
 
 _PENDING_TYPES = {
+    "resolve_review": "v102_resolve_review",
     "manual_stop": "v102_manual_stop",
     "manual_clear": "v102_manual_clear",
     "manual_renew": "v102_manual_renew",
@@ -191,6 +210,7 @@ _OPERATION_COMMAND_NAMES = {
     value: key for key, value in _PENDING_TYPES.items()
 }
 _WRITE_LABELS = {
+    "resolve_review": "复核减数冲突",
     "manual_stop": "减停",
     "manual_clear": "清除减停",
     "manual_renew": "续期减停",
@@ -202,6 +222,88 @@ _COMMAND_PENDING_ACTIONS = {
     "manual_renew": "stop_decision",
     "reject_suggestion": "stop_suggestion",
 }
+
+
+def _review_operator_allowed(qq_number: str) -> bool:
+    try:
+        return str(qq_number) in {str(item) for item in get_driver().config.superusers}
+    except (ValueError, AttributeError):
+        return False
+
+
+def _preview_review_command(command: PolicyCommand, *, group_id: str, operator_qq: str,
+                            message_id: str | None) -> str:
+    if not _review_operator_allowed(operator_qq):
+        return "仅配置的机器人管理员可以复核减数冲突。"
+    try:
+        with connect() as conn:
+            member,state = _member_and_state(conn,command)
+            policy,cycle = _policy_context(conn,member["id"],command.group_area)
+            pending = conn.execute("""SELECT * FROM v102_pending_actions WHERE id=? AND member_id=?
+                AND group_area=? AND action_type='replay_review' AND status='pending'""",
+                (command.pending_action_id,member["id"],command.group_area)).fetchone()
+            if pending is None or policy is None:
+                raise PolicyCommandError("查不到该成员群域对应的待复核冲突，请重新查询减数待办。")
+            records = conn.execute("""SELECT action FROM violation_records WHERE member_id=? AND group_area=?
+                AND is_withdrawn=0 AND is_test=0 AND is_countable=1""",(member["id"],command.group_area)).fetchall()
+            severe = sum(classify_severity(row["action"]).value == "severe" for row in records)
+            fingerprint = policy_review_fingerprint(conn,member["id"],command.group_area)
+    except PolicyCommandError as exc:
+        return str(exc)
+    payload={"member_id":member["id"],"group_area":command.group_area,"qq_number":command.qq_number,
+        "pending_action_id":command.pending_action_id,"recovery_mode":command.recovery_mode,
+        "reason":command.reason,"message_id":message_id,"fingerprint":fingerprint,
+        "operator_qq":str(operator_qq),"group_id":str(group_id)}
+    from .service import _set_pending
+    _set_pending(group_id,operator_qq,"v102_resolve_review",payload)
+    cycle_text=f"{cycle['cycle_type']}（{cycle['start_at']} 至 {cycle['due_at']}，{cycle['status']}）" if cycle else "无活动周期"
+    behavior=("保持原起止时间；已经到期的自动周期可能在确认后补结算。" if command.recovery_mode == "保留周期"
+        else "从确认时重新计时；保留已有减停/最后警告状态和已执行减数。")
+    return (f"{format_member(member)}\n\n复核待办：#{pending['id']}\n群域：{command.group_area}\n"
+        f"冲突：{pending['reason']}\n当前状态：{state['status']}\n当前周期：{cycle_text}\n"
+        f"已执行减数：{state['deduct_count']}；策略操作：{policy['v102_operation_count']}/5\n"
+        f"有效记录：{len(records)} 条，其中严重禁言 {severe} 条。\n"
+        f"恢复方式：{command.recovery_mode}。{behavior}\n"
+        "确认将保留合法记录和既有人工决定，将当前证据作为新的回放起点；不自动重判旧决定。\n"
+        f"事由：{command.reason}\n\n请回复“确认”保存，或回复“取消”放弃。")
+
+
+def _apply_review_command(payload: dict[str,Any], operator: dict[str,Any], message_id: str | None) -> str:
+    actor=str(operator.get("qq_number") or "")
+    if not _review_operator_allowed(actor) or actor != str(payload.get("operator_qq") or ""):
+        return "复核未执行：机器人管理员权限已变化或确认人与预览不一致。"
+    at=now_str()
+    before = None
+    try:
+        with connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            before={"state":dict(conn.execute("SELECT * FROM member_group_states WHERE member_id=? AND group_area=?",
+                (payload["member_id"],payload["group_area"])).fetchone()),"pending_action_id":payload["pending_action_id"],
+                "fingerprint":payload["fingerprint"]}
+            outcome=resolve_policy_review(conn,member_id=payload["member_id"],group_area=payload["group_area"],
+                pending_action_id=int(payload["pending_action_id"]),recovery_mode=payload["recovery_mode"],
+                expected_fingerprint=payload["fingerprint"],effective_at=at,reason=payload["reason"],actor_qq=actor,
+                idempotency_key=f"confirm:review:{payload.get('message_id') or message_id}:{payload['pending_action_id']}")
+            if not outcome.changed:
+                return f"此复核已处理，策略事件：#{outcome.event_id}。"
+            after=dict(conn.execute("SELECT * FROM member_group_states WHERE member_id=? AND group_area=?",
+                (payload["member_id"],payload["group_area"])).fetchone())
+            conn.execute("""INSERT INTO operation_logs(group_area,operation_type,source,operator_qq,operator_nickname,
+                target_member_id,before_json,after_json,message_id,created_at,remark)
+                VALUES(?,'复核减数冲突','手动',?,?,?,?,?,?,?,?)""",
+                (payload["group_area"],actor,operator.get("nickname"),payload["member_id"],dump_json(before),
+                 dump_json({"state":after,"event_id":outcome.event_id,"recovery_mode":payload["recovery_mode"]}),
+                 message_id,at,payload["reason"]))
+    except (ValueError, TypeError, KeyError) as exc:
+        with connect() as conn:
+            conn.execute("""INSERT INTO operation_logs(group_area,operation_type,source,operator_qq,operator_nickname,
+                target_member_id,before_json,after_json,message_id,created_at,remark)
+                VALUES(?,'复核减数冲突失败','手动',?,?,?,?,?,?,?,?)""",
+                (payload.get("group_area"),actor,operator.get("nickname"),payload.get("member_id"),dump_json(before),
+                 dump_json({"result":"rejected","reason":str(exc)}),message_id,at,payload.get("reason")))
+        return f"复核未执行：{exc}。请重新查询待办并生成预览。"
+    return (f"已复核减数冲突 #{payload['pending_action_id']}。\n群域：{payload['group_area']}；QQ号：{payload['qq_number']}\n"
+        f"恢复方式：{payload['recovery_mode']}；保留既有人工决定与合法记录。\n策略事件：#{outcome.event_id}")
 
 
 def preview_policy_command(
@@ -216,6 +318,8 @@ def preview_policy_command(
         raise PolicyCommandError("该命令不是写操作。")
     if not CONFIG.deduction_policy_v102_enabled:
         return "v1.0.2beta 减数策略当前未启用。"
+    if command.name == "resolve_review":
+        return _preview_review_command(command,group_id=group_id,operator_qq=operator_qq,message_id=message_id)
     operator = resolve_operator(operator_qq, operator_nickname)
     if not operator:
         return "无法登记当前操作人，请联系维护者查看 admins 表。"
@@ -353,6 +457,7 @@ def query_policy_command(command: PolicyCommand) -> str | StructuredReply:
                 "清除减停",
                 "续期减停",
                 "拒绝减停建议",
+                "复核减数冲突",
             )
             for row in operation_rows:
                 if not str(row["operation_type"]).startswith(policy_labels):
@@ -436,7 +541,7 @@ def query_policy_command(command: PolicyCommand) -> str | StructuredReply:
                 "减数待办",
                 [
                     f"{row['qq_nickname'] or '未知昵称'}（{row['qq_number']}） "
-                    f"{row['group_area']} {row['action_type']} 事件#{row['caused_by_event_id']}"
+                    f"{row['group_area']} 待办#{row['id']} {row['action_type']} 事件#{row['caused_by_event_id']}：{row['reason']}"
                     for row in rows
                 ],
             )
@@ -496,6 +601,8 @@ def apply_pending_policy_command(
 ) -> str:
     if not CONFIG.deduction_policy_v102_enabled:
         return "v1.0.2beta 减数策略当前未启用，未执行操作。"
+    if operation_type == "v102_resolve_review":
+        return _apply_review_command(payload,operator,message_id)
     action_names = {
         "v102_manual_stop": ("减停", start_manual_stop),
         "v102_manual_clear": ("清除减停", clear_manual_stop),

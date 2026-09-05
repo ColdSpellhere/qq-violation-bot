@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -722,6 +723,140 @@ def record_policy_review(
     return PolicyOutcome(event_id, created, pending_id)
 
 
+def _latest_review_checkpoint(conn, member_id: int, group_area: str):
+    return conn.execute("""SELECT * FROM v102_policy_events
+        WHERE member_id=? AND group_area=? AND event_type='policy_review_resolved'
+          AND replay_generation=0 AND is_effective=1 ORDER BY id DESC LIMIT 1""",
+        (member_id, group_area)).fetchone()
+
+
+def policy_review_fingerprint(conn, member_id: int, group_area: str) -> str:
+    """Bind confirmation to the exact member evidence and projection shown."""
+    material = {}
+    for table in ("member_group_states", "v102_policy_state", "v102_policy_cycles",
+                  "violation_records", "v102_status_bridge_jobs"):
+        material[table] = [dict(row) for row in conn.execute(
+            f"SELECT * FROM {table} WHERE member_id=? AND group_area=? ORDER BY id" if table != "v102_policy_state"
+            else f"SELECT * FROM {table} WHERE member_id=? AND group_area=?",
+            (member_id, group_area))]
+    material["pending"] = [dict(row) for row in conn.execute("""SELECT id,action_type,status,reason,caused_by_event_id
+        FROM v102_pending_actions WHERE member_id=? AND group_area=? ORDER BY id""",(member_id,group_area))]
+    return hashlib.sha256(_json(material).encode()).hexdigest()
+
+
+def resolve_policy_review(
+    conn, *, member_id: int, group_area: str, pending_action_id: int,
+    recovery_mode: str, expected_fingerprint: str, effective_at: str | datetime,
+    reason: str, actor_qq: str, idempotency_key: str,
+) -> PolicyOutcome:
+    """Accept changed evidence and preserve executed human decisions explicitly."""
+    at = _time_text(effective_at)
+    existing = conn.execute("SELECT id FROM v102_policy_events WHERE idempotency_key=?",(idempotency_key,)).fetchone()
+    if existing is not None:
+        return PolicyOutcome(int(existing["id"]),False)
+    if recovery_mode not in {"保留周期", "重新计时"} or not reason.strip() or not actor_qq.strip():
+        raise ValueError("必须明确恢复方式、复核人和非空事由")
+    pending = conn.execute("""SELECT * FROM v102_pending_actions WHERE member_id=? AND group_area=?
+        AND action_type IN ('input_review','replay_review') AND status='pending' ORDER BY id""",
+        (member_id,group_area)).fetchall()
+    if len(pending) != 1 or pending[0]["action_type"] != "replay_review" or pending[0]["id"] != pending_action_id:
+        raise ValueError("待办编号与成员群域不匹配，或还有其他输入复核未处理")
+    if not expected_fingerprint or expected_fingerprint != policy_review_fingerprint(conn,member_id,group_area):
+        raise ValueError("记录或策略状态已变化，请重新生成复核预览")
+    policy = _ensure_policy_state(conn,member_id,group_area,at)
+    records = conn.execute("""SELECT * FROM violation_records WHERE member_id=? AND group_area=?
+        AND is_withdrawn=0 AND is_test=0 AND is_countable=1 ORDER BY id""",(member_id,group_area)).fetchall()
+    jobs = conn.execute("""SELECT * FROM v102_status_bridge_jobs WHERE member_id=? AND group_area=?
+        AND job_status!='applied' ORDER BY id""",(member_id,group_area)).fetchall()
+    current_cycle = _active_cycle(conn,member_id,group_area)
+    if recovery_mode == "保留周期" and current_cycle is not None:
+        affected_current = conn.execute("""SELECT 1 FROM violation_records r WHERE r.member_id=? AND r.group_area=?
+            AND r.violation_time>=? AND (r.id=(SELECT source_record_id FROM v102_policy_events WHERE id=?)
+            OR (r.is_withdrawn=0 AND r.is_test=0 AND r.is_countable=1 AND r.action LIKE '%禁言%'
+                AND NOT EXISTS (SELECT 1 FROM v102_policy_events e WHERE e.source_record_id=r.id
+                    AND e.event_type IN ('mute_recorded','mute_duration_unknown')))) LIMIT 1""",
+            (member_id,group_area,current_cycle["start_at"],pending[0]["caused_by_event_id"])).fetchone()
+        if affected_current is not None or jobs:
+            raise ValueError("当前周期内也有待复核的新证据或状态变更，不能直接沿用旧评价；请选择重新计时")
+    for record in records:
+        _validate_effective_time(_time_text(record["violation_time"]),at)
+        if classify_severity(record["action"]) is Severity.UNKNOWN:
+            raise ValueError("仍有无法确定禁言时长的记录，请先纠正后复核")
+    for job in jobs:
+        _validate_effective_time(_time_text(job["effective_at"]),at)
+    event_id,_ = _insert_event(conn,member_id=member_id,group_area=group_area,
+        event_type="policy_review_resolved",effective_time=at,event_priority=60,source_sequence=pending_action_id,
+        ingest_time=at,idempotency_key=idempotency_key,caused_by_event_id=int(pending[0]["caused_by_event_id"]),
+        payload={"reason":reason,"actor_qq":actor_qq,"pending_action_id":pending_action_id,"recovery_mode":recovery_mode})
+    # Inputs entered while this member was isolated are covered by this explicit review.
+    for record in records:
+        severity = classify_severity(record["action"])
+        if severity is Severity.NONE or record["id"] <= int(policy["baseline_record_watermark"] or 0):
+            continue
+        _insert_event(conn,member_id=member_id,group_area=group_area,event_type="mute_recorded",
+            effective_time=record["violation_time"],event_priority=10,source_sequence=int(record["id"]),
+            ingest_time=at,source_record_id=int(record["id"]),idempotency_key=f"record:{record['id']}:applied",
+            payload={"severity":severity.value,"mute_seconds":parse_mute_seconds(record["action"]),
+                     "accepted_by_review":event_id})
+    for job in jobs:
+        status_event,_ = _insert_event(conn,member_id=member_id,group_area=group_area,event_type="status_changed",
+            effective_time=job["effective_at"],event_priority=30,source_sequence=0,ingest_time=at,
+            idempotency_key=job["idempotency_key"],payload={"status":job["target_status"],"accepted_by_review":event_id})
+        conn.execute("""UPDATE v102_status_bridge_jobs SET job_status='applied',applied_event_id=?,
+            last_error=NULL,updated_at=? WHERE id=?""",(status_event,at,job["id"]))
+    _resolve_pending_actions(conn,member_id,group_area,decision_event_id=event_id,at=at,action_types=("replay_review",))
+    business = sync_count_state(conn,member_id,group_area,updated_at=at)
+    cycle = _active_cycle(conn,member_id,group_area)
+    if business["status"] in TERMINAL_STATUSES:
+        _cancel_active_cycle(conn,member_id,group_area,at=at,reason="review_terminal_status")
+        _set_no_cycle(conn,member_id,group_area,"terminal_status",at,preserve_tag=True)
+    elif recovery_mode == "重新计时" or cycle is None:
+        current=max(0,int(business["total_count"] or 0)-int(business["deduct_count"] or 0))
+        cycle_type = ("final_warning" if business["status"] == "最后警告" else
+            "stop" if cycle is not None and cycle["cycle_type"] == "stop" else
+            "slow" if current>=3 or business["status"] == "已质询" else "normal")
+        sequence = int(cycle["fixed_sequence"] or 0) if cycle is not None else 0
+        _cancel_active_cycle(conn,member_id,group_area,at=at,reason="review_restarted")
+        _start_cycle(conn,member_id=member_id,group_area=group_area,cycle_type=cycle_type,start_at=at,
+            caused_by_event_id=event_id,fixed_sequence=sequence)
+    else:
+        settle_due_cycles(conn,at,member_id=member_id,group_area=group_area)
+    conn.execute("""UPDATE v102_policy_state SET last_processed_event_id=?,last_reason='review_resolved',
+        state_version=state_version+1,updated_at=? WHERE member_id=? AND group_area=?""",(event_id,at,member_id,group_area))
+    cycle = _active_cycle(conn,member_id,group_area)
+    snapshot={"reason":reason,"actor_qq":actor_qq,"pending_action_id":pending_action_id,"recovery_mode":recovery_mode,
+        "business":dict(_business_state(conn,member_id,group_area)),
+        "policy":dict(_ensure_policy_state(conn,member_id,group_area,at)),
+        "cycle":dict(cycle) if cycle is not None else None,
+        "pending_actions":[dict(row) for row in conn.execute("SELECT * FROM v102_pending_actions WHERE member_id=? AND group_area=? AND status='pending'",(member_id,group_area))],
+        "event_watermark":int(conn.execute("SELECT COALESCE(MAX(id),0) FROM v102_policy_events").fetchone()[0]),
+        "record_watermark":int(conn.execute("SELECT COALESCE(MAX(id),0) FROM violation_records").fetchone()[0])}
+    conn.execute("UPDATE v102_policy_events SET payload_json=? WHERE id=?",(_json(snapshot),event_id))
+    return PolicyOutcome(event_id,True)
+
+
+def _restore_review_checkpoint(conn, checkpoint) -> dict:
+    snapshot=json.loads(checkpoint["payload_json"])
+    member_id,area=int(checkpoint["member_id"]),checkpoint["group_area"]
+    for table,key in (("member_group_states","business"),("v102_policy_state","policy"),("v102_policy_cycles","cycle")):
+        values=snapshot[key]
+        if values is None:
+            continue
+        columns={str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        fields=[name for name in values if name in columns and name not in {"id","member_id","group_area"}]
+        if table == "v102_policy_cycles":
+            where="id=? AND member_id=? AND group_area=?";parameters=[values["id"],member_id,area]
+        else:
+            where="member_id=? AND group_area=?";parameters=[member_id,area]
+        assignments=','.join(f'"{field}"=?' for field in fields)
+        conn.execute(f"UPDATE {table} SET {assignments} WHERE {where}",[values[field] for field in fields]+parameters)
+    for pending in snapshot.get("pending_actions", []):
+        conn.execute("""UPDATE v102_pending_actions SET status='pending',caused_by_event_id=?,
+            decision_event_id=NULL,updated_at=? WHERE id=? AND member_id=? AND group_area=?""",
+            (checkpoint["id"],checkpoint["effective_time"],pending["id"],member_id,area))
+    return snapshot
+
+
 def _set_event_evaluation_owner(
     conn: sqlite3.Connection,
     event_id: int,
@@ -914,6 +1049,11 @@ def process_violation_record(
     member_id = int(record["member_id"])
     group_area = record["group_area"]
     _ensure_policy_state(conn, member_id, group_area, ingested_at)
+    checkpoint = _latest_review_checkpoint(conn, member_id, group_area) if replay_generation == 0 else None
+    if checkpoint is not None and effective_at < checkpoint["effective_time"]:
+        return record_policy_review(conn, member_id=member_id, group_area=group_area,
+            source_record_id=source_record_id,key=f"event:{event_id}:replay-review",at=ingested_at,
+            reason=f"新证据早于已确认复核事件 {checkpoint['id']}，保留人工决定，需重新复核",action_type="replay_review")
     settle_due_cycles(
         conn,
         _time_text(_time_value(effective_at) - timedelta(seconds=1)),
@@ -1428,6 +1568,11 @@ def process_status_change(
     )
     if not created:
         return PolicyOutcome(event_id, False)
+    checkpoint = _latest_review_checkpoint(conn, member_id, group_area) if replay_generation == 0 else None
+    if checkpoint is not None and at < checkpoint["effective_time"]:
+        return record_policy_review(conn,member_id=member_id,group_area=group_area,source_record_id=None,
+            key=f"event:{event_id}:replay-review",at=ingested_at,
+            reason=f"状态变更早于已确认复核事件 {checkpoint['id']}，需重新复核",action_type="replay_review")
     if replay_generation == 0 and at < ingested_at and _has_later_effective_event(
         conn, member_id=member_id, group_area=group_area,
         effective_at=at, priority=30, source_sequence=0, event_id=event_id,
@@ -2324,7 +2469,7 @@ def _reset_member_group_projection(
                   'mute_recorded', 'mute_duration_unknown', 'status_changed',
                   'manual_stop_started', 'manual_stop_cleared',
                   'manual_stop_renewed', 'stop_suggestion_rejected',
-                  'record_withdrawn', 'policy_review_required'
+                  'record_withdrawn', 'policy_review_required', 'policy_review_resolved'
               )
           )
         """,
@@ -2682,6 +2827,7 @@ def _replay_member_group(
         (member_id, group_area),
     ).fetchone()
     generation = int(row["generation"] or 0) + 1
+    checkpoint = _latest_review_checkpoint(conn, member_id, group_area)
     _reset_member_group_projection(
         conn,
         member_id,
@@ -2689,18 +2835,23 @@ def _replay_member_group(
         trigger_event_id=trigger_event_id,
         at=replay_at,
     )
-    _restore_migration_baseline_projection(
-        conn,
-        member_id,
-        group_area,
-        replay_generation=generation,
-        at=replay_at,
-    )
+    input_watermark = 0
+    if checkpoint is not None:
+        snapshot = _restore_review_checkpoint(conn, checkpoint)
+        input_watermark = int(snapshot["event_watermark"])
+    else:
+        _restore_migration_baseline_projection(
+            conn,
+            member_id,
+            group_area,
+            replay_generation=generation,
+            at=replay_at,
+        )
     inputs = conn.execute(
         """
         SELECT * FROM v102_policy_events
         WHERE member_id=? AND group_area=? AND replay_generation=0
-          AND is_effective=1
+          AND is_effective=1 AND id>?
           AND event_type IN (
               'mute_recorded', 'mute_duration_unknown', 'status_changed',
               'manual_stop_started', 'manual_stop_cleared',
@@ -2708,7 +2859,7 @@ def _replay_member_group(
           )
         ORDER BY effective_time, event_priority, source_sequence, id
         """,
-        (member_id, group_area),
+        (member_id, group_area, input_watermark),
     ).fetchall()
 
     index = 0
@@ -2811,6 +2962,14 @@ def withdraw_violation_record(
         WHERE source_record_id=? AND event_type='policy_review_required'""",
         (event_id, source_record_id),
     )
+    checkpoint = _latest_review_checkpoint(conn, int(record["member_id"]), record["group_area"])
+    if checkpoint is not None and source_record_id <= int(json.loads(checkpoint["payload_json"])["record_watermark"]):
+        if original is not None:
+            conn.execute("UPDATE v102_policy_events SET is_effective=0,reversed_by_event_id=? WHERE id=?",(event_id,original["id"]))
+        sync_count_state(conn,int(record["member_id"]),record["group_area"],updated_at=at)
+        return record_policy_review(conn,member_id=int(record["member_id"]),group_area=record["group_area"],
+            source_record_id=source_record_id,key=f"event:{event_id}:replay-review",at=at,
+            reason=f"撤回证据影响已确认复核事件 {checkpoint['id']}，保留原决定并再次复核",action_type="replay_review")
     if original:
         manual_conflicts = conn.execute(
             """WITH RECURSIVE affected(id) AS (
