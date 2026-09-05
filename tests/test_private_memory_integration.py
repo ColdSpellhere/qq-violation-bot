@@ -383,7 +383,8 @@ class PrivateMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("熟悉" * 300, profile.summary)
         self.assertNotIn("话题4", profile.summary)
         self.assertEqual(1_200, sum(len(item.text) for item in profile.traits))
-        self.assertEqual("喜欢火锅", profile.traits[0].text)
+        # 优先装入最新事实；单条长事实也必须遵守同一个总字符预算。
+        self.assertEqual("长事实" * 400, profile.traits[0].text)
         self.assertEqual("private", generate.await_args.kwargs["chat_mode"])
         self.assertEqual(
             "熟悉" * 300,
