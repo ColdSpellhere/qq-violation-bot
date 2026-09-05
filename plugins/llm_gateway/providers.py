@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Protocol
 
 from .contracts import GatewayCompletion, GatewayRequest, LLMProvider, LLMTask
-from .errors import GatewayConfigurationError
+from .errors import GatewayConfigurationError, GatewayRateLimitError, GatewayTimeout
 
 
 ECONOMY_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
@@ -36,6 +37,7 @@ class ProviderRouterTransport:
         economy: _ProviderTransport | None,
         total_limit: int,
         lane_limits: Mapping[str, int],
+        max_pending: int | None = None,
     ) -> None:
         if type(total_limit) is not int or total_limit <= 0:
             raise GatewayConfigurationError()
@@ -45,6 +47,9 @@ class ProviderRouterTransport:
         ):
             raise GatewayConfigurationError()
         self._primary = primary
+        if max_pending is not None and (type(max_pending) is not int or max_pending <= 0):
+            raise GatewayConfigurationError()
+        self._admission_limit = total_limit + (max_pending if max_pending is not None else total_limit * 4)
         self._economy = economy
         self._total = asyncio.Semaphore(total_limit)
         self._lanes = {
@@ -65,19 +70,34 @@ class ProviderRouterTransport:
         async with self._admission_lock:
             if not self._accepting or self._closed:
                 raise GatewayConfigurationError(task=request.task)
+            if len(self._active_tasks) >= self._admission_limit:
+                raise GatewayRateLimitError(task=request.task)
             task = asyncio.current_task()
             if task is None:
                 raise GatewayConfigurationError(task=request.task)
             self._active_tasks.add(task)
             self._drained.clear()
         try:
-            async with self._lanes[request.task.value]:
-                async with self._total:
-                    return await resource.complete(request)
+            deadline = asyncio.get_running_loop().time() + request.timeout
+            try:
+                return await asyncio.wait_for(
+                    self._complete_admitted(resource, request, deadline), timeout=request.timeout
+                )
+            except asyncio.TimeoutError:
+                raise GatewayTimeout(task=request.task) from None
         finally:
             self._active_tasks.discard(task)
             if not self._active_tasks:
                 self._drained.set()
+
+    async def _complete_admitted(self, resource: _ProviderTransport, request: GatewayRequest,
+                                 deadline: float) -> GatewayCompletion:
+        async with self._lanes[request.task.value]:
+            async with self._total:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise GatewayTimeout(task=request.task)
+                return await resource.complete(replace(request, timeout=min(request.timeout, remaining)))
 
     def _transport_for(self, request: GatewayRequest) -> _ProviderTransport:
         if request.provider is LLMProvider.PRIMARY:

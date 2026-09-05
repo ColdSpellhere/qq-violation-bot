@@ -451,6 +451,20 @@ def _event(
 
 
 class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from plugins.random_chat.delivery_store import DeliveryLedger
+        # These integration fixtures represent an enabled group. Keep the new
+        # durable send state isolated between tests with reused synthetic IDs.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        ledger = DeliveryLedger(Path(directory.name) / "delivery.sqlite3")
+        for mocked in (
+            patch("plugins.random_chat.matcher.FEATURES.group_chat_allowed", return_value=True),
+            patch("plugins.random_chat.matcher.DeliveryLedger", return_value=ledger),
+        ):
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
     def _stored_image(
         self,
         store: ChatVisionStore,
@@ -1002,6 +1016,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
             communication_style="自然简短",
         )
         features = SimpleNamespace(
+            group_chat_allowed=lambda _: True,
             snapshot=lambda: SimpleNamespace(
                 relationship_state_enabled=True,
                 prompt_builder_enabled=True,
@@ -1046,6 +1061,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_group_legacy_prompt_does_not_read_new_relationship_state(self):
         features = SimpleNamespace(
+            group_chat_allowed=lambda _: True,
             snapshot=lambda: SimpleNamespace(
                 relationship_state_enabled=True,
                 prompt_builder_enabled=False,
@@ -1147,7 +1163,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent)
         self.assertEqual("7003", archive.call_args.args[2]["message_id"])
 
-    async def test_bot_reply_archive_failure_does_not_stop_remaining_replies(self):
+    async def test_bot_reply_archive_failure_leaves_remaining_replies_for_recovery(self):
         bot = AsyncMock()
         bot.send_group_msg.return_value = {"message_id": 7002}
         with patch(
@@ -1170,7 +1186,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(sent)
-        self.assertEqual(2, bot.send_group_msg.await_count)
+        self.assertEqual(1, bot.send_group_msg.await_count)
 
     async def test_passes_current_and_unexpired_quoted_originals_to_ai(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1502,6 +1518,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 description="当前图片是一朵花",
             )
             features = SimpleNamespace(
+            group_chat_allowed=lambda _: True,
                 image_understanding_allowed=lambda: True,
                 snapshot=lambda: SimpleNamespace(
                     relationship_state_enabled=False,
@@ -1570,6 +1587,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 [MessageSegment.image("https://example.invalid/quoted.jpg")]
             )
             features = SimpleNamespace(
+            group_chat_allowed=lambda _: True,
                 image_understanding_allowed=lambda: True,
                 snapshot=lambda: SimpleNamespace(
                     relationship_state_enabled=False,
@@ -1629,6 +1647,7 @@ class RandomChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 description="当前图片是一朵花",
             )
             features = SimpleNamespace(
+            group_chat_allowed=lambda _: True,
                 image_understanding_allowed=lambda: True,
                 snapshot=lambda: SimpleNamespace(
                     relationship_state_enabled=False,

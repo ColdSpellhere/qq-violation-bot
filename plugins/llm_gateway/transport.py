@@ -54,6 +54,7 @@ class LLMTransport:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         random_uniform: Callable[[float, float], float] = random.uniform,
         clock: Callable[[], float] = time.monotonic,
+        max_pending: int | None = None,
     ) -> None:
         self._base_url = self._validate_base_url(base_url)
         if type(api_key) is not str or not api_key.strip():
@@ -64,6 +65,9 @@ class LLMTransport:
         self._api_key = api_key.strip()
         self._validate_positive_int(total_limit)
         self._validate_positive_int(max_attempts)
+        if max_pending is not None:
+            self._validate_positive_int(max_pending)
+        self._admission_limit = total_limit + (max_pending if max_pending is not None else total_limit * 4)
         expected_tasks = {task.value for task in LLMTask}
         if set(lane_limits) != expected_tasks:
             raise GatewayConfigurationError()
@@ -138,6 +142,8 @@ class LLMTransport:
         async with self._admission_lock:
             if not self._accepting or self._closed:
                 raise GatewayConfigurationError(task=request.task)
+            if len(self._active_tasks) >= self._admission_limit:
+                raise GatewayRateLimitError(task=request.task)
             task = asyncio.current_task()
             if task is None:
                 raise GatewayConfigurationError(task=request.task)
@@ -145,13 +151,23 @@ class LLMTransport:
             self._drained.clear()
         try:
             started = self._clock()
-            async with self._lanes[request.task.value]:
-                async with self._total:
-                    return await self._complete_with_retries(request, started)
+            # One wall-clock budget includes queueing, HTTP attempts and backoff.
+            # wait_for also cancels and joins the admitted call on timeout.
+            try:
+                return await asyncio.wait_for(
+                    self._complete_admitted(request, started), timeout=request.timeout
+                )
+            except asyncio.TimeoutError:
+                raise GatewayTimeout(task=request.task) from None
         finally:
             self._active_tasks.discard(task)
             if not self._active_tasks:
                 self._drained.set()
+
+    async def _complete_admitted(self, request: GatewayRequest, started: float) -> GatewayCompletion:
+        async with self._lanes[request.task.value]:
+            async with self._total:
+                return await self._complete_with_retries(request, started)
 
     async def _complete_with_retries(
         self, request: GatewayRequest, started: float

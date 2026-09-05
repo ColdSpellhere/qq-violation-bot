@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -567,7 +568,11 @@ class ProviderRouterTests(unittest.IsolatedAsyncioTestCase):
             await router.complete(request)
         self.assertIs(failure, raised.exception)
         self.assertEqual([], primary.requests)
-        self.assertEqual([request], economy.requests)
+        self.assertEqual(1, len(economy.requests))
+        routed = economy.requests[0]
+        self.assertEqual(request, replace(routed, timeout=request.timeout))
+        self.assertGreater(routed.timeout, 0)
+        self.assertLessEqual(routed.timeout, request.timeout)
 
     async def test_rejects_multimodal_economy_payload_and_closes_both_transports(self) -> None:
         primary = _Transport()

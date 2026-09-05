@@ -21,6 +21,8 @@ from plugins.violation_record.config import CONFIG
 from .ai import RandomChatAIError, generate_reply
 from .context import context_candidate_limit, select_chat_context
 from .delivery import deliver_replies
+from .delivery_store import DeliveryLedger, delivery_event_key
+from .admission import run_chat_turn
 from .stickers import choose_sticker
 
 if TYPE_CHECKING:
@@ -115,6 +117,13 @@ async def send_random_reply(
     addressed: bool = False,
     required: bool = False,
 ) -> bool:
+    return bool(await run_chat_turn(
+        f"group:{event.self_id}:{event.group_id}",
+        lambda: _send_random_reply_serial(bot, event, text, addressed=addressed, required=required),
+    ))
+
+
+async def _send_random_reply_serial(bot, event, text, *, addressed=False, required=False) -> bool:
     async with _group_lock(int(event.self_id), int(event.group_id)):
         return await _send_random_reply_locked(
             bot,
@@ -133,6 +142,16 @@ async def _send_random_reply_locked(
     addressed: bool = False,
     required: bool = False,
 ) -> bool:
+    if not FEATURES.group_chat_allowed(int(event.group_id)):
+        return False
+    ledger = await asyncio.to_thread(DeliveryLedger, CONFIG.chat_archive_path)
+    delivery_key = delivery_event_key(event.self_id, "group", event.group_id, event.user_id, event.message_id)
+    saved_parts = await asyncio.to_thread(ledger.parts, delivery_key)
+    if saved_parts and all(row["status"] == "archived" for row in saved_parts):
+        return True
+    if any(row["status"] in {"unknown", "sending", "cancelled"} for row in saved_parts):
+        logger.warning("群聊投递等待核对 key={}", delivery_key[:16])
+        return False
     context_limit = getattr(CONFIG, "chat_context_messages", 20)
     try:
         context = recent_text_context(
@@ -156,7 +175,7 @@ async def _send_random_reply_locked(
     )
     reply_message_id = _reply_message_id(event)
     stripped_text = text.strip()
-    current_has_image = any(segment.type == "image" for segment in event.message)
+    current_has_image = not saved_parts and any(segment.type == "image" for segment in event.message)
     current_text = stripped_text or ("[图片]" if current_has_image else "")
     image_allowed = getattr(FEATURES, "image_understanding_allowed", lambda: True)
     image_understanding_enabled = bool(image_allowed())
@@ -308,7 +327,7 @@ async def _send_random_reply_locked(
         relationship = None
         open_topics = ()
     try:
-        reply = await generate_reply(
+        reply = tuple(row["reply_text"] for row in saved_parts) if saved_parts else await generate_reply(
             current_text,
             context=context,
             current=current,
@@ -352,27 +371,32 @@ async def _send_random_reply_locked(
                     message += MessageSegment.image(file=f"file://{sticker}")
                 return message
 
-            send_results: list[object] = []
+            send_results: dict[int, object] = {}
 
-            async def send(message: object) -> None:
+            def restore_receipt(index: int, receipt: str) -> None:
+                send_results[index] = {"message_id": receipt}
+
+            async def send(message: object) -> object:
+                if not FEATURES.group_chat_allowed(int(event.group_id)):
+                    raise RuntimeError("group chat access changed")
                 if not isinstance(message, Message):
                     message = Message(MessageSegment.text(str(message)))
                 result = await bot.send_group_msg(
                     group_id=int(event.group_id), message=message
                 )
-                send_results.append(result)
+                return result
 
             async def archive_reply(value: str, index: int) -> None:
-                result = send_results[index] if index < len(send_results) else None
+                result = send_results.get(index)
                 message_id = (
                     result.get("message_id")
                     if isinstance(result, dict)
                     else getattr(result, "message_id", None)
                 )
                 if message_id in (None, ""):
-                    return
+                    message_id = f"bot:{event.self_id}:{event.message_id}:{index}"
                 try:
-                    archive_payload(
+                    await asyncio.to_thread(archive_payload,
                         CONFIG.chat_archive_path,
                         int(event.group_id),
                         {
@@ -392,12 +416,20 @@ async def _send_random_reply_locked(
                     logger.warning(
                         f"随机闲聊归档自身回复失败：{type(exc).__name__}"
                     )
+                    raise
 
             delivered = await deliver_replies(
                 replies[: (3 if addressed or required else 1)],
                 send=send,
                 decorate_final=decorate,
                 after_send=archive_reply,
+                ledger=ledger,
+                delivery_key=delivery_key,
+                kind="group",
+                user_id=str(event.user_id),
+                group_id=str(event.group_id),
+                allowed=lambda: FEATURES.group_chat_allowed(int(event.group_id)),
+                restore_receipt=restore_receipt,
             )
             return bool(delivered)
         except Exception as exc:

@@ -1,4 +1,5 @@
 from dataclasses import replace
+import asyncio
 
 from nonebot import logger, on_message
 from nonebot.adapters.onebot.v11 import (
@@ -19,6 +20,8 @@ from plugins.private_memory.relationship import RelationshipStore
 from plugins.private_memory.store import PrivateMemoryStore
 from plugins.random_chat.ai import RandomChatAIError, generate_reply
 from plugins.random_chat.delivery import deliver_replies
+from plugins.random_chat.delivery_store import DeliveryLedger, delivery_event_key
+from plugins.random_chat.admission import run_chat_turn
 from plugins.random_chat.stickers import choose_sticker
 from plugins.violation_record.config import CONFIG
 
@@ -73,7 +76,7 @@ def _private_profile(
 
     fact_budget = _FACTS_LIMIT
     traits: list[MemoryTrait] = []
-    for fact in facts:
+    for fact in sorted(facts, key=lambda item: (item.updated_at, item.id), reverse=True):
         if fact_budget <= 0:
             break
         text = fact.fact_text[:fact_budget]
@@ -186,6 +189,10 @@ def _enqueue_private_jobs(
 
 @private_matcher.handle()
 async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
+    await run_chat_turn(f"private:{event.self_id}:{event.user_id}", lambda: _handle_private_message(bot, event))
+
+
+async def _handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
     plain_text = event.get_plaintext()
     has_image = any(segment.type == "image" for segment in event.message)
     text = eligible_private_text(plain_text, has_image=has_image)
@@ -210,6 +217,14 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             return
         conversation.user_id = user_id
         persistent = FEATURES.snapshot().private_memory_enabled
+        ledger = await asyncio.to_thread(DeliveryLedger, CONFIG.chat_archive_path) if persistent else None
+        delivery_key = delivery_event_key(event.self_id, "private", "", event.user_id, event.message_id)
+        saved_parts = await asyncio.to_thread(ledger.parts, delivery_key) if ledger else []
+        if saved_parts and all(row["status"] == "archived" for row in saved_parts):
+            return
+        if any(row["status"] in {"unknown", "sending", "cancelled"} for row in saved_parts):
+            logger.warning("私聊投递等待核对 key={}", delivery_key[:16])
+            return
         store: PrivateMemoryStore | None = None
         queue: MemoryJobQueue | None = None
         relationship_store: RelationshipStore | None = None
@@ -254,7 +269,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             assert relationship_store is not None
             assert user_event_state is not None
             if not user_event_state.live or (
-                not user_event_state.created and user_event_state.assistant_exists
+                not user_event_state.created and user_event_state.assistant_exists and not saved_parts
             ):
                 return
             if not user_event_state.created:
@@ -284,7 +299,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
 
         images = ()
         descriptions: tuple[str, ...] = ()
-        if vision_enabled:
+        if vision_enabled and not saved_parts:
             try:
                 vision = await understand_private_images(
                     event.message,
@@ -306,7 +321,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             return
         if not current_event_is_live():
             return
-        if has_image and not real_text and not images and not descriptions:
+        if has_image and not real_text and not images and not descriptions and not saved_parts:
             return
 
         if descriptions:
@@ -381,7 +396,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                 relationship = None
                 open_topics = ()
         try:
-            reply = await generate_reply(
+            reply = tuple(row["reply_text"] for row in saved_parts) if saved_parts else await generate_reply(
                 text,
                 context=context,
                 current=current,
@@ -451,7 +466,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
             )
             conversation.append_assistant(assistant, event_time=int(event.time))
 
-        async def send(message: object) -> None:
+        async def send(message: object) -> object:
             if not FEATURES.private_chat_allowed(user_id):
                 raise RuntimeError("private chat access changed")
             if persistent and not _persistent_allowed(user_id):
@@ -460,13 +475,23 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
                 raise RuntimeError("private message was cleared")
             if not isinstance(message, Message):
                 message = Message(MessageSegment.text(str(message)))
-            await bot.send_private_msg(user_id=int(event.user_id), message=message)
+            return await bot.send_private_msg(user_id=int(event.user_id), message=message)
 
         delivered = await deliver_replies(
             replies[:3],
             send=send,
             decorate_final=decorate,
             after_send=persist,
+            ledger=ledger,
+            delivery_key=delivery_key,
+            kind="private",
+            user_id=user_id,
+            source_message_id=str(event.message_id),
+            allowed=lambda: (
+                FEATURES.private_chat_allowed(user_id)
+                and (not persistent or _persistent_allowed(user_id))
+                and current_event_is_live()
+            ),
         )
         if not delivered:
             logger.warning("私聊消息发送失败")

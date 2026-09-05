@@ -147,6 +147,7 @@ class GatewayRequest:
     response_format: Mapping[str, object] | None = None
     thinking_disabled: bool = False
     provider: LLMProvider = LLMProvider.PRIMARY
+    max_output_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task, LLMTask):
@@ -172,6 +173,10 @@ class GatewayRequest:
             raise ValueError("temperature must be a finite number from 0 to 2")
         if type(self.thinking_disabled) is not bool:
             raise ValueError("thinking_disabled must be boolean")
+        if self.max_output_tokens is not None and (
+            type(self.max_output_tokens) is not int or not 1 <= self.max_output_tokens <= 8192
+        ):
+            raise ValueError("max_output_tokens must be an integer from 1 to 8192")
         object.__setattr__(self, "messages", _freeze_json(self.messages))
         if self.response_format is not None:
             if not isinstance(self.response_format, Mapping):
@@ -192,6 +197,13 @@ class GatewayRequest:
             payload["response_format"] = _thaw_json(self.response_format)
         if self.thinking_disabled:
             payload["thinking"] = {"type": "disabled"}
+        if self.max_output_tokens is not None:
+            payload["max_tokens"] = self.max_output_tokens
+        elif self.task is not LLMTask.BUSINESS_INTENT:
+            # Preserve the business parser contract; bound chat/derived-memory output.
+            payload["max_tokens"] = 1024 if self.task in {
+                LLMTask.CHAT_REPLY, LLMTask.IMAGE_DESCRIPTION, LLMTask.RELATIONSHIP_UPDATE
+            } else 4096
         return payload
 
 

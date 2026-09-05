@@ -194,6 +194,9 @@ class ChatOutputTypeBoundaryTests(unittest.TestCase):
 
 class GroupTemporaryFailureFeedbackTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        import tempfile
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
         features = Mock()
         features.snapshot.return_value = SimpleNamespace(
             relationship_state_enabled=False,
@@ -203,7 +206,7 @@ class GroupTemporaryFailureFeedbackTests(unittest.IsolatedAsyncioTestCase):
         features.group_chat_allowed.return_value = True
         self.features = features
         config = SimpleNamespace(
-            chat_archive_path=Path("/tmp/temporary-feedback-chat.db"),
+            chat_archive_path=Path(directory.name) / "chat.db",
             chat_context_messages=20,
             chat_context_minutes=30,
             chat_context_self_messages=3,
@@ -318,7 +321,7 @@ class GroupTemporaryFailureFeedbackTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     sent = await random_matcher.send_random_reply(
                         bot,
-                        _group_event(),
+                        _group_event().model_copy(update={"message_id": 458 if sticker is None else 459}),
                         "当前消息",
                         addressed=True,
                     )
