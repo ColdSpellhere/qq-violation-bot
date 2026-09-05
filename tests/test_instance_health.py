@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +28,32 @@ def _runtime_state(**overrides: object) -> dict[str, object]:
 
 
 class InstanceHealthTests(unittest.TestCase):
+    def test_legacy_parser_state_without_economy_field_remains_health_checkable(self):
+        from dataclasses import dataclass
+        from scripts import instance_health
+
+        @dataclass
+        class LegacyState:
+            business_enabled: bool
+            chat_enabled: bool
+            group_chat_enabled: bool
+            private_chat_enabled: bool
+            group_chat_allowed_group_ids: tuple
+            private_chat_allowed_user_ids: tuple
+            llm_gateway_business_enabled: bool = False
+
+        loaded = LegacyState(False, True, True, True, (100,), ('200',))
+        parser = Mock()
+        parser._load_state.return_value = loaded
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+                instance_health, '_feature_types', return_value=(parser, LegacyState)):
+            path = Path(temporary)/'runtime_features.json'
+            instance_health.validate_runtime_state('kona', path, environment={'BOT_MODE': 'chat_only'})
+            instance_health.validate_runtime_state('carrot', path)
+            loaded.business_enabled = True
+            with self.assertRaisesRegex(ValueError, 'business'):
+                instance_health.validate_runtime_state('kona', path, environment={'BOT_MODE': 'chat_only'})
+
     def _repository_and_release(self, root: Path) -> tuple[Path, str, Path]:
         repo = root / "repository.git"
         repo.mkdir()

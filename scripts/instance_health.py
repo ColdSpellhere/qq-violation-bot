@@ -71,7 +71,9 @@ def validate_runtime_state(
             or state.llm_gateway_business_enabled is not False
         ):
             raise ValueError("kona business capability must remain disabled")
-    persisted_economy = state.economy_mode_enabled if state is not None else False
+    # Older release parsers predate this switch; their runtime has no economy
+    # capability, so inspecting them during rollback must use the old default.
+    persisted_economy = getattr(state, 'economy_mode_enabled', False)
     requested_economy = persisted_economy if state_found else (
         values.get("ECONOMY_MODE_ENABLED", "").strip().lower()
         in {"1", "true", "yes", "on"}
