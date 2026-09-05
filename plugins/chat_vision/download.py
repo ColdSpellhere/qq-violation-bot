@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import math
 import hashlib
 import ipaddress
 import os
@@ -32,6 +34,17 @@ class DownloadedChatImage:
     content: bytes
     mime_type: str
     extension: str
+
+
+@dataclass
+class ImageByteBudget:
+    remaining: int
+
+    def consume(self, amount: int) -> None:
+        if amount > self.remaining:
+            self.remaining = 0
+            raise ValueError("chat image exceeds total byte budget")
+        self.remaining -= amount
 
 
 def _default_resolver(host: str) -> list[str]:
@@ -119,12 +132,29 @@ class PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
 
 
 async def download_chat_image(
+    url: str, *, max_bytes: int, timeout: float,
+    resolver: Callable[[str], list[str]] = _default_resolver,
+    network_backend: httpcore.AsyncNetworkBackend | Any | None = None,
+    byte_budget: ImageByteBudget | None = None,
+) -> DownloadedChatImage:
+    """Apply one total deadline, including DNS, to a pinned HTTP download."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("chat image timeout must be positive")
+    try:
+        return await asyncio.wait_for(_download_chat_image(url, max_bytes=max_bytes, timeout=timeout,
+            resolver=resolver, network_backend=network_backend, byte_budget=byte_budget), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise ValueError("chat image request timed out") from None
+
+
+async def _download_chat_image(
     url: str,
     *,
     max_bytes: int,
     timeout: float,
     resolver: Callable[[str], list[str]] = _default_resolver,
     network_backend: httpcore.AsyncNetworkBackend | Any | None = None,
+    byte_budget: ImageByteBudget | None = None,
 ) -> DownloadedChatImage:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -132,7 +162,7 @@ async def download_chat_image(
     if max_bytes <= 0:
         raise ValueError("chat image size limit must be positive")
 
-    addresses = tuple(dict.fromkeys(resolver(parsed.hostname)))
+    addresses = tuple(dict.fromkeys(await asyncio.to_thread(resolver, parsed.hostname)))
     if not addresses or any(not _is_public_address(address) for address in addresses):
         raise ValueError("chat image URL resolves to a non-public address")
 
@@ -180,11 +210,16 @@ async def download_chat_image(
                 extension = _IMAGE_EXTENSIONS.get(mime_type)
                 if extension is None:
                     raise ValueError("chat image payload is not a supported image")
+                declared_size = headers.get("content-length")
+                if declared_size is not None and (not declared_size.isdigit() or int(declared_size) > max_bytes):
+                    raise ValueError("chat image exceeds size limit")
                 content = bytearray()
                 async for chunk in response.aiter_stream():
-                    content.extend(chunk)
-                    if len(content) > max_bytes:
+                    if byte_budget is not None:
+                        byte_budget.consume(len(chunk))
+                    if len(content) + len(chunk) > max_bytes:
                         raise ValueError("chat image exceeds size limit")
+                    content.extend(chunk)
     except ValueError:
         raise
     except (httpcore.NetworkError, httpcore.TimeoutException, httpcore.ProtocolError):

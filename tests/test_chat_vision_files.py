@@ -248,6 +248,37 @@ class ChatVisionFileTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(backend.stream, stream)
         self.assertEqual(["93.184.216.34", "1.1.1.1"], backend.hosts)
 
+    async def test_dns_resolution_does_not_run_on_the_event_loop_thread(self):
+        import threading
+        main_thread=threading.get_ident()
+        resolver_threads=[]
+        def resolver(host):
+            resolver_threads.append(threading.get_ident())
+            return ["93.184.216.34"]
+        await download_chat_image("https://cdn.example/a.jpg",max_bytes=1024,timeout=1,
+            resolver=resolver,network_backend=self._backend(JPEG,"image/jpeg"))
+        self.assertEqual(1,len(resolver_threads))
+        self.assertNotEqual(main_thread,resolver_threads[0])
+
+    async def test_download_total_deadline_includes_dns(self):
+        import time
+        def resolver(host):
+            time.sleep(.1)
+            return ["93.184.216.34"]
+        started=asyncio.get_running_loop().time()
+        with self.assertRaisesRegex(ValueError,"timed out"):
+            await download_chat_image("https://cdn.example/a.jpg",max_bytes=1024,timeout=.02,
+                resolver=resolver,network_backend=self._backend(JPEG,"image/jpeg"))
+        self.assertLess(asyncio.get_running_loop().time()-started,.09)
+
+    async def test_failed_stream_consumes_shared_download_budget(self):
+        from plugins.chat_vision.download import ImageByteBudget
+        budget=ImageByteBudget(5)
+        with self.assertRaises(ValueError):
+            await download_chat_image("https://cdn.example/a.jpg",max_bytes=1024,timeout=1,
+                resolver=lambda host:["93.184.216.34"],network_backend=self._backend(JPEG,"image/jpeg"),byte_budget=budget)
+        self.assertEqual(0,budget.remaining)
+
     async def test_download_rejects_content_over_the_byte_limit(self) -> None:
         with self.assertRaisesRegex(ValueError, "size limit"):
             await download_chat_image(
@@ -351,7 +382,7 @@ class ChatVisionFileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(b"outside", outside.read_bytes())
         self.assertEqual(relative_path, self.store.for_message(100, "m1")[0].relative_path)
 
-    async def test_cleanup_does_not_mark_a_missing_asset_as_deleted(self) -> None:
+    async def test_cleanup_marks_missing_asset_deleted_without_recreating_root(self) -> None:
         relative_path = "100/2026-08-21/missing-1.jpg"
         asset = self.store.ensure_pending(100, "missing", 1, "https://cdn.example/1.jpg", 1000)
         self.store.mark_downloaded(
@@ -369,7 +400,10 @@ class ChatVisionFileTests(unittest.IsolatedAsyncioTestCase):
             now_text="2026-08-29 00:00:00",
         )
 
-        self.assertEqual(relative_path, self.store.for_message(100, "missing")[0].relative_path)
+        saved = self.store.for_message(100, "missing")[0]
+        self.assertIsNone(saved.relative_path)
+        self.assertEqual("2026-08-29 00:00:00", saved.deleted_at)
+        self.assertFalse(self.chat_root.exists())
 
     async def test_cleanup_never_touches_evidence_sibling(self) -> None:
         chat_root = self.root / "data" / "chat_vision" / "images"

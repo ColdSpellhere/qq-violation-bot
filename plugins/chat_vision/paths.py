@@ -26,7 +26,7 @@ def _managed_chain(root: Path) -> tuple[Path, ...] | None:
     ) or (anchor,)
 
 
-def validate_existing_managed_root(root: Path) -> Path | None:
+def validate_existing_managed_root(root: Path, *, allow_missing: bool = False) -> Path | None:
     root = lexical_absolute(root)
     chain = _managed_chain(root)
     if chain is None:
@@ -34,6 +34,10 @@ def validate_existing_managed_root(root: Path) -> Path | None:
     for component in chain:
         try:
             mode = component.lstat().st_mode
+        except FileNotFoundError:
+            if allow_missing:
+                continue
+            return None
         except (OSError, RuntimeError):
             return None
         if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
@@ -60,8 +64,8 @@ def ensure_private_managed_root(root: Path) -> Path:
     return root
 
 
-def exact_configured_root(root: Path, configured_root: Path) -> Path | None:
+def exact_configured_root(root: Path, configured_root: Path, *, allow_missing: bool = False) -> Path | None:
     root = lexical_absolute(root)
     if root != lexical_absolute(configured_root):
         return None
-    return validate_existing_managed_root(root)
+    return validate_existing_managed_root(root, allow_missing=allow_missing)

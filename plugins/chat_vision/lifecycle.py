@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import weakref
 from datetime import datetime, timezone
-from functools import partial
 
 from nonebot import get_driver, logger
 
@@ -12,8 +11,8 @@ from plugins.violation_record.config import CONFIG
 
 from .service import (
     cleanup_expired,
-    process_pending_asset,
-    recover_pending,
+    start_workers,
+    stop_workers,
     set_store,
 )
 from .store import ChatVisionStore
@@ -63,17 +62,8 @@ def setup_lifecycle() -> None:
         store = _store
         set_store(store)
 
-        if CONFIG.chat_vision_enabled and FEATURES.image_understanding_allowed():
-            store.recover_interrupted_claims()
-            await recover_pending(
-                store,
-                partial(process_pending_asset, store=store),
-                max_retries=CONFIG.chat_vision_max_retries,
-                min_event_time=(
-                    _now_timestamp() - CONFIG.chat_vision_recovery_window_seconds
-                ),
-                max_assets=CONFIG.chat_vision_recovery_max_assets,
-            )
+        if CONFIG.chat_vision_enabled:
+            start_workers(store)
         await _cleanup_once(store)
         if _cleanup_task is None or _cleanup_task.done():
             _cleanup_task = asyncio.create_task(
@@ -83,6 +73,7 @@ def setup_lifecycle() -> None:
     @driver.on_shutdown
     async def _shutdown() -> None:
         global _cleanup_task
+        await stop_workers()
         task = _cleanup_task
         _cleanup_task = None
         if task is None:

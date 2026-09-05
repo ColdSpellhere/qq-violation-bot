@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import stat
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS chat_image_assets (
     expires_at TEXT,
     deleted_at TEXT,
     error_type TEXT,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
     UNIQUE(group_id, message_id, ordinal)
@@ -49,7 +51,7 @@ SCHEMA = TABLE_SCHEMA + INDEX_SCHEMA
 _SELECT_FIELDS = (
     "id,group_id,message_id,ordinal,source_url,event_time,status,attempts,"
     "relative_path,mime_type,byte_size,sha256,description,expires_at,deleted_at,"
-    "created_at,updated_at"
+    "created_at,updated_at,error_type,next_attempt_at"
 )
 
 _NONRETRYABLE_ERROR_TYPES = (
@@ -77,6 +79,8 @@ class ChatImageAsset:
     deleted_at: str | None
     created_at: str
     updated_at: str
+    error_type: str | None = None
+    next_attempt_at: float = 0
 
 
 def _asset(row: sqlite3.Row) -> ChatImageAsset:
@@ -98,6 +102,8 @@ def _asset(row: sqlite3.Row) -> ChatImageAsset:
         deleted_at=row["deleted_at"],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        error_type=row["error_type"],
+        next_attempt_at=float(row["next_attempt_at"]),
     )
 
 
@@ -198,6 +204,9 @@ class ChatVisionStore:
                 or not has_status_check
             ):
                 self._migrate_legacy_table(conn, columns)
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(chat_image_assets)")}
+            if "next_attempt_at" not in columns:
+                conn.execute("ALTER TABLE chat_image_assets ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0")
             conn.executescript(INDEX_SCHEMA)
 
     @staticmethod
@@ -256,7 +265,7 @@ class ChatVisionStore:
     def recover_interrupted_claims(self) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE chat_image_assets SET status='pending',"
+                "UPDATE chat_image_assets SET status='pending',attempts=MAX(0,attempts-1),next_attempt_at=0,"
                 "updated_at=strftime('%Y-%m-%d %H:%M:%f','now') "
                 "WHERE status='processing'"
             )
@@ -289,6 +298,37 @@ class ChatVisionStore:
         assert row is not None
         return _asset(row)
 
+    def admit_pending(
+        self, group_id: int, message_id: str, ordinal: int, source_url: str, event_time: int,
+        *, max_pending: int, max_retries: int, min_event_time: int,
+    ) -> ChatImageAsset | None:
+        """Bound the live durable queue atomically without dropping existing assets."""
+        if group_id <= 0:
+            raise ValueError("group_id must be positive")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(f"SELECT {_SELECT_FIELDS} FROM chat_image_assets "
+                "WHERE group_id=? AND message_id=? AND ordinal=?",(group_id,message_id,ordinal)).fetchone()
+            if existing is not None:
+                return _asset(existing)
+            count = conn.execute("""SELECT COUNT(*) FROM chat_image_assets
+                WHERE status IN ('pending','processing','failed') AND attempts<? AND event_time>=?
+                AND (error_type IS NULL OR error_type NOT IN (?,?))""",
+                (max_retries,min_event_time,*_NONRETRYABLE_ERROR_TYPES)).fetchone()[0]
+            if count >= max_pending:
+                return None
+            cursor = conn.execute("""INSERT INTO chat_image_assets
+                (group_id,message_id,ordinal,source_url,event_time) VALUES(?,?,?,?,?)""",
+                (group_id,message_id,ordinal,source_url,event_time))
+            return self._one(conn,int(cursor.lastrowid))
+
+    def release_claim(self, asset_id: int) -> None:
+        """A shutdown or gate change is not a model failure and does not burn a retry."""
+        with self._connect() as conn:
+            conn.execute("""UPDATE chat_image_assets SET status='pending',attempts=MAX(0,attempts-1),
+                next_attempt_at=0,updated_at=strftime('%Y-%m-%d %H:%M:%f','now')
+                WHERE id=? AND status='processing'""",(asset_id,))
+
     def claim(self, asset_id: int, max_retries: int) -> ChatImageAsset | None:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -296,8 +336,8 @@ class ChatVisionStore:
                 "UPDATE chat_image_assets SET status='processing',attempts=attempts+1,"
                 "updated_at=strftime('%Y-%m-%d %H:%M:%f','now') "
                 "WHERE id=? AND group_id>0 AND status IN ('pending','failed') "
-                "AND attempts<? AND (error_type IS NULL OR error_type NOT IN (?,?))",
-                (asset_id, max_retries, *_NONRETRYABLE_ERROR_TYPES),
+                "AND attempts<? AND next_attempt_at<=? AND (error_type IS NULL OR error_type NOT IN (?,?))",
+                (asset_id, max_retries, time.time(), *_NONRETRYABLE_ERROR_TYPES),
             )
             if cursor.rowcount != 1:
                 return None
@@ -328,12 +368,12 @@ class ChatVisionStore:
                 (description, asset_id),
             )
 
-    def mark_failed(self, asset_id: int, error_type: str) -> None:
+    def mark_failed(self, asset_id: int, error_type: str, *, retry_delay: float = 0) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE chat_image_assets SET status='failed',error_type=?,"
+                "UPDATE chat_image_assets SET status='failed',error_type=?,next_attempt_at=?,"
                 "updated_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?",
-                (error_type, asset_id),
+                (error_type, time.time() + max(0, retry_delay), asset_id),
             )
 
     def mark_deleted(self, asset_id: int, deleted_at: str) -> None:
@@ -367,13 +407,14 @@ class ChatVisionStore:
             rows = conn.execute(
                 f"SELECT {_SELECT_FIELDS} FROM chat_image_assets "
                 "WHERE group_id>0 AND status IN ('pending','failed') "
-                "AND attempts<? AND id>? "
+                "AND attempts<? AND id>? AND next_attempt_at<=? "
                 "AND (? IS NULL OR event_time>=?) "
                 "AND (error_type IS NULL OR error_type NOT IN (?,?)) "
                 "ORDER BY id LIMIT ?",
                 (
                     max_retries,
                     after_id,
+                    time.time(),
                     min_event_time,
                     min_event_time,
                     *_NONRETRYABLE_ERROR_TYPES,

@@ -7,7 +7,7 @@ from nonebot.rule import Rule
 from plugins.feature_control.runtime import FEATURES
 from plugins.violation_record.config import CONFIG
 
-from .service import live_event_time_allowed, process_image_event
+from .service import live_event_time_allowed, enqueue_image_event
 
 
 def chat_image_candidate(event: Event) -> bool:
@@ -32,4 +32,4 @@ chat_image_matcher = on_message(
 @chat_image_matcher.handle()
 async def collect_chat_images(event: GroupMessageEvent) -> None:
     if chat_image_candidate(event):
-        await process_image_event(event)
+        await enqueue_image_event(event)

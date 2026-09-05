@@ -244,6 +244,19 @@ class ChatVisionStoreTests(unittest.TestCase):
         self.assertEqual("一朵花", saved.description)
         self.assertIsNone(saved.relative_path)
 
+    def test_retry_due_time_survives_store_reopen(self):
+        store=ChatVisionStore(self.db_path)
+        asset=store.ensure_pending(100,"retry-time",1,"https://cdn.example/a.jpg",2000)
+        with patch("plugins.chat_vision.store.time.time",return_value=100):
+            store.claim(asset.id,3)
+            store.mark_failed(asset.id,"synthetic",retry_delay=10)
+            self.assertEqual([],store.claimable(3))
+        reopened=ChatVisionStore(self.db_path)
+        with patch("plugins.chat_vision.store.time.time",return_value=109):
+            self.assertIsNone(reopened.claim(asset.id,3))
+        with patch("plugins.chat_vision.store.time.time",return_value=110):
+            self.assertEqual(asset.id,reopened.claim(asset.id,3).id)
+
     def test_failed_asset_is_claimable_only_below_retry_limit(self) -> None:
         store = ChatVisionStore(self.db_path)
         asset = store.ensure_pending(100, "m1", 1, "https://cdn.example/1.jpg", 1000)

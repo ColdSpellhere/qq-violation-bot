@@ -186,6 +186,11 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.directory = TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        features_patch = patch.object(service, "FEATURES", SimpleNamespace(
+            image_understanding_allowed=lambda: True, group_chat_allowed=lambda group_id: True,
+            llm_gateway_allowed=lambda domain: False))
+        features_patch.start()
+        self.addCleanup(features_patch.stop)
         self.root = Path(self.directory.name)
         self.store = ChatVisionStore(self.root / "chat_archive.db")
         self.config = SimpleNamespace(
@@ -316,7 +321,7 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
             assets = await service.process_image_event(event)
 
         self.assertEqual(3, maximum_active)
-        self.assertEqual(6, len(assets))
+        self.assertEqual(4, len(assets))
         self.assertTrue(all(asset.status == "ready" for asset in assets))
 
     async def test_concurrent_duplicate_events_claim_each_ordinal_once(self) -> None:
@@ -482,6 +487,7 @@ class ChatVisionIngestionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(service, "describe_image", new=describe),
         ):
             failed = await service.process_image_event(event)
+            self.store.mark_failed(failed[0].id, "retry-test", retry_delay=0)
             ready = await service.process_image_event(event)
 
         self.assertEqual("failed", failed[0].status)
@@ -798,7 +804,7 @@ class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch.object(lifecycle, "_now_timestamp", return_value=2_000_000_000),
             patch.object(lifecycle, "CONFIG", config),
             patch.object(lifecycle, "ChatVisionStore", new=store_factory),
-            patch.object(lifecycle, "recover_pending", new=recover),
+            patch.object(lifecycle, "start_workers", side_effect=lambda store: steps.append("start-workers")),
             patch.object(lifecycle, "cleanup_expired", new=cleanup),
             patch.object(lifecycle, "_daily_cleanup_loop", new=forever),
         ):
@@ -807,18 +813,9 @@ class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             await driver.shutdown()
 
-        self.assertEqual(["init", "reset", "recover", "cleanup", "worker"], steps)
+        self.assertEqual(["init", "start-workers", "cleanup", "worker"], steps)
         store_factory.assert_called_once_with(config.chat_archive_path)
-        self.assertEqual(
-            [
-                {
-                    "max_retries": 3,
-                    "min_event_time": 1_999_999_100,
-                    "max_assets": 20,
-                }
-            ],
-            recovery_kwargs,
-        )
+        self.assertEqual([], recovery_kwargs)
 
     async def test_disabled_startup_initializes_and_cleans_without_recovery(self) -> None:
         driver = FakeDriver()
@@ -837,7 +834,7 @@ class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch.object(lifecycle, "get_driver", return_value=driver),
             patch.object(lifecycle, "CONFIG", config),
             patch.object(lifecycle, "ChatVisionStore", return_value=store) as factory,
-            patch.object(lifecycle, "recover_pending", new=AsyncMock()) as recover,
+            patch.object(lifecycle, "start_workers") as recover,
             patch.object(lifecycle, "cleanup_expired", new=AsyncMock()) as cleanup,
             patch.object(lifecycle, "_daily_cleanup_loop", new=forever),
         ):
@@ -847,7 +844,7 @@ class ChatVisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         factory.assert_called_once_with(config.chat_archive_path)
         store.recover_interrupted_claims.assert_not_called()
-        recover.assert_not_awaited()
+        recover.assert_not_called()
         cleanup.assert_awaited_once()
 
     async def test_repeated_startup_keeps_one_cleanup_task(self) -> None:

@@ -140,11 +140,12 @@ class PrivateVisionOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.had_image)
         self.assertEqual(4, download.await_count)
         self.assertEqual(4, describe.await_count)
-        self.assertEqual((0, 1, 2, 3), tuple(item.ordinal for item in result.images))
+        self.assertEqual((), result.images)
+        self.assertEqual(4, len(result.descriptions))
         downloaded_urls = tuple(call.args[0] for call in download.await_args_list)
         self.assertEqual(urls[:4], downloaded_urls)
 
-    async def test_total_raw_byte_budget_drops_all_raw_images_but_keeps_descriptions(self) -> None:
+    async def test_total_byte_budget_is_applied_before_each_download(self) -> None:
         vision = self._module()
         message = _private_event(
             image_urls=("https://images.invalid/a.png", "https://images.invalid/b.png")
@@ -153,7 +154,7 @@ class PrivateVisionOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         describe = AsyncMock(side_effect=("第一张", "第二张"))
         with patch.object(
             vision, "download_chat_image", new=AsyncMock(return_value=downloaded)
-        ), patch.object(vision, "describe_image", new=describe):
+        ) as download, patch.object(vision, "describe_image", new=describe):
             result = await vision.understand_private_images(
                 message,
                 message_id="456",
@@ -165,7 +166,9 @@ class PrivateVisionOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual((), result.images)
-        self.assertEqual(("第一张", "第二张"), result.descriptions)
+        self.assertEqual(("第一张",), result.descriptions)
+        self.assertEqual([5, 2], [item.kwargs["max_bytes"] for item in download.await_args_list])
+        self.assertEqual(1, describe.await_count)
 
     async def test_one_image_failure_does_not_discard_the_other_image(self) -> None:
         vision = self._module()
@@ -193,7 +196,7 @@ class PrivateVisionOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 model="vision-test",
             )
 
-        self.assertEqual((1,), tuple(item.ordinal for item in result.images))
+        self.assertEqual((), result.images)
         self.assertEqual(("可用图片",), result.descriptions)
 
     async def test_raw_image_survives_description_failure_without_logging_sensitive_data(self) -> None:
@@ -224,6 +227,73 @@ class PrivateVisionOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         log_text = "\n".join(captured.output)
         self.assertNotIn(secret_url, log_text)
         self.assertNotIn(secret_description, log_text)
+
+    async def test_total_deadline_cancels_slow_model_and_returns_only_current_raw_fallback(self):
+        vision=self._module(); cancelled=asyncio.Event()
+        async def slow(*args,**kwargs):
+            try: await asyncio.Event().wait()
+            finally: cancelled.set()
+        with patch.object(vision,'download_chat_image',new=AsyncMock(return_value=DownloadedChatImage(b'raw','image/png','png'))) as download, patch.object(vision,'describe_image',new=AsyncMock(side_effect=slow)):
+            start=asyncio.get_running_loop().time()
+            result=await vision.understand_private_images(_private_event(image_urls=('https://images.invalid/a','https://images.invalid/b')).message,
+                message_id='deadline',max_bytes=30,timeout=.04,base_url='https://llm.invalid',api_key='synthetic',model='same-model')
+        self.assertLess(asyncio.get_running_loop().time()-start,.25)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(1,download.await_count)
+        self.assertEqual(1,len(result.images))
+        self.assertEqual((),result.descriptions)
+
+    async def test_failed_download_consumption_reduces_later_image_budget(self):
+        vision=self._module(); limits=[]
+        async def download(url,**kwargs):
+            limits.append(kwargs['max_bytes'])
+            if len(limits)==1:
+                kwargs['byte_budget'].consume(3)
+                raise ValueError('synthetic partial stream')
+            return DownloadedChatImage(b'ok','image/png','png')
+        with patch.object(vision,'download_chat_image',new=AsyncMock(side_effect=download)), patch.object(vision,'describe_image',new=AsyncMock(return_value='合成描述')):
+            result=await vision.understand_private_images(_private_event(image_urls=('https://images.invalid/a','https://images.invalid/b')).message,
+                message_id='budget',max_bytes=5,timeout=1,base_url='https://llm.invalid',api_key='synthetic',model='same-model')
+        self.assertEqual([5,2],limits)
+        self.assertEqual(('合成描述',),result.descriptions)
+        self.assertEqual((),result.images)
+
+    async def test_gate_closure_cancels_model_and_discards_pending_result(self):
+        vision=self._module(); allowed=True; started=asyncio.Event(); cancelled=asyncio.Event()
+        async def slow(*args,**kwargs):
+            started.set()
+            try: await asyncio.Event().wait()
+            finally: cancelled.set()
+        with patch.object(vision,'download_chat_image',new=AsyncMock(return_value=DownloadedChatImage(b'raw','image/png','png'))), patch.object(vision,'describe_image',new=AsyncMock(side_effect=slow)):
+            task=asyncio.create_task(vision.understand_private_images(_private_event(image_urls=('https://images.invalid/a',)).message,
+                message_id='gate',max_bytes=30,timeout=1,base_url='https://llm.invalid',api_key='synthetic',model='same-model',still_allowed=lambda:allowed))
+            await asyncio.wait_for(started.wait(),.5)
+            allowed=False
+            result=await asyncio.wait_for(task,.5)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual((),result.images)
+        self.assertEqual((),result.descriptions)
+
+    async def test_many_private_messages_share_three_image_slots(self):
+        vision=self._module(); active=peak=0; full=asyncio.Event(); release=asyncio.Event()
+        async def describe(*args,**kwargs):
+            nonlocal active,peak
+            active+=1;peak=max(peak,active)
+            if active==3:full.set()
+            try: await release.wait()
+            finally:active-=1
+            return '合成描述'
+        with patch.object(vision,'download_chat_image',new=AsyncMock(return_value=DownloadedChatImage(b'raw','image/png','png'))), patch.object(vision,'describe_image',new=AsyncMock(side_effect=describe)):
+            tasks=[asyncio.create_task(vision.understand_private_images(_private_event(image_urls=('https://images.invalid/a',)).message,
+                message_id=str(i),max_bytes=30,timeout=1,base_url='https://llm.invalid',api_key='synthetic',model='same-model')) for i in range(12)]
+            try:
+                await asyncio.wait_for(full.wait(),.5)
+                self.assertEqual(3,peak)
+            finally:
+                release.set()
+                results=await asyncio.gather(*tasks)
+        self.assertEqual(3,peak)
+        self.assertTrue(all(item.descriptions and not item.images for item in results))
 
 
 class PrivateVisionConversationTests(unittest.TestCase):
@@ -316,7 +386,14 @@ class PrivateVisionConversationTests(unittest.TestCase):
 class PrivateVisionMatcherTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.features = _MutableFeatures()
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
         self.config = _config()
+        self.config.chat_archive_path = Path(self.directory.name) / "private-vision.db"
+        # This matcher suite mocks memory rows; real ledger/source-row integration is tested separately.
+        ledger_patch = patch.object(private_matcher, "DeliveryLedger", return_value=None, create=True)
+        ledger_patch.start()
+        self.addCleanup(ledger_patch.stop)
 
     def _runtime(self, *, conversations=None):
         return patch.multiple(
