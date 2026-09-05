@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,6 +25,10 @@ class PolicyOutcome:
     event_id: int | None
     changed: bool
     pending_action_id: int | None = None
+
+
+class PolicyInputError(ValueError):
+    """An invalid recorded input must be reviewed before scope settlement."""
 
 
 _CHINESE_DIGITS = {
@@ -48,6 +54,9 @@ def _number_value(token: str) -> float | None:
         return None
     if value == "半":
         return 0.5
+    if value.endswith("半"):
+        whole = _number_value(value[:-1])
+        return None if whole is None else whole + 0.5
     try:
         return float(value)
     except ValueError:
@@ -69,23 +78,33 @@ def _number_value(token: str) -> float | None:
 
 def parse_mute_seconds(action: str | None) -> int | None:
     text = str(action or "").strip()
-    if not text or "禁言" not in text:
+    if not text.startswith("禁言"):
         return None
-
-    import re
-
+    text = re.sub(r"\s+", "", text[len("禁言"):]).lstrip(":：")
+    text = text.replace("个半", "半").replace("半个", "半")
     duration_pattern = re.compile(
         r"([0-9]+(?:\.[0-9]+)?|[零〇一二两三四五六七八九十百半]+)"
-        r"\s*个?\s*(小时|钟头|分钟|分)"
+        r"个?(小时|钟头|分钟|分|秒钟|秒|天|日|星期|礼拜|周|个月|月)"
     )
+    unit_seconds = {
+        "小时": 3600, "钟头": 3600, "分钟": 60, "分": 60,
+        "秒钟": 1, "秒": 1, "天": 86400, "日": 86400,
+        "星期": 604800, "礼拜": 604800, "周": 604800,
+        "个月": 2592000, "月": 2592000,
+    }
     seconds = 0.0
+    consumed = 0
     for match in duration_pattern.finditer(text):
+        if match.start() != consumed:
+            return None
         value = _number_value(match.group(1))
-        if value is None:
-            continue
-        unit_seconds = 3600 if match.group(2) in {"小时", "钟头"} else 60
-        seconds += value * unit_seconds
-    return int(seconds) if seconds > 0 else None
+        if value is None or not math.isfinite(value):
+            return None
+        seconds += value * unit_seconds[match.group(2)]
+        consumed = match.end()
+    if consumed != len(text) or not math.isfinite(seconds) or seconds > 2**63 - 1:
+        return None
+    return int(seconds) if seconds >= 1 else None
 
 
 def classify_severity(action: str | None) -> Severity:
@@ -250,6 +269,25 @@ def _time_value(value: str | datetime) -> datetime:
 
 def _json(data: dict[str, object]) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _validate_effective_time(effective_at: str, ingested_at: str) -> None:
+    if _time_value(effective_at) > _time_value(ingested_at):
+        raise PolicyInputError("减数事件生效时间不能晚于处理时间；请撤回未来记录后重新录入")
+
+
+def _has_later_effective_event(
+    conn: sqlite3.Connection, *, member_id: int, group_area: str,
+    effective_at: str, priority: int, source_sequence: int, event_id: int,
+) -> bool:
+    """Ingestion latency alone does not make an input late in the timeline."""
+    return conn.execute(
+        """SELECT 1 FROM v102_policy_events
+        WHERE member_id=? AND group_area=? AND is_effective=1 AND id!=?
+          AND (effective_time,event_priority,source_sequence,id)>(?,?,?,?)
+        LIMIT 1""",
+        (member_id,group_area,event_id,effective_at,priority,source_sequence,event_id),
+    ).fetchone() is not None
 
 
 def _insert_event(
@@ -644,6 +682,36 @@ def _create_pending_action(
     return pending_id
 
 
+def policy_scope_under_review(conn: sqlite3.Connection, member_id: int, group_area: str) -> bool:
+    return conn.execute(
+        """SELECT 1 FROM v102_pending_actions
+        WHERE member_id=? AND group_area=? AND status='pending'
+          AND action_type IN ('input_review','replay_review') LIMIT 1""",
+        (member_id, group_area),
+    ).fetchone() is not None
+
+
+def record_policy_review(
+    conn: sqlite3.Connection, *, member_id: int, group_area: str,
+    source_record_id: int | None, key: str, at: str, reason: str,
+    action_type: str = "input_review",
+) -> PolicyOutcome:
+    """Preserve the last valid projection and make a blocked input durable."""
+    _ensure_policy_state(conn, member_id, group_area, at)
+    event_id, created = _insert_event(
+        conn, member_id=member_id, group_area=group_area,
+        event_type="policy_review_required", effective_time=at,
+        event_priority=60, source_sequence=source_record_id or 0, ingest_time=at,
+        source_record_id=source_record_id, idempotency_key=key,
+        payload={"reason": reason, "review_type": action_type},
+    )
+    pending_id = _create_pending_action(
+        conn, member_id=member_id, group_area=group_area, action_type=action_type,
+        reason=reason, caused_by_event_id=event_id, at=at,
+    )
+    return PolicyOutcome(event_id, created, pending_id)
+
+
 def _set_event_evaluation_owner(
     conn: sqlite3.Connection,
     event_id: int,
@@ -796,8 +864,14 @@ def process_violation_record(
     if severity is Severity.NONE:
         return PolicyOutcome(None, False)
 
+    if replay_generation == 0 and policy_scope_under_review(
+        conn, int(record["member_id"]), record["group_area"]
+    ):
+        return PolicyOutcome(None, False)
+
     effective_at = _time_text(record["violation_time"])
     ingested_at = _time_text(ingest_time)
+    _validate_effective_time(effective_at, ingested_at)
     event_id, created = _insert_event(
         conn,
         member_id=int(record["member_id"]),
@@ -833,6 +907,7 @@ def process_violation_record(
     settle_due_cycles(
         conn,
         _time_text(_time_value(effective_at) - timedelta(seconds=1)),
+        member_id=member_id, group_area=group_area,
     )
     sync_count_state(
         conn,
@@ -866,7 +941,11 @@ def process_violation_record(
                 at=ingested_at,
             )
 
-    if replay_generation == 0 and effective_at < ingested_at:
+    if replay_generation == 0 and effective_at < ingested_at and _has_later_effective_event(
+        conn, member_id=member_id, group_area=group_area,
+        effective_at=effective_at, priority=10, source_sequence=source_record_id,
+        event_id=event_id,
+    ):
         recent_cycles = conn.execute(
             """
             SELECT * FROM v102_policy_cycles
@@ -1304,6 +1383,7 @@ def process_status_change(
 ) -> PolicyOutcome:
     at = _time_text(effective_at)
     ingested_at = _time_text(ingest_time or effective_at)
+    _validate_effective_time(at, ingested_at)
     _ensure_policy_state(conn, member_id, group_area, ingested_at)
     event_id, created = _insert_event(
         conn,
@@ -1321,7 +1401,10 @@ def process_status_change(
     )
     if not created:
         return PolicyOutcome(event_id, False)
-    if replay_generation == 0 and at < ingested_at:
+    if replay_generation == 0 and at < ingested_at and _has_later_effective_event(
+        conn, member_id=member_id, group_area=group_area,
+        effective_at=at, priority=30, source_sequence=0, event_id=event_id,
+    ):
         replay_member_group(
             conn,
             member_id,
@@ -1333,6 +1416,7 @@ def process_status_change(
     settle_due_cycles(
         conn,
         _time_text(_time_value(at) - timedelta(seconds=1)),
+        member_id=member_id, group_area=group_area,
     )
     conn.execute(
         """
@@ -2109,18 +2193,33 @@ def _settle_cycle(conn: sqlite3.Connection, cycle: sqlite3.Row, as_of: str) -> b
     return True
 
 
-def settle_due_cycles(conn: sqlite3.Connection, as_of: str | datetime) -> int:
+def settle_due_cycles(
+    conn: sqlite3.Connection, as_of: str | datetime, *,
+    member_id: int | None = None, group_area: str | None = None,
+) -> int:
+    if (member_id is None) != (group_area is None):
+        raise ValueError("member_id and group_area must be supplied together")
     now = _time_text(as_of)
+    scope_sql = "" if member_id is None else "AND member_id=? AND group_area=?"
+    params = (now,) if member_id is None else (now, member_id, group_area)
     settled = 0
     while True:
         cycle = conn.execute(
-            """
+            f"""
             SELECT * FROM v102_policy_cycles
             WHERE status='active'
               AND due_at<=?
+              {scope_sql}
+              AND NOT EXISTS (
+                  SELECT 1 FROM v102_pending_actions p
+                  WHERE p.member_id=v102_policy_cycles.member_id
+                    AND p.group_area=v102_policy_cycles.group_area
+                    AND p.status='pending'
+                    AND p.action_type IN ('input_review','replay_review')
+              )
             ORDER BY due_at, id LIMIT 1
             """,
-            (now,),
+            params,
         ).fetchone()
         if cycle is None:
             break
@@ -2177,7 +2276,7 @@ def _reset_member_group_projection(
                   'mute_recorded', 'mute_duration_unknown', 'status_changed',
                   'manual_stop_started', 'manual_stop_cleared',
                   'manual_stop_renewed', 'stop_suggestion_rejected',
-                  'record_withdrawn'
+                  'record_withdrawn', 'policy_review_required'
               )
           )
         """,
@@ -2196,6 +2295,7 @@ def _reset_member_group_projection(
         UPDATE v102_pending_actions
         SET status='cancelled', updated_at=?
         WHERE member_id=? AND group_area=? AND status='pending'
+          AND action_type NOT IN ('input_review','replay_review')
         """,
         (at, member_id, group_area),
     )
@@ -2541,12 +2641,12 @@ def replay_member_group(
     while index < len(inputs):
         effective_time = inputs[index]["effective_time"]
         before = _time_text(_time_value(effective_time) - timedelta(seconds=1))
-        settle_due_cycles(conn, before)
+        settle_due_cycles(conn, before, member_id=member_id, group_area=group_area)
         while index < len(inputs) and inputs[index]["effective_time"] == effective_time:
             _apply_replay_input(conn, inputs[index], generation=generation)
             index += 1
-        settle_due_cycles(conn, effective_time)
-    settle_due_cycles(conn, replay_at)
+        settle_due_cycles(conn, effective_time, member_id=member_id, group_area=group_area)
+    settle_due_cycles(conn, replay_at, member_id=member_id, group_area=group_area)
     conn.execute(
         """
         UPDATE v102_policy_state
@@ -2555,6 +2655,18 @@ def replay_member_group(
         """,
         (replay_at, member_id, group_area),
     )
+    review = conn.execute(
+        """SELECT action_type,reason FROM v102_pending_actions
+        WHERE member_id=? AND group_area=? AND status='pending'
+          AND action_type IN ('input_review','replay_review') ORDER BY id LIMIT 1""",
+        (member_id, group_area),
+    ).fetchone()
+    if review is not None:
+        conn.execute(
+            """UPDATE v102_policy_state SET pending_action_type=?,last_reason=?
+            WHERE member_id=? AND group_area=?""",
+            (review["action_type"],review["reason"],member_id,group_area),
+        )
     return PolicyOutcome(trigger_event_id, True)
 
 
@@ -2602,6 +2714,21 @@ def withdraw_violation_record(
         SET is_withdrawn=1, withdrawn_reason=?, updated_at=? WHERE id=?
         """,
         (reason, at, source_record_id),
+    )
+    conn.execute(
+        """UPDATE v102_pending_actions
+        SET status='resolved',decision_event_id=?,updated_at=?
+        WHERE status='pending' AND action_type IN ('input_review','replay_review')
+          AND caused_by_event_id IN (
+              SELECT id FROM v102_policy_events
+              WHERE source_record_id=? AND event_type='policy_review_required'
+          )""",
+        (event_id, at, source_record_id),
+    )
+    conn.execute(
+        """UPDATE v102_policy_events SET is_effective=0,reversed_by_event_id=?
+        WHERE source_record_id=? AND event_type='policy_review_required'""",
+        (event_id, source_record_id),
     )
     if original:
         conn.execute(

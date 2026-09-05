@@ -20,6 +20,12 @@ _last_weekly = None
 _OUTBOX_LEASE_MINUTES = 5
 _OUTBOX_RETRY_MINUTES = 5
 _OUTBOX_DELIVERY_BATCH = 10
+_MISSED_CLAIM_LIMIT = 20
+_MISSED_CHUNK_ITEMS = 10
+_MISSED_CHUNK_CHARS = 10_000
+_FORWARD_NODE_CHARS = 1_800
+_FORWARD_MAX_NODES = 20
+_FORWARD_MAX_CHARS = 12_000
 
 
 class _DeferredFeatures:
@@ -458,10 +464,14 @@ def _claim_missed_outboxes(as_of: str) -> tuple[list[dict], list[dict]]:
                     """
                     UPDATE v102_notification_outbox
                     SET status='sending', updated_at=?
-                    WHERE status='failed' AND scheduled_at<=?
+                    WHERE id IN (
+                        SELECT id FROM v102_notification_outbox
+                        WHERE status='failed' AND scheduled_at<=?
+                        ORDER BY scheduled_at,id LIMIT ?
+                    ) AND status='failed'
                     RETURNING *
                     """,
-                    (as_of, as_of),
+                    (as_of, as_of, _MISSED_CLAIM_LIMIT),
                 )
             ]
         conn.execute(
@@ -483,10 +493,13 @@ def _claim_missed_outboxes(as_of: str) -> tuple[list[dict], list[dict]]:
                 """
                 UPDATE business_notification_outbox
                 SET status='sending', updated_at=?
-                WHERE status='failed'
+                WHERE id IN (
+                    SELECT id FROM business_notification_outbox
+                    WHERE status='failed' ORDER BY created_at,id LIMIT ?
+                ) AND status='failed'
                 RETURNING *
                 """,
-                (as_of,),
+                (as_of, _MISSED_CLAIM_LIMIT),
             )
         ]
     return (
@@ -551,6 +564,51 @@ async def deliver_missed_policy_summary(
 ) -> int:
     moment = as_of or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     selected, generic_rows = _claim_missed_outboxes(moment)
+    handled = 0
+    chunk: list[tuple[bool, dict]] = []
+    chars = 0
+    for is_policy, row in (
+        *((True, row) for row in selected),
+        *((False, row) for row in generic_rows),
+    ):
+        cost = len(str(row["message_text"])) + 256
+        if chunk and (len(chunk) >= _MISSED_CHUNK_ITEMS or chars + cost > _MISSED_CHUNK_CHARS):
+            handled += await _deliver_missed_summary_chunk(bot, chunk, moment)
+            chunk, chars = [], 0
+        chunk.append((is_policy, row))
+        chars += cost
+    if chunk:
+        handled += await _deliver_missed_summary_chunk(bot, chunk, moment)
+    return handled
+
+
+def _bounded_forward_batches(bot, nodes: list[dict]) -> list[list[dict]]:
+    batches: list[list[dict]] = []
+    batch: list[dict] = []
+    chars = 0
+    for node in nodes:
+        content = str(node["data"]["content"])
+        parts = [content[i:i + _FORWARD_NODE_CHARS] for i in range(0, len(content), _FORWARD_NODE_CHARS)] or [""]
+        for part in parts:
+            if batch and (len(batch) >= _FORWARD_MAX_NODES or chars + len(part) > _FORWARD_MAX_CHARS):
+                batches.append(batch)
+                batch, chars = [], 0
+            batch.append(_missed_policy_node(bot, part))
+            chars += len(part)
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+async def _deliver_missed_summary_chunk(bot, chunk: list[tuple[bool, dict]], moment: str) -> int:
+    """Acknowledge one bounded group independently of failures in later groups.
+
+    A long individual notification may span forwards. It is acknowledged only
+    after every part succeeds; an uncertain partial delivery can be repeated.
+    The stable task id makes that at-least-once boundary visible to operators.
+    """
+    selected = [row for is_policy, row in chunk if is_policy]
+    generic_rows = [row for is_policy, row in chunk if not is_policy]
 
     valid_rows: list[dict] = []
     seen_ids: set[int] = set()
@@ -626,7 +684,7 @@ async def deliver_missed_policy_summary(
         items = [heading]
         items.extend(
             (
-                f"[{row['message_type']}] {row['scheduled_at']}"
+                f"[策略任务#{row['id']} {row['message_type']}] {row['scheduled_at']}"
                 f"｜{_missed_reason(row.get('last_error'))}\n"
                 f"{row['message_text']}"
             )
@@ -640,7 +698,7 @@ async def deliver_missed_policy_summary(
         items = [f"{message_type} 未发送通知（{len(grouped_rows)} 条）"]
         items.extend(
             (
-                f"{row['created_at']}｜{_missed_reason(row.get('reason'))}\n"
+                f"[业务任务#{row['id']}] {row['created_at']}｜{_missed_reason(row.get('reason'))}\n"
                 f"{row['message_text']}"
             )
             for row in grouped_rows
@@ -651,11 +709,19 @@ async def deliver_missed_policy_summary(
         _restore_missed_business_claims(generic_rows, as_of=moment)
         return 0
     try:
-        await bot.call_api(
-            "send_group_forward_msg",
-            group_id=CONFIG.target_group_id,
-            messages=nodes,
-        )
+        for batch in _bounded_forward_batches(bot, nodes):
+            if not _business_allowed() or any(
+                not _policy_outbox_valid(row, expected_status="sending", expected_updated_at=row["updated_at"])[0]
+                for row in valid_rows
+            ):
+                _restore_missed_policy_claims(valid_rows, as_of=moment)
+                _restore_missed_business_claims(generic_rows, as_of=moment)
+                return 0
+            await bot.call_api(
+                "send_group_forward_msg",
+                group_id=CONFIG.target_group_id,
+                messages=batch,
+            )
     except Exception as exc:
         logger.warning(
             f"未发送业务提醒汇总失败 error={type(exc).__name__}"
