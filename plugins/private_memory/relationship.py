@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from plugins.member_memory.safety import contains_secret
+
 from .models import ConversationScope, RelationshipState, validate_persona_id
 from .schema import PRIVATE_MEMORY_SCHEMA_VERSION, schema_version
 
@@ -182,6 +184,8 @@ class RelationshipStore:
             field="communication_style",
             maximum=MAX_COMMUNICATION_STYLE_LENGTH,
         )
+        if any(contains_secret(text) for text in (state_text, preferred_address, communication_style, *open_topics)):
+            return False
         source_message_id = _validate_source_message_id(candidate.source_message_id)
         source_watermark = _validate_nonnegative_int(
             candidate.source_watermark, "source_watermark"

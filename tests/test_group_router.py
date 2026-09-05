@@ -529,7 +529,7 @@ class GroupRouterTests(unittest.IsolatedAsyncioTestCase):
             group_router, "send_random_reply", new=AsyncMock()
         ) as casual, patch.object(
             archive_matcher, "archive_payload"
-        ) as archive, patch.object(memory_matcher.BATCHER, "add") as remember:
+        ) as archive, patch.object(memory_matcher, "_enqueue_member_batch") as remember:
             await group_router.route_group_message(bot, event)
             self.assertFalse(archive_matcher._chat_group(event))
             self.assertFalse(memory_matcher._target_member_message(event))

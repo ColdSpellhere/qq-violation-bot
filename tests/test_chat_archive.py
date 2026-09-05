@@ -144,7 +144,7 @@ class ChatArchiveTests(unittest.IsolatedAsyncioTestCase):
                 "reply_message_id": "99",
             }
             self.assertTrue(archive_payload(path, 123456789, payload))
-            self.assertTrue(archive_payload(path, 123456789, payload))
+            self.assertFalse(archive_payload(path, 123456789, payload))
             outside = dict(payload, message_id="102", group_id=987654321)
             self.assertFalse(archive_payload(path, 123456789, outside))
             with sqlite3.connect(path) as conn:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from contextlib import closing
 
@@ -12,13 +13,27 @@ from nonebot.rule import Rule
 from plugins.chat_archive.db import recent_text_context
 from plugins.feature_control.runtime import FEATURES
 from plugins.member_memory.ai import extract_memory_candidates
-from plugins.member_memory.batcher import MemberMemoryBatcher
 from plugins.member_memory.store import apply_candidates
 from plugins.member_memory.summary import refresh_member_summary
 from plugins.violation_record.config import CONFIG
 
 
-BATCHER = MemberMemoryBatcher(threshold=5, delay_seconds=60.0)
+def _enqueue_member_batch(event: GroupMessageEvent) -> None:
+    from plugins.private_memory.jobs import MemoryJobQueue
+    if not FEATURES.group_chat_allowed(int(event.group_id)):
+        return
+    with closing(sqlite3.connect(CONFIG.chat_archive_path)) as connection:
+        row = connection.execute(
+            "SELECT rowid FROM chat_messages WHERE group_id=? AND user_id=? AND message_id=?",
+            (int(event.group_id), str(event.user_id), str(event.message_id)),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("member memory source was not archived")
+    if FEATURES.group_chat_allowed(int(event.group_id)):
+        MemoryJobQueue(CONFIG.chat_archive_path).enqueue(job_type="member_facts",
+            conversation_kind="group", group_id=int(event.group_id), user_id=str(event.user_id),
+            input_through_id=int(row[0]), expected_version=0)
+
 
 
 def _enqueue_group_relationship(event: GroupMessageEvent) -> None:
@@ -76,15 +91,13 @@ async def collect_member_memory(event: GroupMessageEvent) -> None:
     text = event.get_plaintext().strip()
     if not text or text.startswith("/"):
         return
-    BATCHER.add(
-        group_id=int(event.group_id),
-        user_id=str(event.user_id),
-        event_time=int(event.time),
-        callback=analyze_member_memory,
-    )
+    try:
+        await asyncio.to_thread(_enqueue_member_batch, event)
+    except Exception as exc:
+        logger.warning(f"群友记忆持久入队失败 group_id={event.group_id} user_id={event.user_id} error={type(exc).__name__}")
     if FEATURES.snapshot().relationship_state_enabled:
         try:
-            _enqueue_group_relationship(event)
+            await asyncio.to_thread(_enqueue_group_relationship, event)
         except Exception as exc:
             logger.warning(
                 "group relationship enqueue failed group_id=%s user_id=%s error=%s",
@@ -98,7 +111,7 @@ async def analyze_member_memory(group_id: int, user_id: str, event_time: int) ->
     if not FEATURES.group_chat_allowed(group_id):
         return
     try:
-        context = recent_text_context(
+        context = await asyncio.to_thread(recent_text_context,
             CONFIG.chat_archive_path,
             group_id=group_id,
             since_epoch=event_time - 1800,
@@ -114,7 +127,7 @@ async def analyze_member_memory(group_id: int, user_id: str, event_time: int) ->
         ]
         if not FEATURES.group_chat_allowed(group_id):
             return
-        applied = apply_candidates(
+        applied = await asyncio.to_thread(apply_candidates,
             CONFIG.chat_archive_path,
             CONFIG.member_memory_root,
             group_id=group_id,

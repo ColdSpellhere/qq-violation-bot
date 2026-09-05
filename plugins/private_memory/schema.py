@@ -11,13 +11,26 @@ from pathlib import Path
 from .models import MigrationReport
 
 
-PRIVATE_MEMORY_SCHEMA_VERSION = 3
+PRIVATE_MEMORY_SCHEMA_VERSION = 4
 _MANAGED_PRIVATE_MEMORY_BACKUP_RE = re.compile(
     r"(?:chat_archive_before_private_memory_\d{8}T\d{12}Z"
     r"|[^/]+-pre-private-memory-\d{8}T\d{12}Z-\d+)\.sqlite3\Z"
 )
 
 _TABLE_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS group_fact_progress (
+        group_id INTEGER NOT NULL, user_id TEXT NOT NULL,
+        through_message_id INTEGER NOT NULL DEFAULT 0 CHECK(through_message_id>=0),
+        version INTEGER NOT NULL DEFAULT 0 CHECK(version>=0), updated_at TEXT NOT NULL,
+        PRIMARY KEY(group_id,user_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS private_fact_progress (
+        user_id TEXT PRIMARY KEY,
+        through_message_id INTEGER NOT NULL DEFAULT 0 CHECK(through_message_id>=0),
+        version INTEGER NOT NULL DEFAULT 0 CHECK(version>=0),
+        updated_at TEXT NOT NULL
+    )""",
+
     """
     CREATE TABLE IF NOT EXISTS private_chat_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,13 +112,15 @@ _TABLE_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS memory_jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         job_type TEXT NOT NULL
-            CHECK(job_type IN ('private_summary','private_facts','relationship')),
+            CHECK(job_type IN ('private_summary','private_facts','relationship','member_facts')),
         conversation_kind TEXT NOT NULL
             CHECK(conversation_kind IN ('group','private')),
         group_id INTEGER,
         user_id TEXT NOT NULL,
         persona_id TEXT NOT NULL DEFAULT 'radish-cat',
         input_through_id INTEGER NOT NULL CHECK(input_through_id >= 0),
+        input_from_id INTEGER NOT NULL DEFAULT 0 CHECK(input_from_id >= 0),
+        input_count INTEGER NOT NULL DEFAULT 1 CHECK(input_count > 0),
         expected_version INTEGER NOT NULL CHECK(expected_version >= 0),
         status TEXT NOT NULL DEFAULT 'pending'
             CHECK(status IN ('pending','running','succeeded','failed','cancelled')),
@@ -382,6 +397,52 @@ def migrate(path: Path) -> MigrationReport:
                     "WHERE updated_at IS NULL OR trim(updated_at)=''"
                 )
 
+            job_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(memory_jobs)")}
+            for name, definition in (("input_from_id", "INTEGER NOT NULL DEFAULT 0"),
+                                     ("input_count", "INTEGER NOT NULL DEFAULT 1")):
+                if name not in job_columns:
+                    connection.execute(f"ALTER TABLE memory_jobs ADD COLUMN {name} {definition}")
+                    columns_added += 1
+            job_sql = str(connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name='memory_jobs' AND type='table'"
+            ).fetchone()[0])
+            if "'member_facts'" not in job_sql:
+                # Preserve IDs, lease state, and every supported column while
+                # widening the CHECK. Unknown local extensions require review.
+                from plugins.chat_archive.db import assert_table_rebuild_safe
+                assert_table_rebuild_safe(connection, "memory_jobs")
+                sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='memory_jobs'").fetchone()
+                target_sql = next(item for item in _TABLE_STATEMENTS if "CREATE TABLE IF NOT EXISTS memory_jobs (" in item)
+                columns = [str(row[1]) for row in connection.execute("PRAGMA table_info(memory_jobs)")]
+                indexes = [str(row[0]) for row in connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='memory_jobs' AND sql IS NOT NULL"
+                )]
+                connection.execute("ALTER TABLE memory_jobs RENAME TO memory_jobs_before_v4")
+                connection.execute(target_sql)
+                expected = {str(row[1]) for row in connection.execute("PRAGMA table_info(memory_jobs)")}
+                if set(columns) != expected:
+                    raise RuntimeError("unrecognized memory_jobs schema; migration requires review")
+                names = ','.join(columns)
+                connection.execute(f"INSERT INTO memory_jobs({names}) SELECT {names} FROM memory_jobs_before_v4")
+                connection.execute("DROP TABLE memory_jobs_before_v4")
+                if sequence is not None:
+                    current_sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='memory_jobs'").fetchone()
+                    if current_sequence is None:
+                        connection.execute("INSERT INTO sqlite_sequence(name,seq) VALUES('memory_jobs',?)", (int(sequence[0]),))
+                    else:
+                        connection.execute("UPDATE sqlite_sequence SET seq=max(seq,?) WHERE name='memory_jobs'", (int(sequence[0]),))
+                for statement in indexes:
+                    connection.execute(statement)
+            from plugins.chat_archive.db import migrate_archive_schema
+            migrate_archive_schema(connection)
+            # Existing succeeded jobs establish safe incremental checkpoints;
+            # pending/failed work is deliberately not treated as processed.
+            connection.execute("""
+                INSERT OR IGNORE INTO private_fact_progress(user_id,through_message_id,version,updated_at)
+                SELECT user_id,MAX(input_through_id),0,strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                FROM memory_jobs WHERE job_type='private_facts' AND conversation_kind='private'
+                  AND status='succeeded' GROUP BY user_id
+            """)
             for statement in _INDEX_STATEMENTS:
                 connection.execute(statement)
             connection.execute(
@@ -407,6 +468,8 @@ def migrate(path: Path) -> MigrationReport:
                 "memory_governance_audit",
                 "llm_usage_events",
                 "private_memory_schema_meta",
+                "private_fact_progress",
+                "group_fact_progress",
             })
         path.chmod(0o600)
         quick_check(path)

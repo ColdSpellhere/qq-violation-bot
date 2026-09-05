@@ -583,7 +583,7 @@ class PrivateMemoryProcessorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await task)
         self.assertIsNone(self.store.get_summary(user_id="200"))
 
-    async def test_stale_summary_does_not_rebase_across_purged_source(self) -> None:
+    async def test_stale_summary_rebases_from_remaining_live_sources(self) -> None:
         first = self.append("p1", "第一句", 100)
         self.append("p2", "将被清理", 101)
         third = self.append("p3", "第三句", 102)
@@ -599,15 +599,15 @@ class PrivateMemoryProcessorTests(unittest.IsolatedAsyncioTestCase):
         summarize = AsyncMock(return_value="不应跨越已清理来源")
         processor.summarize = summarize
 
-        self.assertFalse(await processor.process(_job(
+        self.assertTrue(await processor.process(_job(
             "private_summary", watermark=third, expected_version=0
         )))
-        summarize.assert_not_awaited()
+        self.assertEqual(["p3"], [item.message_id for item in summarize.await_args.args[1]])
         summary = self.store.get_summary(user_id="200")
-        self.assertEqual("第一版摘要", summary.summary_text)
-        self.assertEqual(first, summary.summarized_through_id)
+        self.assertEqual("不应跨越已清理来源", summary.summary_text)
+        self.assertEqual(third, summary.summarized_through_id)
 
-    async def test_matching_summary_version_does_not_cross_purged_source(self) -> None:
+    async def test_matching_summary_version_skips_previously_purged_source(self) -> None:
         first = self.append("p1", "第一句", 100)
         self.append("p2", "将被清理", 101)
         third = self.append("p3", "第三句", 102)
@@ -623,13 +623,13 @@ class PrivateMemoryProcessorTests(unittest.IsolatedAsyncioTestCase):
         summarize = AsyncMock(return_value="不应跨越已清理来源")
         processor.summarize = summarize
 
-        self.assertFalse(await processor.process(_job(
+        self.assertTrue(await processor.process(_job(
             "private_summary", watermark=third, expected_version=1
         )))
-        summarize.assert_not_awaited()
+        self.assertEqual(["p3"], [item.message_id for item in summarize.await_args.args[1]])
         summary = self.store.get_summary(user_id="200")
-        self.assertEqual("第一版摘要", summary.summary_text)
-        self.assertEqual(first, summary.summarized_through_id)
+        self.assertEqual("不应跨越已清理来源", summary.summary_text)
+        self.assertEqual(third, summary.summarized_through_id)
 
     async def test_clear_tombstone_version_allows_only_current_post_clear_job(self) -> None:
         before_clear = self.append("p1", "清理前消息", 1)

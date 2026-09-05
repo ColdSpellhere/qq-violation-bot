@@ -87,15 +87,10 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
             memory_matcher,
             "FEATURES",
             self._controller(directory, allowed=(int(event.group_id),)),
-        ), patch.object(memory_matcher.BATCHER, "add") as add:
+        ), patch.object(memory_matcher, "_enqueue_member_batch") as add:
             await memory_matcher.collect_member_memory(event)
 
-        add.assert_called_once_with(
-            group_id=memory_matcher.CONFIG.target_group_id,
-            user_id="456791",
-            event_time=1785168002,
-            callback=memory_matcher.analyze_member_memory,
-        )
+        add.assert_called_once_with(event)
 
     async def test_commands_blank_self_and_outside_group_are_ignored(self):
         events = (
@@ -111,7 +106,7 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
             self._controller(
                 directory, allowed=(memory_matcher.CONFIG.target_group_id,)
             ),
-        ), patch.object(memory_matcher.BATCHER, "add") as add:
+        ), patch.object(memory_matcher, "_enqueue_member_batch") as add:
             for event in events:
                 if memory_matcher._target_member_message(event):
                     await memory_matcher.collect_member_memory(event)
@@ -197,7 +192,7 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
             self._controller(
                 directory, allowed=(group_id,), chat_enabled=False
             ),
-        ), patch.object(memory_matcher.BATCHER, "add") as add, patch.object(
+        ), patch.object(memory_matcher, "_enqueue_member_batch") as add, patch.object(
             memory_matcher, "recent_text_context"
         ) as recent, patch.object(
             memory_matcher, "apply_candidates"
@@ -234,7 +229,7 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
             )
             with patch.object(memory_matcher, "FEATURES", controller), patch.object(
                 memory_matcher, "CONFIG", config
-            ), patch.object(memory_matcher.BATCHER, "add"):
+            ), patch.object(memory_matcher, "_enqueue_member_batch"):
                 await memory_matcher.collect_member_memory(event)
 
             with sqlite3.connect(database) as connection:
@@ -253,7 +248,7 @@ class MemberMemoryMatcherTests(unittest.IsolatedAsyncioTestCase):
         event = _group_event(group_id=123)
         with tempfile.TemporaryDirectory() as directory, patch.object(
             memory_matcher, "FEATURES", self._controller(directory, allowed=(123,))
-        ), patch.object(memory_matcher.BATCHER, "add"), patch.object(
+        ), patch.object(memory_matcher, "_enqueue_member_batch"), patch.object(
             memory_matcher, "_enqueue_group_relationship"
         ) as enqueue:
             await memory_matcher.collect_member_memory(event)

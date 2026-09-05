@@ -51,6 +51,8 @@ def _purge_retained_messages(store: PrivateMemoryStore) -> None:
         logger.warning(
             "私聊记忆保留清理已提交，但 WAL checkpoint 尚未完成，将在后续周期重试"
         )
+    from plugins.memory_governance.retention import prune_previews
+    prune_previews(CONFIG.chat_archive_path, now=now)
     prune_private_memory_backups(
         Path(BACKUP_DIR) / "private_memory",
         now=now,
@@ -58,11 +60,20 @@ def _purge_retained_messages(store: PrivateMemoryStore) -> None:
     )
 
 
+async def _purge_async(store: PrivateMemoryStore) -> None:
+    task = asyncio.create_task(asyncio.to_thread(_purge_retained_messages, store))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
 async def _run_daily_retention(store: PrivateMemoryStore) -> None:
     while True:
         await _sleep(86_400)
         try:
-            _purge_retained_messages(store)
+            await _purge_async(store)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -72,6 +83,8 @@ async def _run_daily_retention(store: PrivateMemoryStore) -> None:
 def _allowed_job_types() -> frozenset[str]:
     state = FEATURES.snapshot()
     allowed: set[str] = set()
+    if getattr(state, "chat_enabled", False) and getattr(state, "group_chat_enabled", False):
+        allowed.add("member_facts")
     if state.private_memory_enabled:
         allowed.update(("private_summary", "private_facts"))
     if state.relationship_state_enabled:
@@ -127,14 +140,14 @@ def setup_lifecycle(
         from .store import PrivateMemoryStore
 
         database = Path(CONFIG.chat_archive_path)
-        _ensure_schema(database)
+        await asyncio.to_thread(_ensure_schema, database)
         _queue = MemoryJobQueue(database)
         _queue.start_intake()
         _queue.recover_expired_leases(now=_utc_now())
         _store = PrivateMemoryStore(
             database, retention_days=CONFIG.private_memory_retention_days
         )
-        _purge_retained_messages(_store)
+        await _purge_async(_store)
         if _retention_task is None or _retention_task.done():
             _retention_task = asyncio.create_task(
                 _run_daily_retention(_store), name="private-memory-retention"

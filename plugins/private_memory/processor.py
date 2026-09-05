@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import re
 import sqlite3
+from dataclasses import replace
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import closing
 
 from plugins.feature_control.runtime import FEATURES
 from plugins.member_memory.store import SENSITIVE_RE
+from plugins.member_memory.safety import contains_secret as _contains_secret
 
 from .ai import (
     RelationshipCandidate,
@@ -18,6 +20,7 @@ from .ai import (
 from .models import (
     ConversationScope,
     MemoryJob,
+    MemoryJobContinuation,
     PrivateFactCandidate,
     PrivateMessage,
     RelationshipState,
@@ -35,21 +38,6 @@ RelationshipCallable = Callable[
     Awaitable[RelationshipCandidate | None],
 ]
 Gate = Callable[[], bool]
-
-_SECRET_LABEL_RE = re.compile(
-    r"(?:api[\s_-]*key|access[\s_-]*key|client[\s_-]*secret|secret|token|"
-    r"password|passwd|authorization|bearer|密码|口令|密钥|私钥|令牌|凭据)",
-    re.IGNORECASE,
-)
-_SECRET_VALUE_RE = re.compile(
-    r"(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|"
-    r"AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"
-    r"\.[A-Za-z0-9_-]{4,})"
-)
-
-
-def _contains_secret(value: str) -> bool:
-    return bool(_SECRET_LABEL_RE.search(value) or _SECRET_VALUE_RE.search(value))
 
 
 def _private_memory_enabled() -> bool:
@@ -79,7 +67,13 @@ class PrivateMemoryProcessor:
         private_memory_enabled: Gate = _private_memory_enabled,
         relationship_enabled: Gate = _relationship_enabled,
         background_memory_allowed: Gate = _background_memory_allowed,
+        batch_messages: int = 20,
+        batch_chars: int = 12_000,
     ) -> None:
+        if type(batch_messages) is not int or batch_messages < 1 or type(batch_chars) is not int or batch_chars < 1:
+            raise ValueError("memory batch limits must be positive integers")
+        self.batch_messages = batch_messages
+        self.batch_chars = batch_chars
         self.store = store
         self.relationship_store = relationship_store
         self.summarize = summarize
@@ -89,10 +83,17 @@ class PrivateMemoryProcessor:
         self.relationship_enabled = relationship_enabled
         self.background_memory_allowed = background_memory_allowed
 
-    async def __call__(self, job: MemoryJob) -> bool:
+    async def __call__(self, job: MemoryJob) -> bool | MemoryJobContinuation:
         return await self.process(job)
 
-    async def process(self, job: MemoryJob) -> bool:
+    async def process(self, job: MemoryJob) -> bool | MemoryJobContinuation:
+        if job.job_type == "member_facts":
+            from plugins.member_memory.processing import process_member_job
+            from plugins.violation_record.config import CONFIG
+            return await process_member_job(job, path=self.store.path, root=CONFIG.member_memory_root,
+                allowed=lambda group_id: FEATURES.group_chat_allowed(group_id) and self.background_memory_allowed(),
+                summary_enabled=CONFIG.member_memory_summary_enabled,
+                batch_messages=self.batch_messages, batch_chars=self.batch_chars)
         if job.job_type == "private_summary":
             return await self._process_summary(job)
         if job.job_type == "private_facts":
@@ -101,15 +102,15 @@ class PrivateMemoryProcessor:
             return await self._process_relationship(job)
         raise ValueError("unknown memory job type")
 
-    async def _process_summary(self, job: MemoryJob) -> bool:
+    async def _process_summary(self, job: MemoryJob) -> bool | MemoryJobContinuation:
         if (
             job.scope.conversation_kind != "private"
             or not self.private_memory_enabled()
             or not self.background_memory_allowed()
         ):
             return False
-        current = self.store.get_summary(user_id=job.scope.user_id)
-        current_version, previous_through = self.store.get_summary_version_state(
+        current = await asyncio.to_thread(self.store.get_summary, user_id=job.scope.user_id)
+        current_version, previous_through = await asyncio.to_thread(self.store.get_summary_version_state,
             user_id=job.scope.user_id
         )
         stale = current_version != job.expected_version
@@ -119,71 +120,91 @@ class PrivateMemoryProcessor:
             or job.input_through_id <= previous_through
         ):
             return False
-        live_ids = self._private_live_interval_ids(
-            job.scope, after=previous_through, through=job.input_through_id
-        )
-        if not live_ids:
-            return False
         expected_version = current_version
-        messages = self._private_messages(
-            job.scope, after=previous_through, through=job.input_through_id
-        )
-        if not messages or messages[-1].id != job.input_through_id:
+        messages = await asyncio.to_thread(self._private_messages,
+            job.scope, after=previous_through, through=job.input_through_id, limit=self.batch_messages)
+        if not messages:
+            return False
+        messages = self._bounded_messages(messages)
+        end = messages[-1].id
+        live_ids = await asyncio.to_thread(self._private_live_interval_ids,
+            job.scope, after=previous_through, through=end)
+        if not live_ids:
             return False
         if not self.background_memory_allowed():
             return False
         summary = await self.summarize(current.summary_text if current else "", messages)
         if (
             summary is None
+            or _contains_secret(summary)
             or not self.private_memory_enabled()
             or not self.background_memory_allowed()
         ):
             return False
-        return self.store.commit_summary(
+        committed = await asyncio.to_thread(self.store.commit_summary,
             user_id=job.scope.user_id,
             summary_text=summary,
             source_start_id=live_ids[0],
-            source_end_id=job.input_through_id,
+            source_end_id=end,
             expected_through_id=previous_through,
             expected_version=expected_version,
+            expected_live_ids=live_ids,
         )
+        if not committed:
+            return False
+        return MemoryJobContinuation.MORE if end < job.input_through_id else True
 
-    async def _process_facts(self, job: MemoryJob) -> bool:
-        if (
-            job.scope.conversation_kind != "private"
-            or not self.private_memory_enabled()
-            or not self.background_memory_allowed()
-        ):
+    async def _process_facts(self, job: MemoryJob) -> bool | MemoryJobContinuation:
+        if (job.scope.conversation_kind != "private" or not self.private_memory_enabled()
+            or not self.background_memory_allowed()):
             return False
-        messages = self._private_messages(
-            job.scope, after=0, through=job.input_through_id, user_only=True
+        through, version = await asyncio.to_thread(self.store.fact_progress, user_id=job.scope.user_id)
+        if through >= job.input_through_id:
+            return True
+        messages = await asyncio.to_thread(
+            self._private_messages, job.scope, after=through,
+            through=job.input_through_id, user_only=True, limit=self.batch_messages,
         )
-        if not messages or messages[-1].id != job.input_through_id:
-            return False
+        if not messages:
+            # Retention may have removed the entire pending interval.
+            return await asyncio.to_thread(self.store.commit_fact_batch,
+                user_id=job.scope.user_id, candidates=(), expected_through_id=through,
+                expected_version=version, through_id=job.input_through_id, expected_source_ids=())
+        messages = self._bounded_messages(messages)
         if not self.background_memory_allowed():
             return False
         candidates = await self.extract(messages)
-        if (
-            not self.private_memory_enabled()
-            or not self.background_memory_allowed()
-        ):
+        if not self.private_memory_enabled() or not self.background_memory_allowed():
             return False
         sources = {message.message_id: message for message in messages}
+        valid = []
         for candidate in candidates:
             source = sources.get(candidate.source_message_id)
-            if (
-                candidate.user_id != job.scope.user_id
-                or source is None
-                or not candidate.source_quote
-                or candidate.source_quote not in source.text
-                or SENSITIVE_RE.search(candidate.fact_text)
-                or SENSITIVE_RE.search(candidate.source_quote)
-                or _contains_secret(candidate.fact_text)
-                or _contains_secret(candidate.source_quote)
-            ):
+            if (candidate.user_id != job.scope.user_id or source is None
+                or not candidate.source_quote or candidate.source_quote not in source.text
+                or SENSITIVE_RE.search(candidate.fact_text) or SENSITIVE_RE.search(candidate.source_quote)
+                or _contains_secret(candidate.fact_text) or _contains_secret(candidate.source_quote)):
                 continue
-            self.store.append_fact(candidate)
-        return True
+            valid.append(candidate)
+        end = messages[-1].id
+        committed = await asyncio.to_thread(self.store.commit_fact_batch,
+            user_id=job.scope.user_id, candidates=valid, expected_through_id=through,
+            expected_version=version, through_id=end,
+            expected_source_ids=tuple(message.id for message in messages))
+        if not committed:
+            return False
+        return MemoryJobContinuation.MORE if end < job.input_through_id else True
+
+    def _bounded_messages(self, messages: Sequence[PrivateMessage]) -> tuple[PrivateMessage, ...]:
+        result = []
+        remaining = self.batch_chars
+        for message in messages[:self.batch_messages]:
+            if remaining <= 0:
+                break
+            text = message.text[:remaining]
+            result.append(replace(message, text=text))
+            remaining -= len(text)
+        return tuple(result)
 
     async def _process_relationship(self, job: MemoryJob) -> bool:
         if (
@@ -191,7 +212,7 @@ class PrivateMemoryProcessor:
             or not self.background_memory_allowed()
         ):
             return False
-        current = self._relationship(job.scope)
+        current = await asyncio.to_thread(self._relationship, job.scope)
         current_version = current.version if current else 0
         current_watermark = current.source_watermark if current else 0
         if current_watermark >= job.input_through_id:
@@ -206,16 +227,16 @@ class PrivateMemoryProcessor:
             return False
         expected_version = current_version
         if job.scope.conversation_kind == "private":
-            messages = self._private_messages(
+            messages = await asyncio.to_thread(self._private_messages,
                 job.scope,
-                after=max(0, job.input_through_id - 1),
+                after=max(0, (job.input_from_id or job.input_through_id) - 1),
                 through=job.input_through_id,
                 user_only=True,
             )
         elif job.scope.conversation_kind == "group":
-            messages = self._group_messages(
+            messages = await asyncio.to_thread(self._group_messages,
                 job.scope,
-                after=max(0, job.input_through_id - 1),
+                after=max(0, (job.input_from_id or job.input_through_id) - 1),
                 through=job.input_through_id,
             )
         else:
@@ -224,12 +245,20 @@ class PrivateMemoryProcessor:
             return False
         if not self.background_memory_allowed():
             return False
+        messages = messages[-self.batch_messages:]
+        share = max(1, self.batch_chars // len(messages))
+        messages = tuple(replace(message, text=message.text[:share]) for message in messages)
         candidate = await self.update_relationship(current, messages)
         if (
             candidate is None
             or not self.relationship_enabled()
             or not self.background_memory_allowed()
         ):
+            return False
+        if any(_contains_secret(text) for text in (
+            candidate.state_text, candidate.preferred_address,
+            candidate.communication_style, *candidate.open_topics,
+        )):
             return False
         source = messages[-1]
         state = RelationshipState(
@@ -245,7 +274,7 @@ class PrivateMemoryProcessor:
             created_at=current.created_at if current else "",
             updated_at="",
         )
-        return self.relationship_store.commit(state, expected_version=expected_version)
+        return await asyncio.to_thread(self.relationship_store.commit, state, expected_version=expected_version)
 
     def _relationship(self, scope: ConversationScope) -> RelationshipState | None:
         if scope.conversation_kind == "private":
@@ -267,6 +296,7 @@ class PrivateMemoryProcessor:
         after: int,
         through: int,
         user_only: bool = False,
+        limit: int | None = None,
     ) -> tuple[PrivateMessage, ...]:
         direction = " AND message.direction='user'" if user_only else ""
         with closing(sqlite3.connect(self.store.path)) as connection:
@@ -293,8 +323,8 @@ class PrivateMemoryProcessor:
                       message.direction='assistant'
                       AND source.source_kind IN ('image','text_image')
                   )
-                """ + direction + " ORDER BY message.id",
-                (scope.user_id, after, through),
+                """ + direction + " ORDER BY message.id" + (" LIMIT ?" if limit else ""),
+                (scope.user_id, after, through, limit) if limit else (scope.user_id, after, through),
             ).fetchall()
         return tuple(
             PrivateMessage(
@@ -326,10 +356,9 @@ class PrivateMemoryProcessor:
         if (
             not rows
             or int(rows[-1][0]) != through
-            or any(row[1] is not None for row in rows)
         ):
             return ()
-        return tuple(int(row[0]) for row in rows)
+        return tuple(int(row[0]) for row in rows if row[1] is None)
 
     def _group_messages(
         self, scope: ConversationScope, *, after: int, through: int

@@ -103,12 +103,21 @@ def _request_policy() -> tuple[bool, bool]:
     return use_gateway, False
 
 
-async def extract_memory_candidates(context: Sequence[ContextMessage]) -> list[dict[str, object]]:
+class MemberMemoryError(RuntimeError):
+    code = "member_memory_processing_error"
+    retryable = True
+
+
+async def extract_memory_candidates(context: Sequence[ContextMessage], *, strict: bool = False) -> list[dict[str, object]]:
     use_gateway, economy_mode = _request_policy()
     api_available = bool(
         getattr(CONFIG, "glm_api_key", "") if economy_mode else CONFIG.ai_api_key
     )
-    if not api_available or not context:
+    if not context:
+        return []
+    if not api_available:
+        if strict:
+            raise MemberMemoryError("member memory model unavailable")
         return []
     try:
         content = str(
@@ -122,9 +131,15 @@ async def extract_memory_candidates(context: Sequence[ContextMessage]) -> list[d
         if content.startswith("```"):
             content = content.strip("`").removeprefix("json").strip()
         parsed = json.loads(content)
+        if strict and (not isinstance(parsed, dict) or not isinstance(parsed.get("memories"), list)):
+            raise ValueError("invalid member memory response contract")
         memories = parsed.get("memories", []) if isinstance(parsed, dict) else []
+        if strict and (len(memories) > 20 or any(not isinstance(item, dict) for item in memories)):
+            raise ValueError("invalid member memory candidate count or type")
         return [item for item in memories if isinstance(item, dict)]
-    except (OSError, ValueError, KeyError, TypeError, httpx.HTTPError, GatewayError):
+    except (OSError, ValueError, KeyError, TypeError, httpx.HTTPError, GatewayError) as exc:
+        if strict:
+            raise MemberMemoryError("member memory request failed") from exc
         return []
 
 

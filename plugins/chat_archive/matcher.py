@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from nonebot import logger, on_message
@@ -54,7 +55,7 @@ archive_matcher = on_message(rule=Rule(_chat_group), priority=1, block=False)
 async def archive_chat_message(event: GroupMessageEvent) -> None:
     sender = _sender_dict(event)
     try:
-        archived = archive_payload(
+        archived = await asyncio.to_thread(archive_payload,
             CONFIG.chat_archive_path,
             int(event.group_id),
             {
@@ -80,7 +81,7 @@ async def archive_chat_message(event: GroupMessageEvent) -> None:
     if not archived:
         return
     try:
-        remember_identity(
+        await asyncio.to_thread(remember_identity,
             CONFIG.chat_archive_path,
             CONFIG.member_memory_root,
             group_id=int(event.group_id),

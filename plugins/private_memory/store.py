@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from plugins.chat_archive.db import ContextMessage
+from plugins.member_memory.safety import contains_secret
 
 from .models import (
     ClearReport,
@@ -520,11 +521,14 @@ class PrivateMemoryStore:
         source_end_id: int,
         expected_through_id: int,
         expected_version: int,
+        expected_live_ids: tuple[int, ...] | None = None,
     ) -> bool:
         user_id = _validate_user_id(user_id)
         summary_text = _normalize_compact(summary_text)
         if not summary_text:
             raise ValueError("summary_text must not be empty")
+        if contains_secret(summary_text):
+            return False
         values = (source_start_id, source_end_id, expected_through_id, expected_version)
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
             raise ValueError("summary ids and versions must be non-negative integers")
@@ -564,6 +568,7 @@ class PrivateMemoryStore:
                     not live_ids
                     or live_ids[0] != source_start_id
                     or source_end_id not in live_ids
+                    or (expected_live_ids is not None and tuple(value for value in live_ids if value <= source_end_id) != expected_live_ids)
                 ):
                     connection.rollback()
                     return False
@@ -625,7 +630,7 @@ class PrivateMemoryStore:
             candidate.source_message_id, "source_message_id"
         )
         source_quote = _normalize_compact(candidate.source_quote)[:_SOURCE_QUOTE_LIMIT]
-        if not fact_text or not source_quote:
+        if not fact_text or not source_quote or contains_secret(fact_text) or contains_secret(source_quote):
             return None
         if trust_level not in {"ai_extracted", "admin_confirmed"}:
             raise ValueError("invalid trust_level")
@@ -701,6 +706,66 @@ class PrivateMemoryStore:
             except Exception:
                 connection.rollback()
                 raise
+
+    def fact_progress(self, *, user_id: str) -> tuple[int, int]:
+        user_id = _validate_user_id(user_id)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT through_message_id,version FROM private_fact_progress WHERE user_id=?", (user_id,)
+            ).fetchone()
+        return (int(row[0]), int(row[1])) if row else (0, 0)
+
+    def commit_fact_batch(
+        self, *, user_id: str, candidates: Sequence[PrivateFactCandidate],
+        expected_through_id: int, expected_version: int, through_id: int,
+        expected_source_ids: tuple[int, ...],
+    ) -> bool:
+        """Atomically write validated facts and advance their durable input cursor."""
+        user_id = _validate_user_id(user_id)
+        if through_id <= expected_through_id:
+            raise ValueError("fact watermark must advance")
+        now = _now_text()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = connection.execute(
+                "SELECT through_message_id,version FROM private_fact_progress WHERE user_id=?", (user_id,)
+            ).fetchone()
+            actual = (int(state[0]), int(state[1])) if state else (0, 0)
+            if actual != (expected_through_id, expected_version):
+                connection.rollback()
+                return False
+            rows = connection.execute(
+                "SELECT id,message_id,text FROM private_chat_messages "
+                "WHERE user_id=? AND direction='user' AND source_kind<>'image' "
+                "AND purged_at IS NULL AND id>? AND id<=? ORDER BY id",
+                (user_id, expected_through_id, through_id),
+            ).fetchall()
+            if tuple(int(row['id']) for row in rows) != expected_source_ids:
+                connection.rollback()
+                return False
+            sources = {str(row['message_id']): str(row['text']) for row in rows}
+            for candidate in candidates:
+                text = _normalize_compact(candidate.fact_text)
+                quote = _normalize_compact(candidate.source_quote)[:_SOURCE_QUOTE_LIMIT]
+                source = sources.get(candidate.source_message_id)
+                if (candidate.user_id != user_id or source is None or not quote or quote not in source
+                    or not text or contains_secret(text) or contains_secret(quote)):
+                    continue
+                connection.execute(
+                    """INSERT OR IGNORE INTO private_memory_facts(
+                        user_id,fact_text,normalized_text,source_message_id,source_quote,
+                        trust_level,status,supersedes_id,version,created_at,updated_at,deleted_at
+                    ) VALUES(?,?,?,?,?,'ai_extracted','active',NULL,1,?,?,NULL)""",
+                    (user_id, text, text.casefold(), candidate.source_message_id, quote, now, now),
+                )
+            connection.execute(
+                """INSERT INTO private_fact_progress(user_id,through_message_id,version,updated_at)
+                VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+                through_message_id=excluded.through_message_id,version=excluded.version,updated_at=excluded.updated_at""",
+                (user_id, through_id, expected_version + 1, now),
+            )
+            connection.commit()
+        return True
 
     def active_facts(self, *, user_id: str, limit: int) -> tuple[PrivateFact, ...]:
         user_id = _validate_user_id(user_id)
@@ -842,6 +907,9 @@ class PrivateMemoryStore:
                     """,
                     (now, user_id),
                 )
+                from plugins.memory_governance.retention import clear_delivery_plans, invalidate_fact_progress
+                invalidate_fact_progress(connection, user_id, cleared_through, now)
+                clear_delivery_plans(connection, user_id)
                 summary = connection.execute(
                     "SELECT summary_text FROM private_conversation_summaries WHERE user_id=?",
                     (user_id,),

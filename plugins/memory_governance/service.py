@@ -702,6 +702,9 @@ class MemoryGovernanceService:
             """,
             (scope.user_id, maximum, now, now),
         )
+        from .retention import clear_delivery_plans, invalidate_fact_progress
+        invalidate_fact_progress(connection, scope.user_id, maximum, now)
+        clear_delivery_plans(connection, scope.user_id)
         connection.execute(
             "UPDATE relationship_states SET open_topics_json='[]',source_message_id=?,version=version+1,updated_at=? WHERE conversation_kind='private' AND group_id IS NULL AND user_id=? AND open_topics_json<>'[]'",
             (f"governance:{operation_id}", now, scope.user_id),

@@ -10,15 +10,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import AbstractSet, Awaitable, Callable
 
-from .models import ConversationScope, MemoryJob, validate_persona_id
+from .models import ConversationScope, MemoryJob, MemoryJobContinuation, validate_persona_id
 from .schema import PRIVATE_MEMORY_SCHEMA_VERSION, schema_version
 
 
-JobProcessor = Callable[[MemoryJob], Awaitable[bool | None]]
+JobProcessor = Callable[[MemoryJob], Awaitable[bool | None | MemoryJobContinuation]]
 AllowedJobTypesProvider = Callable[[], AbstractSet[str]]
 logger = logging.getLogger(__name__)
 
-_JOB_TYPES = {"private_summary", "private_facts", "relationship"}
+_JOB_TYPES = {"private_summary", "private_facts", "relationship", "member_facts"}
 _KINDS = {"private", "group"}
 _USER_ID_RE = re.compile(r"[1-9][0-9]*", re.ASCII)
 _ERROR_CODE_RE = re.compile(r"[^a-z0-9_]+")
@@ -44,6 +44,10 @@ class MemoryJobQueue:
         lease_seconds: int = 60,
         max_attempts: int = 3,
         backoff_base_seconds: int = 5,
+        relationship_debounce_seconds: int = 60,
+        relationship_max_wait_seconds: int = 300,
+        member_batch_delay_seconds: int = 60,
+        member_batch_threshold: int = 5,
     ) -> None:
         self.path = Path(path)
         if schema_version(self.path) != PRIVATE_MEMORY_SCHEMA_VERSION:
@@ -55,6 +59,17 @@ class MemoryJobQueue:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if (type(relationship_debounce_seconds) is not int or type(relationship_max_wait_seconds) is not int
+            or relationship_debounce_seconds < 0 or relationship_max_wait_seconds < relationship_debounce_seconds):
+            raise ValueError("invalid relationship debounce")
+        if type(member_batch_delay_seconds) is not int or member_batch_delay_seconds < 0:
+            raise ValueError("invalid member batch delay")
+        if type(member_batch_threshold) is not int or member_batch_threshold < 1:
+            raise ValueError("invalid member batch threshold")
+        self.member_batch_delay_seconds = member_batch_delay_seconds
+        self.member_batch_threshold = member_batch_threshold
+        self.relationship_debounce_seconds = relationship_debounce_seconds
+        self.relationship_max_wait_seconds = relationship_max_wait_seconds
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
         self.backoff_base_seconds = backoff_base_seconds
@@ -104,6 +119,8 @@ class MemoryJobQueue:
             raise ValueError("unknown memory job type")
         if job_type in {"private_summary", "private_facts"} and conversation_kind != "private":
             raise ValueError(f"{job_type} jobs require private conversation scope")
+        if job_type == "member_facts" and conversation_kind != "group":
+            raise ValueError("member_facts jobs require group conversation scope")
         self._validate_scope(
             conversation_kind=conversation_kind, user_id=user_id, group_id=group_id
         )
@@ -114,10 +131,41 @@ class MemoryJobQueue:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
-        now = _utc_text(_now())
+        now_value = _now()
+        now = _utc_text(now_value)
         with closing(self._connect()) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                exact = connection.execute(
+                    "SELECT id FROM memory_jobs WHERE status IN ('pending','running') AND job_type=? "
+                    "AND conversation_kind=? AND ifnull(group_id,-1)=ifnull(?,-1) AND user_id=? "
+                    "AND persona_id=? AND input_through_id=? ORDER BY id LIMIT 1",
+                    (job_type,conversation_kind,group_id,user_id,persona_id,input_through_id),
+                ).fetchone()
+                if exact is not None:
+                    connection.commit()
+                    return int(exact[0])
+                if job_type in {"private_facts", "relationship", "member_facts"}:
+                    pending = connection.execute(
+                        "SELECT id,input_through_id,created_at,expected_version,input_count FROM memory_jobs "
+                        "WHERE status='pending' AND attempts=0 AND job_type=? AND conversation_kind=? "
+                        "AND ifnull(group_id,-1)=ifnull(?,-1) AND user_id=? AND persona_id=? ORDER BY id LIMIT 1",
+                        (job_type, conversation_kind, group_id, user_id, persona_id),
+                    ).fetchone()
+                    if pending is not None:
+                        if input_through_id > int(pending['input_through_id']):
+                            created = datetime.fromisoformat(str(pending['created_at']).replace('Z','+00:00'))
+                            due = min(now_value + timedelta(seconds=self.relationship_debounce_seconds),
+                                      created + timedelta(seconds=self.relationship_max_wait_seconds)) if job_type == 'relationship' else now_value
+                            count = int(pending['input_count']) + 1
+                            if job_type == 'member_facts':
+                                due = now_value if count >= self.member_batch_threshold else created + timedelta(seconds=self.member_batch_delay_seconds)
+                            connection.execute(
+                                "UPDATE memory_jobs SET input_through_id=?,input_count=?,next_run_at=?,updated_at=? WHERE id=?",
+                                (input_through_id, count, _utc_text(due), now, int(pending['id'])),
+                            )
+                        connection.commit()
+                        return int(pending['id'])
                 row = connection.execute(
                     """
                     SELECT id FROM memory_jobs
@@ -144,8 +192,8 @@ class MemoryJobQueue:
                             job_type,conversation_kind,group_id,user_id,persona_id,
                             input_through_id,expected_version,status,attempts,next_run_at,
                             lease_owner,lease_expires_at,claim_version,error_code,
-                            error_summary,created_at,updated_at
-                        ) VALUES(?,?,?,?,?,?,?,'pending',0,?,NULL,NULL,0,'','',?,?)
+                            error_summary,created_at,updated_at,input_from_id
+                        ) VALUES(?,?,?,?,?,?,?,'pending',0,?,NULL,NULL,0,'','',?,?,?)
                         """,
                         (
                             job_type,
@@ -155,9 +203,11 @@ class MemoryJobQueue:
                             persona_id,
                             input_through_id,
                             expected_version,
+                            _utc_text(now_value + timedelta(seconds=self.relationship_debounce_seconds)) if job_type == "relationship"
+                            else _utc_text(now_value + timedelta(seconds=self.member_batch_delay_seconds)) if job_type == "member_facts" else now,
                             now,
                             now,
-                            now,
+                            input_through_id,
                         ),
                     )
                     job_id = int(cursor.lastrowid)
@@ -373,6 +423,31 @@ class MemoryJobQueue:
             connection.commit()
             return bool(cursor.rowcount)
 
+    def renew(self, job: MemoryJob, *, worker_id: str, now: datetime | None = None) -> bool:
+        current = now or _now()
+        with closing(self._connect()) as connection:
+            result = connection.execute(
+                "UPDATE memory_jobs SET lease_expires_at=?,updated_at=? "
+                "WHERE id=? AND status='running' AND lease_owner=? AND claim_version=?",
+                (_utc_text(current + timedelta(seconds=self.lease_seconds)), _utc_text(current),
+                 job.id, worker_id, job.claim_version),
+            )
+            connection.commit()
+            return bool(result.rowcount)
+
+    def continue_job(self, job: MemoryJob, *, worker_id: str) -> bool:
+        """Yield a bounded successful batch without consuming a retry attempt."""
+        now = _utc_text(_now())
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                "UPDATE memory_jobs SET status='pending',attempts=max(0,attempts-1),"
+                "next_run_at=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=? "
+                "WHERE id=? AND status='running' AND lease_owner=? AND claim_version=?",
+                (now, now, job.id, worker_id, job.claim_version),
+            )
+            connection.commit()
+            return bool(cursor.rowcount)
+
     def get(self, job_id: int) -> MemoryJob:
         with closing(self._connect()) as connection:
             row = connection.execute("SELECT * FROM memory_jobs WHERE id=?", (job_id,)).fetchone()
@@ -405,7 +480,19 @@ class MemoryJobQueue:
             error_summary=str(row["error_summary"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            input_from_id=int(row["input_from_id"]),
         )
+
+
+async def _queue_io(method, *args, **kwargs):
+    # SQLite calls cannot be cancelled once their thread starts. Wait for the
+    # operation before releasing leases, otherwise a late claim can outlive shutdown.
+    task = asyncio.create_task(asyncio.to_thread(method, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
 
 
 class MemoryJobWorker:
@@ -442,17 +529,34 @@ class MemoryJobWorker:
     def stop_intake(self) -> None:
         self._stopping.set()
 
+    async def _heartbeat(self, job: MemoryJob) -> None:
+        while True:
+            await asyncio.sleep(max(0.1, self.queue.lease_seconds / 3))
+            try:
+                if not await _queue_io(self.queue.renew, job, worker_id=self.worker_id):
+                    return
+            except Exception as exc:
+                logger.warning("memory job lease renewal failed error=%s", type(exc).__name__)
+
     async def _process(self, job: MemoryJob) -> None:
+        heartbeat = asyncio.create_task(self._heartbeat(job))
+        try:
+            await self._process_owned(job)
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _process_owned(self, job: MemoryJob) -> None:
         try:
             if self.processor is None:
-                self.queue.release_owned(worker_id=self.worker_id)
+                await _queue_io(self.queue.release_owned, worker_id=self.worker_id)
                 return
             processed = await self.processor(job)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             try:
-                self.queue.finish(
+                await _queue_io(self.queue.finish,
                     job,
                     worker_id=self.worker_id,
                     status="failed",
@@ -466,10 +570,12 @@ class MemoryJobWorker:
                 )
         else:
             try:
-                if processed is False:
-                    self.queue.defer(job, worker_id=self.worker_id)
+                if processed is MemoryJobContinuation.MORE:
+                    await _queue_io(self.queue.continue_job, job, worker_id=self.worker_id)
+                elif processed is False:
+                    await _queue_io(self.queue.defer, job, worker_id=self.worker_id)
                 else:
-                    self.queue.finish(job, worker_id=self.worker_id, status="succeeded")
+                    await _queue_io(self.queue.finish, job, worker_id=self.worker_id, status="succeeded")
             except Exception as exc:
                 logger.warning(
                     "memory job success finalization failed error=%s",
@@ -512,7 +618,7 @@ class MemoryJobWorker:
                 capacity = self.concurrency - len(self._active)
                 if capacity > 0:
                     try:
-                        claimed = self.queue.claim(
+                        claimed = await _queue_io(self.queue.claim,
                             worker_id=self.worker_id,
                             now=_now(),
                             limit=capacity,
@@ -536,7 +642,7 @@ class MemoryJobWorker:
             if self._active:
                 await asyncio.gather(*self._active, return_exceptions=True)
             try:
-                self.queue.release_owned(worker_id=self.worker_id)
+                await _queue_io(self.queue.release_owned, worker_id=self.worker_id)
             except Exception as exc:
                 logger.warning(
                     "memory job cancellation release failed error=%s",

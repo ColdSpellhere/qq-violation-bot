@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterable
 
@@ -100,9 +101,9 @@ async def handle_memory_governance(bot: Bot, event: Event) -> None:
 
     now = datetime.now(timezone.utc)
     try:
-        service = _create_service(state.private_chat_allowed_user_ids)
+        service = await asyncio.to_thread(_create_service, state.private_chat_allowed_user_ids)
         if command.action == "confirm":
-            result = service.confirm(
+            result = await asyncio.to_thread(service.confirm,
                 command.token,
                 actor=actor,
                 reason=command.reason,
@@ -133,12 +134,12 @@ async def handle_memory_governance(bot: Bot, event: Event) -> None:
             return
 
         if command.action == "cancel":
-            result = service.cancel(command.token, actor=actor, now=now)
+            result = await asyncio.to_thread(service.cancel, command.token, actor=actor, now=now)
             await memory_governance_matcher.finish(result.message)
             return
 
         if command.is_write:
-            result = service.preview(command, actor=actor, now=now)
+            result = await asyncio.to_thread(service.preview, command, actor=actor, now=now)
             receipt = (
                 f"{result.preview_text}\n\n操作码：{result.token}\n"
                 f"有效期至：{result.expires_at}"
@@ -154,7 +155,7 @@ async def handle_memory_governance(bot: Bot, event: Event) -> None:
             await memory_governance_matcher.finish("记忆治理预览已私发。")
             return
 
-        result = service.view(command, actor=actor)
+        result = await asyncio.to_thread(service.view, command, actor=actor)
         delivered = await _send_private_receipt(
             bot, actor=actor, message=result.text
         )

@@ -5,6 +5,9 @@ import logging
 import os
 import re
 import sqlite3
+import tempfile
+import threading
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -67,6 +70,9 @@ MAX_TRAITS = LEGACY_VIEW_LIMIT
 PROMPT_ALIAS_LIMIT = 5
 PROMPT_UNSUMMARIZED_LIMIT = 8
 logger = logging.getLogger(__name__)
+_MIRROR_LOCKS = tuple(threading.Lock() for _ in range(32))
+
+from .safety import contains_secret
 
 SENSITIVE_RE = re.compile(
     r"手机号|电话号码?|身份证|住址|家庭地址|密码|token|银行卡|微信号|邮箱|真实姓名|\d{6,}",
@@ -99,6 +105,7 @@ class SummaryWork:
     summary: str
     previous_through_id: int
     facts: tuple[MemoryTrait, ...]
+    fact_versions: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -323,7 +330,7 @@ def migrate_legacy_memory(path: Path, root: Path, *, apply: bool) -> MemoryMigra
     empty = MemoryMigrationReport(0, 0, 0, 0, 0)
     if not path.is_file():
         return empty
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         has_legacy_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type=? AND name=?",
             ("table", "member_memories"),
@@ -360,7 +367,15 @@ def migrate_legacy_memory(path: Path, root: Path, *, apply: bool) -> MemoryMigra
 
 
 def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> bool:
-    with sqlite3.connect(path) as conn:
+    # Bounded lock stripes prevent identity updates and background memory jobs
+    # from publishing stale snapshots or sharing a temporary filename.
+    lock = _MIRROR_LOCKS[hash((str(path.resolve()), group_id, user_id)) % len(_MIRROR_LOCKS)]
+    with lock:
+        return _write_mirror_locked(path, root, group_id, user_id)
+
+
+def _write_mirror_locked(path: Path, root: Path, group_id: int, user_id: str) -> bool:
+    with closing(sqlite3.connect(path)) as conn, conn:
         _ensure_schema(conn)
         profile = _profile_with_legacy_fallback(conn, group_id, str(user_id))
     if profile is None:
@@ -372,7 +387,7 @@ def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> bool:
         logger.error("member memory mirror directory creation failed error=%s", type(exc).__name__)
         return False
     target = directory / f"{profile.user_id}.json"
-    temporary = directory / f".{profile.user_id}.json.tmp"
+    temporary: Path | None = None
     payload = {
         "group_id": profile.group_id,
         "user_id": profile.user_id,
@@ -384,7 +399,10 @@ def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> bool:
         "updated_at": profile.updated_at,
     }
     try:
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=f".{profile.user_id}.", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         temporary.chmod(0o600)
         os.replace(temporary, target)
         target.chmod(0o600)
@@ -392,13 +410,19 @@ def _write_mirror(path: Path, root: Path, group_id: int, user_id: str) -> bool:
     except OSError as exc:
         logger.error("member memory mirror write failed error=%s", type(exc).__name__)
         return False
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("member memory temporary file cleanup failed")
 
 
 def remember_identity(path: Path, root: Path, *, group_id: int, user_id: str, nickname: str) -> MemberProfile:
     cleaned_name = nickname.strip() or str(user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     user_id = str(user_id)
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         _ensure_schema(conn)
         existing = _profile_row(conn, group_id, user_id)
         if existing is not None:
@@ -502,7 +526,7 @@ def load_profiles(
     if not path.is_file() or not ordered:
         return []
     try:
-        with sqlite3.connect(path) as conn:
+        with closing(sqlite3.connect(path)) as conn, conn:
             _ensure_schema(conn)
             profiles = [
                 _compact_profile_row(
@@ -520,7 +544,7 @@ def load_profiles(
 def pending_summary_batch(
     path: Path, *, group_id: int, user_id: str, threshold: int = 5, limit: int = 20
 ) -> SummaryWork | None:
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         _ensure_schema(conn)
         state = conn.execute(
@@ -534,10 +558,13 @@ def pending_summary_batch(
             "WHERE group_id=? AND user_id=? AND id>? AND status='active'",
             (group_id, user_id, through),
         ).fetchone()[0]
-        if pending_count < threshold:
+        # An explicitly invalidated summary must rebuild even if deleting a
+        # fact leaves fewer than the normal aggregation threshold.
+        effective_threshold = 1 if state is not None and not summary and through == 0 else threshold
+        if pending_count < effective_threshold:
             return None
         rows = conn.execute(
-            "SELECT id,trait,evidence_message_id,created_at FROM member_memory_facts "
+            "SELECT id,trait,evidence_message_id,created_at,version FROM member_memory_facts "
             "WHERE group_id=? AND user_id=? AND id>? AND status='active' ORDER BY id LIMIT ?",
             (group_id, user_id, through, limit),
         ).fetchall()
@@ -545,7 +572,7 @@ def pending_summary_batch(
         MemoryTrait(row["trait"], row["evidence_message_id"], row["created_at"], row["id"])
         for row in rows
     )
-    return SummaryWork(summary, through, facts)
+    return SummaryWork(summary, through, facts, tuple((int(row["id"]), int(row["version"])) for row in rows))
 
 
 def commit_summary(
@@ -557,8 +584,11 @@ def commit_summary(
     previous_through_id: int,
     through_fact_id: int,
     summary: str,
+    expected_fact_versions: tuple[tuple[int, int], ...] | None = None,
 ) -> bool:
-    with sqlite3.connect(path) as conn:
+    if not summary.strip() or contains_secret(summary):
+        return False
+    with closing(sqlite3.connect(path)) as conn, conn:
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -577,7 +607,18 @@ def commit_summary(
             """,
             (group_id, user_id, previous_through_id, through_fact_id),
         ).fetchone()
-        if newly_inactive is not None:
+        if expected_fact_versions is not None:
+            current_versions = tuple(conn.execute(
+                "SELECT id,version FROM member_memory_facts "
+                "WHERE group_id=? AND user_id=? AND id>? AND id<=? AND status='active' ORDER BY id",
+                (group_id, user_id, previous_through_id, through_fact_id),
+            ))
+            # Historical tombstones are valid during a rebuild. Only changes to
+            # the active source set while the model was running invalidate it.
+            conflict = current_versions != expected_fact_versions
+        else:
+            conflict = newly_inactive is not None
+        if conflict:
             conn.rollback()
             return False
         conn.execute(
@@ -606,6 +647,7 @@ def apply_candidates(
         if (
             source is None or source.user_id != user_id or not quote or quote not in source.text
             or not (2 <= len(trait) <= 80) or SENSITIVE_RE.search(trait) or SENSITIVE_RE.search(quote)
+            or contains_secret(trait) or contains_secret(quote)
         ):
             continue
         valid.append((user_id, trait, evidence_id))
@@ -614,7 +656,7 @@ def apply_candidates(
     for user_id, trait, evidence_id in valid:
         source = evidence[evidence_id]
         remember_identity(path, root, group_id=group_id, user_id=user_id, nickname=source.nickname)
-        with sqlite3.connect(path) as conn:
+        with closing(sqlite3.connect(path)) as conn, conn:
             _ensure_schema(conn)
             if not _append_fact(conn, group_id, user_id, trait, evidence_id, _now()):
                 continue

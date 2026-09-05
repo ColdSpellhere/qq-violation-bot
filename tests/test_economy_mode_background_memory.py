@@ -104,7 +104,7 @@ class EconomyModeGroupBackgroundTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(archive_matcher, "CONFIG", config),
                 patch.object(member_matcher, "FEATURES", features),
                 patch.object(member_matcher, "CONFIG", config),
-                patch.object(member_matcher.BATCHER, "add") as add,
+                patch.object(member_matcher, "_enqueue_member_batch") as add,
                 patch.object(member_matcher, "_enqueue_group_relationship") as enqueue,
             ):
                 await archive_matcher.archive_chat_message(event)
@@ -233,7 +233,7 @@ class EconomyModeWorkerGateTests(unittest.TestCase):
 
         self.assertEqual(normal_allowed, economy_allowed)
         self.assertEqual(
-            frozenset({"private_summary", "private_facts", "relationship"}),
+            frozenset({"private_summary", "private_facts", "relationship", "member_facts"}),
             normal_allowed,
         )
 

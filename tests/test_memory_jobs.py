@@ -53,7 +53,7 @@ class MemoryJobQueueTests(unittest.TestCase):
         now_patch.start()
         self.addCleanup(now_patch.stop)
         self.queue = MemoryJobQueue(
-            self.database, lease_seconds=10, max_attempts=3, backoff_base_seconds=2
+            self.database, lease_seconds=10, max_attempts=3, backoff_base_seconds=2, relationship_debounce_seconds=0
         )
 
     def enqueue(self, user_id: str = "200", watermark: int = 1, **changes: object) -> int:
@@ -226,7 +226,7 @@ class MemoryJobQueueTests(unittest.TestCase):
 
         job_id = self.enqueue()
         second_queue = MemoryJobQueue(
-            self.database, lease_seconds=10, max_attempts=3, backoff_base_seconds=2
+            self.database, lease_seconds=10, max_attempts=3, backoff_base_seconds=2, relationship_debounce_seconds=0
         )
 
         def claim(queue, worker):
@@ -504,8 +504,9 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         database = self.root / "chat_archive.db"
         with closing(sqlite3.connect(database)) as connection:
-            connection.execute("CREATE TABLE chat_messages(id INTEGER PRIMARY KEY, plaintext TEXT)")
-            connection.execute("INSERT INTO chat_messages VALUES(1,'kept')")
+            from plugins.chat_archive.db import SCHEMA
+            connection.executescript(SCHEMA.replace('message_id TEXT NOT NULL,','message_id TEXT PRIMARY KEY,').replace(',\n    PRIMARY KEY(group_id,message_id)',''))
+            connection.execute("INSERT INTO chat_messages VALUES('m',123,1,'7','{}','[]','kept',NULL,'old')")
             connection.commit()
         driver = FakeDriver()
         steps: list[str] = []
@@ -642,7 +643,10 @@ class MemoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
 
             clock.advance_one_day()
-            await asyncio.sleep(0)
+            for _ in range(100):
+                if prune_backups.call_count == 2:
+                    break
+                await asyncio.sleep(0.01)
             self.assertEqual(2, store.purge_expired.call_count)
             self.assertEqual(NOW + timedelta(days=1), store.purge_expired.call_args.kwargs["now"])
             warning.assert_called_once()

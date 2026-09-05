@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 
 
 _PERSONA_ID_RE = re.compile(
@@ -124,6 +125,11 @@ class MemoryJob:
     error_summary: str
     created_at: str
     updated_at: str
+    input_from_id: int = 0
+
+
+class MemoryJobContinuation(Enum):
+    MORE = "more"
 
 
 @dataclass(frozen=True)

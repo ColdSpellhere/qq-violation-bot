@@ -102,7 +102,7 @@ class LLMUsageSchemaMigrationTests(unittest.TestCase):
         self.root = Path(temporary.name)
 
     def test_fresh_legacy_and_v1_databases_upgrade_to_current_idempotently(self) -> None:
-        self.assertEqual(3, PRIVATE_MEMORY_SCHEMA_VERSION)
+        self.assertEqual(4, PRIVATE_MEMORY_SCHEMA_VERSION)
         for kind in ("fresh", "legacy", "v1"):
             path = self.root / f"{kind}.db"
             if kind != "fresh":
@@ -128,7 +128,7 @@ class LLMUsageSchemaMigrationTests(unittest.TestCase):
                 )
                 connection.commit()
             second = migrate(path)
-            self.assertEqual((3, 3), (first.schema_version, second.schema_version))
+            self.assertEqual((4, 4), (first.schema_version, second.schema_version))
             with closing(sqlite3.connect(path)) as connection:
                 self.assertIsNotNone(connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_usage_events'"

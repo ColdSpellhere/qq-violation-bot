@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import os
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_messages (
-    message_id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
     group_id INTEGER NOT NULL,
     event_time INTEGER NOT NULL,
     user_id TEXT NOT NULL,
@@ -23,10 +25,11 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     message_json TEXT NOT NULL,
     plaintext TEXT NOT NULL,
     reply_message_id TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(group_id,message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_chat_messages_time
-ON chat_messages(event_time, message_id);
+ON chat_messages(group_id,event_time);
 """
 
 
@@ -58,7 +61,7 @@ def recent_text_context(
     if not path.is_file() or limit <= 0:
         return []
     try:
-        with sqlite3.connect(path) as conn:
+        with closing(sqlite3.connect(path)) as conn, conn:
             boundary = conn.execute(
                 "SELECT rowid FROM chat_messages WHERE group_id=? AND message_id=?",
                 (group_id, exclude_message_id),
@@ -221,7 +224,7 @@ def archived_message_author(path: Path, *, group_id: int, message_id: str | None
     if not path.is_file() or not message_id:
         return None
     try:
-        with sqlite3.connect(path) as conn:
+        with closing(sqlite3.connect(path)) as conn, conn:
             row = conn.execute(
                 "SELECT user_id FROM chat_messages WHERE group_id=? AND message_id=?",
                 (group_id, message_id),
@@ -231,22 +234,81 @@ def archived_message_author(path: Path, *, group_id: int, message_id: str | None
     return str(row[0]) if row else None
 
 
+def assert_table_rebuild_safe(connection: sqlite3.Connection, table: str) -> None:
+    """Fail closed for local extensions whose dependencies need manual review."""
+    for kind, name, sql in connection.execute(
+        "SELECT type,name,sql FROM sqlite_master WHERE type IN ('view','trigger')"
+    ):
+        if table.casefold() in str(sql).casefold():
+            raise RuntimeError(f"{table} has dependent {kind}; migration requires review")
+    for (name,) in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+        escaped = str(name).replace('"', '""')
+        for foreign_key in connection.execute(f'PRAGMA foreign_key_list("{escaped}")'):
+            if str(foreign_key[2]).casefold() == table.casefold():
+                raise RuntimeError(f"{table} has foreign key references; migration requires review")
+
+
+def migrate_archive_schema(connection: sqlite3.Connection) -> bool:
+    """Controlled startup migration: preserve rowids used by relationship jobs."""
+    columns = connection.execute("PRAGMA table_info(chat_messages)").fetchall()
+    if not columns:
+        return False
+    primary = [row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]]
+    if primary == ["group_id", "message_id"]:
+        return False
+    if primary != ["message_id"]:
+        raise RuntimeError("unsupported archive primary key")
+    expected = {"message_id", "group_id", "event_time", "user_id", "sender_json",
+                "message_json", "plaintext", "reply_message_id", "created_at"}
+    if {row[1] for row in columns} != expected:
+        raise RuntimeError("archive schema has unknown columns; refusing lossy migration")
+    assert_table_rebuild_safe(connection, "chat_messages")
+    # This helper runs inside the private-memory migration transaction and never
+    # makes a backup/restore decision on behalf of an already running service.
+    indexes = [row[0] for row in connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='chat_messages' AND sql IS NOT NULL"
+    )]
+    connection.execute("ALTER TABLE chat_messages RENAME TO chat_messages_before_scope")
+    connection.execute(SCHEMA.split(';', 1)[0])
+    names = ','.join(row[1] for row in columns)
+    connection.execute(f"INSERT INTO chat_messages(rowid,{names}) SELECT rowid,{names} FROM chat_messages_before_scope")
+    connection.execute("DROP TABLE chat_messages_before_scope")
+    for statement in indexes:
+        connection.execute(statement)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_group_time ON chat_messages(group_id,event_time)")
+    return True
+
+
+async def archive_payload_async(path: Path, target_group_id: int, payload: dict[str, Any]) -> bool:
+    """Await durability without running SQLite/filesystem work on the event loop."""
+    task = asyncio.create_task(asyncio.to_thread(archive_payload, path, target_group_id, payload))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
 def archive_payload(path: Path, target_group_id: int, payload: dict[str, Any]) -> bool:
     if int(payload["group_id"]) != target_group_id:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(descriptor)
-    with sqlite3.connect(path) as conn:
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.executescript(SCHEMA)
-        conn.execute(
+        inserted = conn.execute(
             """
             INSERT INTO chat_messages(
                 message_id,group_id,event_time,user_id,sender_json,message_json,
                 plaintext,reply_message_id,created_at
             ) VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(message_id) DO NOTHING
+            ON CONFLICT(group_id,message_id) DO NOTHING
             """,
             (
                 str(payload["message_id"]),
@@ -261,4 +323,4 @@ def archive_payload(path: Path, target_group_id: int, payload: dict[str, Any]) -
             ),
         )
     path.chmod(0o600)
-    return True
+    return inserted.rowcount == 1

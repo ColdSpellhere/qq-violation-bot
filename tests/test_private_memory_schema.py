@@ -84,7 +84,7 @@ class PrivateMemorySchemaTests(unittest.TestCase):
     def test_empty_database_gets_exact_schema_constraints_and_indexes(self) -> None:
         report = migrate(self.database)
 
-        self.assertEqual(3, PRIVATE_MEMORY_SCHEMA_VERSION)
+        self.assertEqual(4, PRIVATE_MEMORY_SCHEMA_VERSION)
         self.assertEqual(PRIVATE_MEMORY_SCHEMA_VERSION, report.schema_version)
         with closing(sqlite3.connect(self.database)) as connection:
             tables = {
@@ -132,7 +132,7 @@ class PrivateMemorySchemaTests(unittest.TestCase):
             self.database, "table", "relationship_states"
         ))
         jobs_sql = object_sql(self.database, "table", "memory_jobs")
-        self.assertIn("CHECK(job_type IN ('private_summary','private_facts','relationship'))", jobs_sql)
+        self.assertIn("CHECK(job_type IN ('private_summary','private_facts','relationship','member_facts'))", jobs_sql)
         self.assertIn("CHECK(status IN ('pending','running','succeeded','failed','cancelled'))", jobs_sql)
         self.assertIn("CHECK(result IN ('success','failed','cancelled'))", object_sql(
             self.database, "table", "memory_governance_audit"
@@ -289,9 +289,11 @@ class PrivateMemorySchemaTests(unittest.TestCase):
                 CREATE TABLE chat_messages (
                     message_id TEXT PRIMARY KEY,
                     group_id INTEGER NOT NULL,
-                    plaintext TEXT NOT NULL
+                    plaintext TEXT NOT NULL,
+                    event_time INTEGER NOT NULL, user_id TEXT NOT NULL, sender_json TEXT NOT NULL,
+                    message_json TEXT NOT NULL, reply_message_id TEXT, created_at TEXT NOT NULL
                 );
-                INSERT INTO chat_messages VALUES ('legacy-message', 123, 'kept');
+                INSERT INTO chat_messages VALUES ('legacy-message',123,'kept',1,'7','{}','[]',NULL,'old');
                 CREATE TABLE member_memory_facts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_id INTEGER NOT NULL,
@@ -406,7 +408,7 @@ class PrivateMemorySchemaTests(unittest.TestCase):
         first = migrate(self.database)
         second = migrate(self.database)
 
-        self.assertEqual(3, first.schema_version)
+        self.assertEqual(4, first.schema_version)
         self.assertEqual(1, first.columns_added)
         self.assertEqual(0, second.columns_added)
         with closing(sqlite3.connect(self.database)) as connection:
@@ -430,7 +432,7 @@ class PrivateMemorySchemaTests(unittest.TestCase):
             ("200", "legacy-private", "旧私聊正文", "legacy-hash", "[]"),
             row,
         )
-        self.assertEqual(3, version)
+        self.assertEqual(4, version)
 
     def test_migrate_rejects_failed_source_quick_check_before_schema_write(self) -> None:
         self.database.write_bytes(b"not a sqlite database")
