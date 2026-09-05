@@ -34,4 +34,17 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python -m compileall -q bot.py plugins scripts tests
       - run: python scripts/check_public_tree.py
-      - run: python scripts/check_public_tree.py --history
+      - name: Scan every commit introduced by this change
+        env:
+          SCAN_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ ! "$SCAN_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Missing or invalid scan base" >&2
+            exit 1
+          fi
+          if [[ "$SCAN_BASE" == "0000000000000000000000000000000000000000" ]]; then
+            python scripts/check_public_tree.py --history
+          else
+            git cat-file -e "$SCAN_BASE^{commit}"
+            python scripts/check_public_tree.py --range "$SCAN_BASE..HEAD"
+          fi
