@@ -493,13 +493,10 @@ def _claim_missed_outboxes(as_of: str) -> tuple[list[dict], list[dict]]:
                 """
                 UPDATE business_notification_outbox
                 SET status='sending', updated_at=?
-                WHERE id IN (
-                    SELECT id FROM business_notification_outbox
-                    WHERE status='failed' ORDER BY created_at,id LIMIT ?
-                ) AND status='failed'
+                WHERE status='failed'
                 RETURNING *
                 """,
-                (as_of, _MISSED_CLAIM_LIMIT),
+                (as_of,),
             )
         ]
     return (
@@ -564,6 +561,16 @@ async def deliver_missed_policy_summary(
 ) -> int:
     moment = as_of or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     selected, generic_rows = _claim_missed_outboxes(moment)
+    if generic_rows:
+        # Weekly/legacy notifications retain their existing combined overview,
+        # node format, single send and acknowledgement boundary. Only a pure
+        # deduction backlog participates in the new bounded delivery path.
+        return await _deliver_missed_summary_chunk(
+            bot,
+            [*((True, row) for row in selected),
+             *((False, row) for row in generic_rows)],
+            moment,
+        )
     handled = 0
     chunk: list[tuple[bool, dict]] = []
     chars = 0
@@ -698,7 +705,7 @@ async def _deliver_missed_summary_chunk(bot, chunk: list[tuple[bool, dict]], mom
         items = [f"{message_type} 未发送通知（{len(grouped_rows)} 条）"]
         items.extend(
             (
-                f"[业务任务#{row['id']}] {row['created_at']}｜{_missed_reason(row.get('reason'))}\n"
+                f"{row['created_at']}｜{_missed_reason(row.get('reason'))}\n"
                 f"{row['message_text']}"
             )
             for row in grouped_rows
@@ -709,11 +716,12 @@ async def _deliver_missed_summary_chunk(bot, chunk: list[tuple[bool, dict]], mom
         _restore_missed_business_claims(generic_rows, as_of=moment)
         return 0
     try:
-        for batch in _bounded_forward_batches(bot, nodes):
-            if not _business_allowed() or any(
+        batches = [nodes] if generic_rows else _bounded_forward_batches(bot, nodes)
+        for batch in batches:
+            if not generic_rows and (not _business_allowed() or any(
                 not _policy_outbox_valid(row, expected_status="sending", expected_updated_at=row["updated_at"])[0]
                 for row in valid_rows
-            ):
+            )):
                 _restore_missed_policy_claims(valid_rows, as_of=moment)
                 _restore_missed_business_claims(generic_rows, as_of=moment)
                 return 0
