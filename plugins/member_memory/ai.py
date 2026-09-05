@@ -8,7 +8,13 @@ import httpx
 from plugins.chat_archive.db import ContextMessage
 from plugins.feature_control.runtime import FEATURES
 from plugins.llm_gateway import get_gateway
-from plugins.llm_gateway.errors import GatewayError
+from plugins.llm_gateway.errors import (
+    GatewayError, GatewayAuthenticationError, GatewayClientError,
+    GatewayConfigurationError, GatewayEmptyContentError, GatewayContractError,
+    GatewayPaymentRequiredError, GatewayRateLimitError, GatewayServerError,
+    GatewayTimeout, GatewayTransportError,
+)
+from .errors import MemberMemoryError, MemberSummaryError
 from plugins.member_memory.store import MemoryTrait
 from plugins.violation_record.config import CONFIG
 
@@ -103,11 +109,6 @@ def _request_policy() -> tuple[bool, bool]:
     return use_gateway, False
 
 
-class MemberMemoryError(RuntimeError):
-    code = "member_memory_processing_error"
-    retryable = True
-
-
 async def extract_memory_candidates(context: Sequence[ContextMessage], *, strict: bool = False) -> list[dict[str, object]]:
     use_gateway, economy_mode = _request_policy()
     api_available = bool(
@@ -143,12 +144,47 @@ async def extract_memory_candidates(context: Sequence[ContextMessage], *, strict
         return []
 
 
-async def generate_memory_summary(existing: str, facts: Sequence[MemoryTrait]) -> str | None:
+def _summary_request_error(error: Exception) -> MemberSummaryError:
+    if isinstance(error, (GatewayTimeout, httpx.TimeoutException)):
+        code = "request_timeout"
+    elif isinstance(error, GatewayConfigurationError):
+        code = "configuration_error"
+    elif isinstance(error, GatewayPaymentRequiredError):
+        code = "payment_required"
+    elif isinstance(error, GatewayAuthenticationError):
+        code = "auth_error"
+    elif isinstance(error, GatewayRateLimitError):
+        code = "rate_limited"
+    elif isinstance(error, GatewayServerError):
+        code = "server_error"
+    elif isinstance(error, GatewayEmptyContentError):
+        code = "empty_response"
+    elif isinstance(error, (GatewayContractError, ValueError, KeyError, TypeError, IndexError)):
+        code = "invalid_response"
+    elif isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        code = ({401: "auth_error", 403: "auth_error", 402: "payment_required",
+                 408: "request_timeout", 429: "rate_limited"}.get(status)
+                or ("server_error" if status >= 500 else "client_error"))
+    elif isinstance(error, (GatewayTransportError, httpx.TransportError, OSError)):
+        code = "transport_error"
+    elif isinstance(error, (GatewayClientError, GatewayError, httpx.HTTPError)):
+        code = "client_error"
+    else:
+        code = "generation_failed"
+    return MemberSummaryError("member_summary_" + code)
+
+
+async def generate_memory_summary(existing: str, facts: Sequence[MemoryTrait], *, strict: bool = False) -> str | None:
     use_gateway, economy_mode = _request_policy()
     api_available = bool(
         getattr(CONFIG, "glm_api_key", "") if economy_mode else CONFIG.ai_api_key
     )
-    if not api_available or not facts:
+    if not facts:
+        return None
+    if not api_available:
+        if strict:
+            raise MemberSummaryError("member_summary_configuration_error")
         return None
     try:
         content = await _complete(
@@ -157,9 +193,21 @@ async def generate_memory_summary(existing: str, facts: Sequence[MemoryTrait]) -
             use_gateway=use_gateway,
             economy_mode=economy_mode,
         )
-        if not isinstance(content, str):
-            return None
-        text = content.strip()
-    except (OSError, ValueError, KeyError, TypeError, httpx.HTTPError, GatewayError):
+    except (OSError, ValueError, KeyError, TypeError, IndexError, httpx.HTTPError, GatewayError) as exc:
+        if strict:
+            raise _summary_request_error(exc) from None
         return None
-    return text if text and len(text) <= 300 else None
+    rejection = None
+    if not isinstance(content, str):
+        rejection = "member_summary_invalid_response"
+    else:
+        text = content.strip()
+        if not text:
+            rejection = "member_summary_empty_response"
+        elif len(text) > 300:
+            rejection = "member_summary_too_long"
+        else:
+            return text
+    if strict:
+        raise MemberSummaryError(rejection)
+    return None

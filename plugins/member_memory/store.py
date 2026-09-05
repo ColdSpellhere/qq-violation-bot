@@ -73,6 +73,7 @@ logger = logging.getLogger(__name__)
 _MIRROR_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 from .safety import contains_secret
+from .errors import MemberSummaryError
 
 SENSITIVE_RE = re.compile(
     r"手机号|电话号码?|身份证|住址|家庭地址|密码|token|银行卡|微信号|邮箱|真实姓名|\d{6,}",
@@ -585,8 +586,15 @@ def commit_summary(
     through_fact_id: int,
     summary: str,
     expected_fact_versions: tuple[tuple[int, int], ...] | None = None,
+    strict: bool = False,
 ) -> bool:
-    if not summary.strip() or contains_secret(summary):
+    if not summary.strip():
+        if strict:
+            raise MemberSummaryError("member_summary_empty_response")
+        return False
+    if contains_secret(summary):
+        if strict:
+            raise MemberSummaryError("member_summary_secret_blocked")
         return False
     with closing(sqlite3.connect(path)) as conn, conn:
         _ensure_schema(conn)
@@ -598,6 +606,8 @@ def commit_summary(
         current = int(row[0]) if row else 0
         if current != previous_through_id:
             conn.rollback()
+            if strict:
+                raise MemberSummaryError("member_summary_cursor_conflict")
             return False
         newly_inactive = conn.execute(
             """
@@ -620,6 +630,8 @@ def commit_summary(
             conflict = newly_inactive is not None
         if conflict:
             conn.rollback()
+            if strict:
+                raise MemberSummaryError("member_summary_fact_conflict")
             return False
         conn.execute(
             "INSERT INTO member_memory_summaries(group_id,user_id,summary_text,through_fact_id,updated_at) "
