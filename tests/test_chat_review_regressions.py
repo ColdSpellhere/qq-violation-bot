@@ -171,6 +171,10 @@ class AdditionalCancellationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_io_threads_are_bounded_even_after_repeated_cancel(self):
         from plugins.random_chat import admission
+        from concurrent.futures import ThreadPoolExecutor
+        # A small host may default to fewer than eight threads. Give the test
+        # excess capacity so it measures our gate rather than the host pool.
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=12))
         entered = 0
         count_lock = threading.Lock()
         release = threading.Event()
