@@ -72,26 +72,9 @@ class DeployInstanceTests(unittest.TestCase):
         return repo, sha
 
     def _prepare_without_dependencies(self, repo: Path, sha: str) -> Path:
-        real_run = subprocess.run
-
-        def run(args, **kwargs):
-            command = tuple(str(item) for item in args)
-            if len(command) >= 4 and command[:3] == (
-                sys.executable,
-                "-m",
-                "venv",
-            ):
-                (Path(command[3]) / "bin").mkdir(parents=True)
-                return subprocess.CompletedProcess(args, 0)
-            if command and (
-                command[0].endswith("/.venv/bin/pip")
-                or command[0].endswith("/.venv/bin/python")
-            ):
-                return subprocess.CompletedProcess(args, 0)
-            return real_run(args, **kwargs)
-
-        with patch("scripts.deploy_instance.subprocess.run", side_effect=run):
-            return self.prepare(repo, self.root, sha)
+        # Empty requirements exercise a real local venv/entrypoint build.
+        # No dependencies are fetched and pip's version network check is off.
+        return self.prepare(repo, self.root, sha)
 
     def test_rejects_unsafe_instance_and_non_full_sha(self) -> None:
         restart = Mock()
@@ -239,13 +222,15 @@ class DeployInstanceTests(unittest.TestCase):
         self.assertTrue(manifest_path.is_file())
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(
-            {"format_version", "commit", "tree", "source_sha256"},
+            {"format_version", "commit", "tree", "source_sha256", 'build'},
             set(manifest),
         )
-        self.assertEqual(1, manifest["format_version"])
+        self.assertEqual(2, manifest["format_version"])
         self.assertEqual(sha, manifest["commit"])
         self.assertRegex(manifest["tree"], r"^[0-9a-f]{40}$")
         self.assertRegex(manifest["source_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(manifest['build']['pip_freeze_sha256'], r'^[0-9a-f]{64}$')
+        self.assertEqual('requirements.txt', manifest['build']['requirements_file'])
         self.assertNotIn("key", manifest_path.read_text(encoding="utf-8").lower())
 
     def test_prepare_release_rejects_unmanifested_existing_release(self) -> None:
@@ -260,6 +245,18 @@ class DeployInstanceTests(unittest.TestCase):
             "cannot be safely reused.*manifest",
         ):
             self.prepare(repo, self.root, sha)
+
+    def test_environment_drift_is_detected_on_release_reuse(self) -> None:
+        from scripts.deploy_instance import verify_release
+
+        repo, sha = self._repository()
+        release = self._prepare_without_dependencies(repo, sha)
+        manifest_path = release/'.release-manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        manifest['build']['pip_freeze_sha256'] = 'f'*64
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(self.DeploymentError, 'environment drift'):
+            verify_release(repo, release, sha, verify_environment=True)
 
     def test_prepare_release_rejects_tampered_or_injected_existing_release(self) -> None:
         repo, sha = self._repository()

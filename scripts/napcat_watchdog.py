@@ -6,9 +6,16 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+
+sys.dont_write_bytecode = True
+if __package__:
+    from .ops_runtime import OPS_VERSION, cgroup_pids, exact_onebot_sockets, onebot_status, read_environment
+else:
+    from ops_runtime import OPS_VERSION, cgroup_pids, exact_onebot_sockets, onebot_status, read_environment
 
 
 QQ_FD_LIMIT = 1500
@@ -25,9 +32,10 @@ class RuntimeTarget:
     port: int
     state_path: Path
     lock_path: Path
+    instance_root: Path | None = None
 
 
-def target_for_instance(instance: str) -> RuntimeTarget:
+def target_for_instance(instance: str, root: Path = Path('/opt/qq-bots')) -> RuntimeTarget:
     ports = {"carrot": 6199, "kona": 6299}
     if instance not in ports:
         raise ValueError("instance must be carrot or kona")
@@ -38,6 +46,7 @@ def target_for_instance(instance: str) -> RuntimeTarget:
         port=ports[instance],
         state_path=Path(f"/var/lib/qq-bots/{instance}/watchdog-state.json"),
         lock_path=Path(f"/run/lock/qqbot-napcat-watchdog-{instance}.lock"),
+        instance_root=root/'instances'/instance,
     )
 
 
@@ -85,17 +94,11 @@ def decide(metrics: Metrics, state: State, now_epoch: int, scheduled: bool = Fal
 
 
 def _run(*command: str, check: bool = True) -> str:
-    return subprocess.run(command, check=check, capture_output=True, text=True).stdout
+    return subprocess.run(command, check=check, capture_output=True, text=True, timeout=8).stdout
 
 
 def _cgroup_pids(target: RuntimeTarget) -> list[int]:
-    group = _run(
-        "systemctl", "show", target.napcat_unit, "-p", "ControlGroup", "--value"
-    ).strip()
-    if not group or group == "/":
-        raise RuntimeError(f"{target.napcat_unit} has no dedicated cgroup")
-    path = Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.procs"
-    return [int(line) for line in path.read_text().splitlines() if line.strip().isdigit()]
+    return sorted(cgroup_pids(target.napcat_unit, _run))
 
 
 def _comm(pid: int) -> str:
@@ -119,9 +122,15 @@ def collect_metrics(target: RuntimeTarget) -> Metrics:
     qq_counts = [_fd_counts(pid) for pid in pids if _comm(pid) in {"qq", "node"}]
     xvfb_counts = [_fd_counts(pid)[0] for pid in pids if _comm(pid) == "Xvfb"]
     sockets = _run("ss", "-Htanp", check=False)
-    websocket = any(
-        "ESTAB" in line and f":{target.port}" in line for line in sockets.splitlines()
-    )
+    websocket = exact_onebot_sockets(sockets, target.port, cgroup_pids(target.bot_unit, _run), set(pids))
+    if websocket:
+        try:
+            values = read_environment((target.instance_root or Path('/opt/qq-bots/instances')/target.instance)/'.env')
+            if int(values.get('PORT', '0')) != target.port:
+                raise ValueError('configured port mismatch')
+            onebot_status(target.instance, values)
+        except (OSError, RuntimeError, ValueError):
+            websocket = False
     recent = _run(
         "journalctl",
         "-u",
@@ -179,11 +188,21 @@ def wait_for_recovery(target: RuntimeTarget, timeout_seconds: int = 90) -> Metri
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument('--version', action='version', version=OPS_VERSION)
     parser.add_argument("--instance", choices=("carrot", "kona"), default="carrot")
     parser.add_argument("--scheduled", action="store_true")
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument('--root', type=Path, default=Path('/opt/qq-bots'))
     args = parser.parse_args()
-    target = target_for_instance(args.instance)
+    target = target_for_instance(args.instance, args.root)
+    if args.check_only:
+        # A point-in-time inspection must not create a directory/lock, truncate
+        # an existing lock, reset failures, or influence the next timer run.
+        metrics = collect_metrics(target)
+        decision = decide(metrics, load_state(target), int(time.time()), scheduled=args.scheduled)
+        print(json.dumps({'check_only': True, 'ops_version': OPS_VERSION,
+                          'metrics': asdict(metrics), 'decision': asdict(decision)}, ensure_ascii=True))
+        return 0
     target.lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with target.lock_path.open("w") as lock:
@@ -193,10 +212,10 @@ def main() -> int:
             metrics = collect_metrics(target)
             decision = decide(metrics, state, now_epoch, scheduled=args.scheduled)
             print(json.dumps({"metrics": asdict(metrics), "decision": asdict(decision)}, ensure_ascii=True))
-            if args.check_only or not decision.restart:
+            if not decision.restart:
                 save_state(target, decision.next_state)
                 return 0
-            subprocess.run(["systemctl", "restart", target.napcat_unit], check=True)
+            subprocess.run(["systemctl", "restart", target.napcat_unit], check=True, timeout=60)
             next_state = replace(decision.next_state, last_restart_epoch=now_epoch, websocket_failures=0)
             save_state(target, next_state)
             recovered = wait_for_recovery(target)
