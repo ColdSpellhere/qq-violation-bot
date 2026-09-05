@@ -508,7 +508,9 @@ class KeywordCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = KeywordRuleStore(Path(directory) / "keywords.json")
             self.assertEqual(
-                "用法：/违禁词 添加 <关键词>、/违禁词 删除 <编号>、/违禁词 列表。",
+                "用法：/违禁词 添加 <关键词>、/违禁词 删除 <编号>、/违禁词 列表。\n"
+                "投递核对：/违禁词 告警状态 [KA-编号]；"
+                "/违禁词 告警重试 KA-编号 确认；/违禁词 告警已收 KA-编号 确认。",
                 execute_keyword_command("/违禁词", store, actor="42"),
             )
             self.assertIn(
@@ -948,12 +950,13 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             **kwargs: object,
         ) -> object:
             nonlocal active, maximum_active
+            from plugins.content_alert.service import _scan_managed_catalog, _message_excerpt
+            if function not in {_scan_managed_catalog, _message_excerpt}:
+                return function(*args, **kwargs)
             active += 1
             maximum_active = max(maximum_active, active)
             await asyncio.sleep(0.01)
             active -= 1
-            from plugins.content_alert.service import _scan_managed_catalog
-
             if function is _scan_managed_catalog:
                 return True, (match,), False
             return function(*args, **kwargs)
@@ -985,8 +988,12 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
                         for message_id in (501, 502, 503)
                     )
                 )
+                # Concurrent arrivals persist first. A busy sender leaves the
+                # remaining rows for the runtime worker rather than blocking
+                # an unbounded number of message handlers on the send lock.
+                await service.deliver_pending(bot, self_id=str(BOT_USER_ID))
 
-        self.assertEqual([True, True, True], delivered)
+        self.assertGreaterEqual(sum(delivered), 1)
         self.assertLessEqual(maximum_active, 2)
         self.assertEqual(3, len(bot.calls))
 
@@ -2210,7 +2217,7 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], bot.calls)
 
-    async def test_duplicate_delivery_is_suppressed_but_failure_can_retry(self) -> None:
+    async def test_duplicate_delivery_is_suppressed_and_unknown_failure_requires_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = self._service(directory)
             event = _group_event("测试违禁词")
@@ -2224,10 +2231,10 @@ class ContentAlertServiceTests(unittest.IsolatedAsyncioTestCase):
             service = self._service(directory)
             retrying_bot = self.Bot(failures=1)
             event = _group_event("测试违禁词", message_id=777)
-            with self.assertRaises(OSError):
-                await service.handle_event(retrying_bot, event)
-            self.assertTrue(await service.handle_event(retrying_bot, event))
-            self.assertEqual(2, len(retrying_bot.calls))
+            self.assertFalse(await service.handle_event(retrying_bot, event))
+            self.assertFalse(await service.handle_event(retrying_bot, event))
+            self.assertEqual(1, len(retrying_bot.calls))
+            self.assertEqual([{'status': 'delivery_unknown', 'count': 1}], service.outbox.states())
 
 
 class ContentAlertMatcherTests(unittest.IsolatedAsyncioTestCase):

@@ -8,6 +8,15 @@ from types import MappingProxyType
 
 from .rules import MAX_RULES, KeywordRule, normalize_literal_text
 
+MAX_LITERAL_TEXT_CHARS = 16_384
+MAX_LITERAL_CANDIDATES = 20_000
+MAX_LITERAL_SEGMENTS = 256
+
+
+@dataclass
+class LiteralScanBudget:
+    candidates_left: int = MAX_LITERAL_CANDIDATES
+
 
 @dataclass(frozen=True)
 class KeywordMatch:
@@ -270,15 +279,23 @@ class LiteralKeywordMatcher:
             prepared.append((rule, normalized))
         self._rules = tuple(prepared)
 
-    def match_text(self, text: str) -> tuple[KeywordMatch, ...]:
+    def match_text(self, text: str, *, budget: LiteralScanBudget | None = None) -> tuple[KeywordMatch, ...]:
+        if len(text) > MAX_LITERAL_TEXT_CHARS:
+            raise ScalableLiteralScanLimitError("raw_text_limit")
         normalized_text = normalize_literal_text(text)
+        if len(normalized_text) > MAX_LITERAL_TEXT_CHARS:
+            raise ScalableLiteralScanLimitError("normalized_text_limit")
         if not normalized_text or not self._rules:
             return ()
+        budget = budget if budget is not None else LiteralScanBudget()
 
         candidates: list[KeywordMatch] = []
         for rule, normalized_pattern in self._rules:
             offset = normalized_text.find(normalized_pattern)
             while offset >= 0:
+                budget.candidates_left -= 1
+                if budget.candidates_left < 0:
+                    raise ScalableLiteralScanLimitError("candidate_limit")
                 candidates.append(
                     KeywordMatch(
                         rule_id=rule.rule_id,
@@ -293,13 +310,15 @@ class LiteralKeywordMatcher:
         # This avoids an earlier short rule shadowing a longer rule that starts
         # one character later.  Stable rule-id ordering makes ties deterministic.
         accepted: list[KeywordMatch] = []
+        occupied = bytearray(len(normalized_text))
         for candidate in sorted(
             candidates,
             key=lambda item: (-(item.end - item.start), item.start, item.rule_id),
         ):
-            if any(_overlaps(candidate, existing) for existing in accepted):
+            if any(occupied[candidate.start:candidate.end]):
                 continue
             accepted.append(candidate)
+            occupied[candidate.start:candidate.end] = b'\1' * (candidate.end - candidate.start)
 
         accepted.sort(
             key=lambda item: (item.start, -(item.end - item.start), item.rule_id)
@@ -322,7 +341,11 @@ def match_message_text_segments(
 
     matches: list[KeywordMatch] = []
     seen_rule_ids: set[str] = set()
-    for segment in message:  # type: ignore[union-attr]
+    budget = LiteralScanBudget()
+    raw_chars = 0
+    for index, segment in enumerate(message):  # type: ignore[union-attr]
+        if index >= MAX_LITERAL_SEGMENTS:
+            raise ScalableLiteralScanLimitError("message_segment_limit")
         if getattr(segment, "type", None) != "text":
             continue
         data = getattr(segment, "data", None)
@@ -331,7 +354,10 @@ def match_message_text_segments(
         value = data.get("text")
         if not isinstance(value, str):
             continue
-        for match in matcher.match_text(value):
+        raw_chars += len(value)
+        if raw_chars > MAX_LITERAL_TEXT_CHARS:
+            raise ScalableLiteralScanLimitError("message_text_limit")
+        for match in matcher.match_text(value, budget=budget):
             if match.rule_id in seen_rule_ids:
                 continue
             seen_rule_ids.add(match.rule_id)

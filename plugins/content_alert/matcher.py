@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from nonebot import get_driver, logger, on_message
+from nonebot import get_bots, get_driver, logger, on_message
 from nonebot.adapters.onebot.v11 import (
     Bot,
     Event,
@@ -20,6 +20,8 @@ from .catalog import ManagedKeywordCatalog
 from .commands import execute_keyword_command, is_keyword_command
 from .rules import KeywordRuleStore
 from .service import ContentAlertService
+from .lifecycle import AlertDeliveryWorker
+from .delivery_commands import execute_delivery_command
 
 RULE_STORE = KeywordRuleStore(CONFIG.content_alert_rules_path)
 BACKGROUND_RULE_STORE = KeywordRuleStore(CONFIG.content_alert_background_rules_path)
@@ -47,6 +49,9 @@ ALERT_SERVICE = ContentAlertService(
     runtime_enabled=_runtime_enabled,
     clock=time.time,
 )
+DELIVERY_WORKER = AlertDeliveryWorker(ALERT_SERVICE, get_bots)
+get_driver().on_startup(DELIVERY_WORKER.start)
+get_driver().on_shutdown(DELIVERY_WORKER.stop)
 
 
 async def is_source_alert_event(event: Event) -> bool:
@@ -116,7 +121,9 @@ async def handle_keyword_command(event: Event) -> None:
         await keyword_command_matcher.finish("你没有违禁词管理权限。")
         return
     try:
-        reply = execute_keyword_command(text, RULE_STORE, actor=actor)
+        reply = await execute_delivery_command(text, ALERT_SERVICE, actor=actor)
+        if reply is None:
+            reply = execute_keyword_command(text, RULE_STORE, actor=actor)
     except Exception as exc:  # noqa: BLE001 - event handlers must fail closed
         logger.error(f"违禁词规则命令失败 error={type(exc).__name__}")
         await keyword_command_matcher.finish("操作失败，规则未改变。")

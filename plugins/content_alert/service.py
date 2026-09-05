@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import unicodedata
-from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
+from nonebot.adapters.onebot.v11.exception import ActionFailed
+from nonebot import logger
 
 from .engine import (
     KeywordMatch,
@@ -23,14 +26,16 @@ from .rules import (
     is_ignored_literal_character,
     normalize_literal_text,
 )
+from .outbox import AlertOutbox, event_identity
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-_DELIVERED_CACHE_LIMIT = 4096
 _FUTURE_EVENT_TOLERANCE_SECONDS = 60
 _MAX_REPORTED_MATCHES = 20
 _MAX_REPORTED_MANAGED_MATCHES = 12
 _MAX_REPORT_CHARS = 1_800
 _MAX_CONCURRENT_MANAGED_SCANS = 2
+_MAX_ADMITTED_SCANS = 8
+_SEND_TIMEOUT_SECONDS = 30
 _CONTEXT_CLASS_LABELS = {
     "case_proceeding": "案件语境",
     "office_title": "职务语境",
@@ -76,6 +81,7 @@ class ContentAlertService:
         clock: Callable[[], float],
         max_event_age_seconds: int = 300,
         max_excerpt_chars: int = 160,
+        outbox_path: Path | None = None,
     ) -> None:
         self._rule_store = rule_store
         self._background_rule_store = background_rule_store
@@ -95,17 +101,42 @@ class ContentAlertService:
         self._max_excerpt_chars = max(16, int(max_excerpt_chars))
         self._delivery_lock = asyncio.Lock()
         self._scan_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MANAGED_SCANS)
-        self._delivered: OrderedDict[tuple[int, int, str], None] = OrderedDict()
+        self._admitted_scans = 0
+        self._overflow_guard_inflight = False
+        self.outbox = AlertOutbox(outbox_path or rule_store.path.with_name("outbox.sqlite3"))
+        self._accepting = True
 
     async def handle_event(self, bot: Bot, event: GroupMessageEvent) -> bool:
         if not self._eligible(event):
             return False
+        if self._admitted_scans >= _MAX_ADMITTED_SCANS:
+            # Fail visibly with bounded, hidden metadata; do not allocate an
+            # unbounded semaphore waiter or run an over-budget scan inline.
+            if self._overflow_guard_inflight:
+                return False
+            self._overflow_guard_inflight = True
+            try:
+                return await self._persist_and_deliver(
+                    bot, event, (), (), strict_hidden=True, political_alert=False,
+                    scan_overflow=True, sender_name_strict=True,
+                    excerpt="（内容已隐藏）", rule_generation="scan-admission-overflow",
+                )
+            finally:
+                self._overflow_guard_inflight = False
+        self._admitted_scans += 1
+        try:
+            return await self._handle_admitted_event(bot, event)
+        finally:
+            self._admitted_scans -= 1
+
+    async def _handle_admitted_event(self, bot: Bot, event: GroupMessageEvent) -> bool:
 
         manual_rules = self._rule_store.snapshot()
         managed_active = False
         managed_scan_overflow = False
         managed_sender_name_strict = False
         managed_matches: Sequence[_ManagedMatch] = ()
+        managed_generation = "none"
         if self._managed_catalog is not None:
             try:
                 sender = event.sender
@@ -120,21 +151,20 @@ class ContentAlertService:
                 async with self._scan_semaphore:
                     if not self._eligible(event):
                         return False
-                    (
-                        managed_active,
-                        managed_matches,
-                        managed_sender_name_strict,
-                    ) = await asyncio.to_thread(
+                    result = await asyncio.to_thread(
                         _scan_managed_catalog,
                         self._managed_catalog,
                         event.message,
                         sender_name_candidates,
                     )
-            except ScalableLiteralScanLimitError:
+                    managed_active, managed_matches, managed_sender_name_strict = result[:3]
+                    managed_generation = str(result[3]) if len(result) > 3 else "unknown"
+            except ScalableLiteralScanLimitError as exc:
                 # A scan limit can only be raised after an active immutable
                 # snapshot has been selected by ``scan_message``.
                 managed_active = True
                 managed_scan_overflow = True
+                managed_generation = str(getattr(exc, "generation_id", "unknown"))
 
         # The legacy file remains an intentionally strict fallback.  Once a
         # complete managed generation is active it must not be evaluated as a
@@ -149,14 +179,18 @@ class ContentAlertService:
             and not managed_scan_overflow
         ):
             return False
-        manual_matches = _match_rules(
-            event.message,
-            manual_rules,
-        )
-        background_matches = _match_rules(
-            event.message,
-            background_rules,
-        )
+        manual_matches: tuple[KeywordMatch, ...] = ()
+        background_matches: tuple[KeywordMatch, ...] = ()
+        try:
+            if manual_rules or background_rules:
+                async with self._scan_semaphore:
+                    if not self._eligible(event):
+                        return False
+                    manual_matches, background_matches = await asyncio.to_thread(
+                        _scan_literal_sources, event.message, manual_rules, background_rules
+                    )
+        except ScalableLiteralScanLimitError:
+            managed_scan_overflow = True
         if (
             not manual_matches
             and not background_matches
@@ -191,44 +225,109 @@ class ContentAlertService:
                     focus=excerpt_focus,
                 )
 
-        delivery_key = (
-            int(event.self_id),
-            int(event.group_id),
-            str(event.message_id),
+        return await self._persist_and_deliver(
+            bot, event, manual_matches, managed_matches,
+            strict_hidden=strict_hidden, political_alert=political_alert,
+            scan_overflow=managed_scan_overflow,
+            sender_name_strict=managed_sender_name_strict or bool(background_matches),
+            excerpt=prepared_excerpt,
+            rule_generation=(f"managed:{managed_generation};manual:{_rules_digest(manual_rules)};"
+                             f"legacy:{_rules_digest(background_rules)}"),
         )
+
+    async def _persist_and_deliver(
+        self, bot: Bot, event: GroupMessageEvent,
+        manual_matches: Sequence[KeywordMatch], managed_matches: Sequence[_ManagedMatch], *,
+        strict_hidden: bool, political_alert: bool, scan_overflow: bool,
+        sender_name_strict: bool, excerpt: str, rule_generation: str,
+    ) -> bool:
+        if not self._eligible(event):
+            return False
+        report = self._build_report(
+            event, manual_matches, managed_matches=managed_matches,
+            strict_hidden=strict_hidden, political_alert=political_alert,
+            managed_scan_overflow=scan_overflow,
+            strict_sender_name_match=sender_name_strict, prepared_excerpt=excerpt,
+        )
+        key, inserted = await asyncio.to_thread(
+            self.outbox.enqueue, self_id=str(event.self_id), source_group_id=int(event.group_id),
+            source_message_id=str(event.message_id), report_group_id=self._report_group_id,
+            rule_generation=rule_generation, report_text=report, now=float(self._clock()),
+        )
+        if not inserted:
+            return False
+        return bool(await self.deliver_pending(bot, event_key=key, self_id=str(event.self_id), limit=1))
+
+    def _delivery_allowed(self, row: Mapping[str, object]) -> bool:
+        return (
+            self._accepting and self._runtime_enabled()
+            and int(row['source_group_id']) in self._source_group_labels
+            and int(row['report_group_id']) == self._report_group_id > 0
+            and int(row['source_group_id']) != self._report_group_id
+        )
+
+    async def deliver_pending(self, bot: Bot, *, self_id: str | None = None,
+                              event_key: str | None = None, limit: int = 10) -> int:
+        """Attempt persisted alerts without reapplying the input freshness gate."""
+        if not self._accepting or not self._runtime_enabled() or self._delivery_lock.locked():
+            return 0
+        bot_id = str(getattr(bot, 'self_id', self_id or ''))
+        if not bot_id or (self_id is not None and bot_id != self_id):
+            return 0
+        sent = 0
         async with self._delivery_lock:
-            # An administrator may disable the feature while a large managed
-            # snapshot is loading/scanning or while this event waits behind a
-            # previous delivery.  Re-check at the final serialized boundary
-            # so no stale in-flight event is sent after shutdown.
-            if not self._eligible(event):
-                return False
-            if delivery_key in self._delivered:
-                return False
-            report = self._build_report(
-                event,
-                manual_matches,
-                managed_matches=managed_matches,
-                strict_hidden=strict_hidden,
-                political_alert=political_alert,
-                managed_scan_overflow=managed_scan_overflow,
-                strict_sender_name_match=(
-                    managed_sender_name_strict or bool(background_matches)
-                ),
-                prepared_excerpt=prepared_excerpt,
-            )
-            await bot.send_group_msg(
-                group_id=self._report_group_id,
-                message=MessageSegment.text(report),
-            )
-            self._delivered[delivery_key] = None
-            self._delivered.move_to_end(delivery_key)
-            while len(self._delivered) > _DELIVERED_CACHE_LIMIT:
-                self._delivered.popitem(last=False)
-        return True
+            for _ in range(min(max(0, limit), 10)):
+                if not self._accepting or not self._runtime_enabled():
+                    break
+                row = await asyncio.to_thread(self.outbox.claim, now=float(self._clock()),
+                                              self_id=bot_id, event_key=event_key)
+                if row is None:
+                    break
+                if not self._delivery_allowed(row):
+                    await asyncio.to_thread(self.outbox.release, row, now=float(self._clock()))
+                    break
+                if not await asyncio.to_thread(self.outbox.begin_send, row, now=float(self._clock())):
+                    continue
+                # No await between this final gate and invoking the QQ API.
+                if not self._delivery_allowed(row):
+                    await asyncio.to_thread(self.outbox.abort_unsent, row, now=float(self._clock()))
+                    break
+                try:
+                    response = await asyncio.wait_for(self._send_guarded(bot, row), timeout=_SEND_TIMEOUT_SECONDS)
+                except _FeatureDisabledBeforeSend:
+                    await asyncio.to_thread(self.outbox.abort_unsent, row, now=float(self._clock()))
+                    break
+                except ActionFailed:
+                    await asyncio.to_thread(self.outbox.finish, row, outcome='rejected', now=float(self._clock()))
+                except asyncio.CancelledError:
+                    await asyncio.shield(asyncio.to_thread(
+                        self.outbox.finish, row, outcome='delivery_unknown', now=float(self._clock())))
+                    raise
+                except Exception:
+                    await asyncio.to_thread(self.outbox.finish, row, outcome='delivery_unknown', now=float(self._clock()))
+                    logger.warning(f"关键词告警投递结果未知 alert_id={row['alert_id']}")
+                else:
+                    receipt = response.get('message_id') if isinstance(response, dict) else None
+                    valid_receipt = (
+                        isinstance(receipt, int) and not isinstance(receipt, bool)
+                    ) or (
+                        isinstance(receipt, str) and receipt.lstrip('-').isdigit()
+                    )
+                    outcome = 'delivered' if valid_receipt else 'delivery_unknown'
+                    saved = await asyncio.to_thread(self.outbox.finish, row, outcome=outcome,
+                                                   receipt=str(receipt) if valid_receipt else '',
+                                                   now=float(self._clock()))
+                    sent += int(saved and outcome == 'delivered')
+        return sent
+
+    async def _send_guarded(self, bot: Bot, row: dict) -> object:
+        if not self._delivery_allowed(row):
+            raise _FeatureDisabledBeforeSend
+        return await bot.send_group_msg(
+            group_id=int(row['report_group_id']), message=MessageSegment.text(row['report_text']))
 
     def _eligible(self, event: GroupMessageEvent) -> bool:
-        if not self._runtime_enabled():
+        if not self._accepting or not self._runtime_enabled():
             return False
         group_id = int(event.group_id)
         if group_id not in self._source_group_labels:
@@ -273,9 +372,7 @@ class ContentAlertService:
         compound_match = _first_compound_match(managed_matches)
         excerpt = prepared_excerpt
         event_time = datetime.fromtimestamp(int(event.time), tz=_SHANGHAI)
-        alert_id = hashlib.sha256(
-            f"{event.self_id}:{group_id}:{event.message_id}".encode()
-        ).hexdigest()[:12]
+        _event_key, alert_id = event_identity(event.self_id, group_id, event.message_id)
 
         label = _one_line(
             self._source_group_labels.get(group_id, f"群{group_id}"),
@@ -305,7 +402,7 @@ class ContentAlertService:
         )
         prefix_lines = (
             title,
-            f"告警编号：KA-{alert_id}",
+            f"告警编号：{alert_id}",
             f"来源群：{label}（{group_id}）",
             f"发送者：{sender_name}（QQ：{event.user_id}）",
         )
@@ -334,6 +431,10 @@ class ContentAlertService:
         )
 
 
+class _FeatureDisabledBeforeSend(Exception):
+    pass
+
+
 def _match_rules(
     message: object,
     rules: Sequence[KeywordRule],
@@ -342,8 +443,23 @@ def _match_rules(
         return ()
     return match_message_text_segments(
         message,
-        LiteralKeywordMatcher(rules),
+        _compiled_literal_rules(tuple(rules)),
     )
+
+
+@lru_cache(maxsize=16)
+def _compiled_literal_rules(rules: tuple[KeywordRule, ...]) -> LiteralKeywordMatcher:
+    return LiteralKeywordMatcher(rules)
+
+
+def _rules_digest(rules: Sequence[KeywordRule]) -> str:
+    # Only the digest enters the delivery ledger, never hidden rule metadata.
+    return hashlib.sha256(repr(tuple((rule.rule_id, rule.pattern) for rule in rules)).encode()).hexdigest()
+
+
+def _scan_literal_sources(message: object, manual: Sequence[KeywordRule],
+                          background: Sequence[KeywordRule]) -> tuple[tuple[KeywordMatch, ...], tuple[KeywordMatch, ...]]:
+    return _match_rules(message, manual), _match_rules(message, background)
 
 
 def _first_compound_match(
@@ -381,29 +497,38 @@ def _scan_managed_catalog(
     catalog: _ManagedCatalog,
     message: object,
     sender_name_candidates: Sequence[str],
-) -> tuple[bool, Sequence[_ManagedMatch], bool]:
+) -> tuple[bool, Sequence[_ManagedMatch], bool, str]:
     """Load and scan one immutable snapshot entirely outside the event loop."""
 
     snapshot = catalog.snapshot()
     if not snapshot.has_active_generation:
-        return False, (), False
-    matches = catalog.match_snapshot(snapshot, message)
+        return False, (), False, "none"
+    generation_id = str(getattr(snapshot, "generation_id", "unknown"))
+    try:
+        matches = catalog.match_snapshot(snapshot, message)
+    except ScalableLiteralScanLimitError as exc:
+        exc.generation_id = generation_id
+        raise
     has_political = any("political_cn" in match.category_ids for match in matches)
     has_strict = any(match.disclosure_policy == "strict_hidden" for match in matches)
     sender_name_strict = False
     if has_political and has_strict:
         for candidate in sender_name_candidates:
-            candidate_matches = catalog.match_snapshot(
-                snapshot,
-                (MessageSegment.text(candidate),),
-            )
+            try:
+                candidate_matches = catalog.match_snapshot(
+                    snapshot,
+                    (MessageSegment.text(candidate),),
+                )
+            except ScalableLiteralScanLimitError as exc:
+                exc.generation_id = generation_id
+                raise
             if any(
                 match.disclosure_policy == "strict_hidden"
                 for match in candidate_matches
             ):
                 sender_name_strict = True
                 break
-    return True, matches, sender_name_strict
+    return True, matches, sender_name_strict, generation_id
 
 
 def _render_matches(

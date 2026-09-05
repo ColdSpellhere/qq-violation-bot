@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from .rules import KeywordRuleStore
 
-_USAGE = "用法：/违禁词 添加 <关键词>、/违禁词 删除 <编号>、/违禁词 列表。"
+_USAGE = (
+    "用法：/违禁词 添加 <关键词>、/违禁词 删除 <编号>、/违禁词 列表。\n"
+    "投递核对：/违禁词 告警状态 [KA-编号]；"
+    "/违禁词 告警重试 KA-编号 确认；/违禁词 告警已收 KA-编号 确认。"
+)
 
 
 def is_keyword_command(text: str) -> bool:
