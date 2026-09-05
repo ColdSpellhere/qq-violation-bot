@@ -1,0 +1,11 @@
+[Unit]
+Description=QQbot database and configuration recovery points every six hours for %i
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:20:00
+RandomizedDelaySec=5min
+Persistent=true
+Unit=qqbot-backup-state@%i.service
+
+[Install]
+WantedBy=timers.target

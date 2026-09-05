@@ -1,0 +1,12 @@
+[Unit]
+Description=Verified QQbot full data backup for %i
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=20min
+ExecStart=/usr/bin/python3 /opt/qq-bots/bin/instance_backup.py --instance %i --mode full --prune
+NoNewPrivileges=true

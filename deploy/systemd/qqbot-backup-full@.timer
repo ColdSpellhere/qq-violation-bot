@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily QQbot media and state recovery point for %i
+
+[Timer]
+OnCalendar=*-*-* 04:45:00
+RandomizedDelaySec=10min
+Persistent=true
+Unit=qqbot-backup-full@%i.service
+
+[Install]
+WantedBy=timers.target
