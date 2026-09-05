@@ -31,6 +31,16 @@ class PolicyInputError(ValueError):
     """An invalid recorded input must be reviewed before scope settlement."""
 
 
+class PolicyReplayConflict(ValueError):
+    """Historical human decisions cannot be re-applied to changed evidence."""
+
+
+_MANUAL_INPUT_TYPES = frozenset({
+    "manual_stop_started", "manual_stop_cleared",
+    "manual_stop_renewed", "stop_suggestion_rejected",
+})
+
+
 _CHINESE_DIGITS = {
     "零": 0,
     "〇": 0,
@@ -1208,7 +1218,7 @@ def _resolve_pending_actions(
     action_types: tuple[str, ...] | None = None,
 ) -> None:
     parameters: list[object] = [decision_event_id, at, member_id, group_area]
-    condition = ""
+    condition = " AND action_type NOT IN ('input_review','replay_review')"
     if action_types:
         placeholders = ",".join("?" for _ in action_types)
         condition = f" AND action_type IN ({placeholders})"
@@ -1311,6 +1321,8 @@ def start_manual_stop(
     caused_by_event_id: int | None = None,
     replay_generation: int = 0,
 ) -> PolicyOutcome:
+    if replay_generation == 0 and policy_scope_under_review(conn, member_id, group_area):
+        raise ValueError("该成员存在减数复核待办，请先复核冲突或撤回对应错误记录")
     at = _time_text(effective_at)
     if not reason.strip():
         raise ValueError("减停事由不能为空")
@@ -1381,10 +1393,25 @@ def process_status_change(
     caused_by_event_id: int | None = None,
     replay_generation: int = 0,
 ) -> PolicyOutcome:
+    if replay_generation == 0 and conn.execute(
+        """SELECT 1 FROM v102_pending_actions WHERE member_id=? AND group_area=?
+        AND action_type='replay_review' AND status='pending' LIMIT 1""", (member_id, group_area)
+    ).fetchone():
+        return PolicyOutcome(None, False)
     at = _time_text(effective_at)
     ingested_at = _time_text(ingest_time or effective_at)
     _validate_effective_time(at, ingested_at)
     _ensure_policy_state(conn, member_id, group_area, ingested_at)
+    previous_business_status = str(_business_state(conn, member_id, group_area)["status"])
+    previous_event = conn.execute(
+        """SELECT payload_json FROM v102_policy_events
+        WHERE member_id=? AND group_area=? AND event_type='status_changed'
+          AND is_effective=1 AND effective_time<=?
+        ORDER BY effective_time DESC, id DESC LIMIT 1""",
+        (member_id, group_area, at),
+    ).fetchone()
+    previous_status = (str(json.loads(previous_event["payload_json"])["status"])
+        if previous_event is not None else previous_business_status)
     event_id, created = _insert_event(
         conn,
         member_id=member_id,
@@ -1473,6 +1500,21 @@ def process_status_change(
             caused_by_event_id=event_id,
             replay_generation=replay_generation,
         )
+    elif status == "正常":
+        policy = _ensure_policy_state(conn, member_id, group_area, at)
+        cycle = _active_cycle(conn, member_id, group_area)
+        recovering = (previous_status != "正常" or policy["no_cycle_reason"] == "terminal_status"
+            or (cycle is not None and cycle["cycle_type"] == "final_warning"))
+        if recovering and not policy_scope_under_review(conn, member_id, group_area):
+            _cancel_active_cycle(conn, member_id, group_area, at=at, reason="normal_status_recovered")
+            _resolve_pending_actions(conn, member_id, group_area,
+                decision_event_id=event_id, at=at,
+                action_types=("stop_suggestion", "stop_decision", "remove_member"))
+            business = _business_state(conn, member_id, group_area)
+            current = max(0, int(business["total_count"] or 0) - int(business["deduct_count"] or 0))
+            _start_cycle(conn, member_id=member_id, group_area=group_area,
+                cycle_type="slow" if current >= 3 else "normal", start_at=at,
+                caused_by_event_id=event_id, replay_generation=replay_generation)
     conn.execute(
         """
         UPDATE v102_policy_state
@@ -1495,6 +1537,8 @@ def clear_manual_stop(
     caused_by_event_id: int | None = None,
     replay_generation: int = 0,
 ) -> PolicyOutcome:
+    if replay_generation == 0 and policy_scope_under_review(conn, member_id, group_area):
+        raise ValueError("该成员存在减数复核待办，请先复核冲突或撤回对应错误记录")
     at = _time_text(effective_at)
     if not reason.strip():
         raise ValueError("清除减停事由不能为空")
@@ -1596,6 +1640,8 @@ def renew_manual_stop(
     caused_by_event_id: int | None = None,
     replay_generation: int = 0,
 ) -> PolicyOutcome:
+    if replay_generation == 0 and policy_scope_under_review(conn, member_id, group_area):
+        raise ValueError("该成员存在减数复核待办，请先复核冲突或撤回对应错误记录")
     at = _time_text(effective_at)
     if not reason.strip():
         raise ValueError("续期减停事由不能为空")
@@ -1689,6 +1735,8 @@ def reject_stop_suggestion(
     caused_by_event_id: int | None = None,
     replay_generation: int = 0,
 ) -> PolicyOutcome:
+    if replay_generation == 0 and policy_scope_under_review(conn, member_id, group_area):
+        raise ValueError("该成员存在减数复核待办，请先复核冲突或撤回对应错误记录")
     at = _time_text(effective_at)
     if not reason.strip():
         raise ValueError("拒绝减停建议事由不能为空")
@@ -2591,6 +2639,32 @@ def _apply_replay_input(
 
 
 def replay_member_group(
+    conn: sqlite3.Connection, member_id: int, group_area: str, *,
+    trigger_event_id: int, as_of: str | datetime,
+) -> PolicyOutcome:
+    """Commit a complete replay or preserve the last valid human decision."""
+    at = _time_text(as_of)
+    conn.execute("SAVEPOINT policy_replay_projection")
+    try:
+        try:
+            outcome = _replay_member_group(conn, member_id, group_area,
+                trigger_event_id=trigger_event_id, as_of=at)
+        except PolicyReplayConflict as exc:
+            conn.execute("ROLLBACK TO SAVEPOINT policy_replay_projection")
+            trigger = conn.execute("SELECT source_record_id FROM v102_policy_events WHERE id=?",
+                (trigger_event_id,)).fetchone()
+            outcome = record_policy_review(conn, member_id=member_id, group_area=group_area,
+                source_record_id=trigger["source_record_id"], key=f"event:{trigger_event_id}:replay-review",
+                at=at, reason=str(exc), action_type="replay_review")
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT policy_replay_projection")
+        raise
+    finally:
+        conn.execute("RELEASE SAVEPOINT policy_replay_projection")
+    return outcome
+
+
+def _replay_member_group(
     conn: sqlite3.Connection,
     member_id: int,
     group_area: str,
@@ -2643,7 +2717,14 @@ def replay_member_group(
         before = _time_text(_time_value(effective_time) - timedelta(seconds=1))
         settle_due_cycles(conn, before, member_id=member_id, group_area=group_area)
         while index < len(inputs) and inputs[index]["effective_time"] == effective_time:
-            _apply_replay_input(conn, inputs[index], generation=generation)
+            try:
+                _apply_replay_input(conn, inputs[index], generation=generation)
+            except ValueError as exc:
+                if inputs[index]["event_type"] not in _MANUAL_INPUT_TYPES:
+                    raise
+                raise PolicyReplayConflict(
+                    f"历史人工决定事件 {inputs[index]['id']} 与变更证据冲突：{exc}"
+                ) from exc
             index += 1
         settle_due_cycles(conn, effective_time, member_id=member_id, group_area=group_area)
     settle_due_cycles(conn, replay_at, member_id=member_id, group_area=group_area)
@@ -2730,6 +2811,23 @@ def withdraw_violation_record(
         WHERE source_record_id=? AND event_type='policy_review_required'""",
         (event_id, source_record_id),
     )
+    if original:
+        manual_conflicts = conn.execute(
+            """WITH RECURSIVE affected(id) AS (
+                SELECT ? UNION SELECT e.id FROM v102_policy_events e JOIN affected a ON e.caused_by_event_id=a.id
+            ) SELECT e.id FROM v102_policy_events e JOIN affected a ON e.id=a.id
+            WHERE e.replay_generation=0 AND e.is_effective=1 AND e.event_type IN (
+                'manual_stop_started','manual_stop_cleared','manual_stop_renewed','stop_suggestion_rejected')""",
+            (original["id"],),
+        ).fetchall()
+        if manual_conflicts:
+            conn.execute("UPDATE v102_policy_events SET is_effective=0,reversed_by_event_id=? WHERE id=?",
+                (event_id, original["id"]))
+            sync_count_state(conn, int(record["member_id"]), record["group_area"], updated_at=at)
+            return record_policy_review(conn, member_id=int(record["member_id"]), group_area=record["group_area"],
+                source_record_id=source_record_id, key=f"event:{event_id}:replay-review", at=at,
+                reason="撤回证据关联历史人工决定事件 " + ",".join(str(item["id"]) for item in manual_conflicts)
+                    + "，保留原决定，等待人工复核", action_type="replay_review")
     if original:
         conn.execute(
             """

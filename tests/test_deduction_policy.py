@@ -842,7 +842,7 @@ class ReplayTests(PolicyTimelineTests):
         self.assertEqual(self._cycle()["cycle_type"], "stop")
         self.assertEqual(self._cycle()["due_at"], "2026-02-01 00:00:00")
 
-    def test_explicitly_caused_manual_stop_is_reversed_with_source_record(self) -> None:
+    def test_explicitly_caused_manual_stop_is_preserved_for_review_after_withdrawal(self) -> None:
         record_id = self._add_record("2026-01-01 00:00:00")
         source_event_id = self.conn.execute(
             """
@@ -868,8 +868,10 @@ class ReplayTests(PolicyTimelineTests):
             reason="误记录",
         )
 
-        self.assertEqual(self._policy_state()["policy_tag"], "none")
-        self.assertIsNone(self._policy_state()["active_cycle_id"])
+        self.assertEqual(self._policy_state()["policy_tag"], "stop")
+        self.assertEqual(self._cycle()["cycle_type"], "stop")
+        self.assertEqual(self._policy_state()["pending_action_type"], "replay_review")
+        self.assertEqual(self._business_state()["total_count"], 0)
 
     def test_repeated_replay_has_same_canonical_projection(self) -> None:
         self._add_record("2026-01-01 00:00:00")

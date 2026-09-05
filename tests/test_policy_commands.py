@@ -361,8 +361,9 @@ class PolicyCommandServiceTests(unittest.TestCase):
                 "SELECT * FROM v102_policy_events WHERE id=?",
                 (manual_event["id"],),
             ).fetchone()
-        self.assertEqual(manual_event["is_effective"], 0)
-        self.assertEqual(policy["policy_tag"], "none")
+        self.assertEqual(manual_event["is_effective"], 1)
+        self.assertEqual(policy["policy_tag"], "stop")
+        self.assertEqual(policy["pending_action_type"], "replay_review")
 
     def test_lists_are_complete_and_deterministically_ordered(self) -> None:
         now = "2026-08-02 12:00:00"

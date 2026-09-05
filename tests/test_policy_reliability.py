@@ -7,6 +7,9 @@ from unittest.mock import patch
 
 from plugins.violation_record.deduction_policy import (
     Severity,
+    start_manual_stop,
+    clear_manual_stop,
+    settle_due_cycles,
     ensure_policy_scope_snapshot,
     classify_severity,
     parse_mute_seconds,
@@ -98,6 +101,79 @@ class PolicyInputReliabilityTests(PolicyTimelineTests):
         withdraw_violation_record(self.conn,valid,effective_at="2026-09-05 12:01:00",reason="合成撤回")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM v102_pending_actions WHERE action_type='input_review' AND status='pending'").fetchone()[0],1)
         self.assertEqual(self._policy_state()["pending_action_type"],"input_review")
+
+    def test_normal_recovery_restarts_from_recovery_day(self) -> None:
+        self._add_record("2026-09-01 12:00:00")
+        process_status_change(self.conn,member_id=1,group_area="蜂巢",status="已退群",
+            effective_at="2026-09-02 12:00:00",idempotency_key="synthetic-left")
+        process_status_change(self.conn,member_id=1,group_area="蜂巢",status="正常",
+            effective_at="2026-09-05 12:00:00",idempotency_key="synthetic-return")
+        self.assertEqual(self._cycle()["start_at"],"2026-09-05 12:00:00")
+        self.assertEqual(self._cycle()["due_at"],"2026-09-19 12:00:00")
+        settle_due_cycles(self.conn,"2026-09-15 12:00:00")
+        self.assertEqual(self._business_state()["deduct_count"],0)
+        settle_due_cycles(self.conn,"2026-09-19 12:00:00")
+        self.assertEqual(self._business_state()["deduct_count"],1)
+
+    def test_recovery_after_consultation_restarts_even_when_business_status_already_saved(self) -> None:
+        self._add_record("2026-09-01 12:00:00")
+        process_status_change(self.conn,member_id=1,group_area="蜂巢",status="已质询",
+            effective_at="2026-09-02 12:00:00",idempotency_key="synthetic-consult")
+        self.conn.execute("UPDATE member_group_states SET status='正常'")
+        process_status_change(self.conn,member_id=1,group_area="蜂巢",status="正常",
+            effective_at="2026-09-05 12:00:00",idempotency_key="synthetic-normal-saved")
+        self.assertEqual(self._cycle()["cycle_type"],"normal")
+        self.assertEqual(self._cycle()["start_at"],"2026-09-05 12:00:00")
+
+    def test_zero_count_recovery_does_not_create_empty_cycle(self) -> None:
+        process_status_change(self.conn,member_id=1,group_area="蜂巢",status="已退群",
+            effective_at="2026-09-02 12:00:00",idempotency_key="synthetic-zero-left")
+        process_status_change(self.conn,member_id=1,group_area="蜂巢",status="正常",
+            effective_at="2026-09-05 12:00:00",idempotency_key="synthetic-zero-return")
+        self.assertIsNone(self._cycle())
+        self.assertEqual(self._policy_state()["no_cycle_reason"],"zero_count")
+
+    def test_repeated_normal_status_does_not_extend_recovered_cycle(self) -> None:
+        self.test_normal_recovery_restarts_from_recovery_day()
+        # Start another nonzero sequence after the first completed naturally.
+        self._add_record("2026-09-21 12:00:00")
+        original=self._cycle()["id"]
+        process_status_change(self.conn,member_id=1,group_area="蜂巢",status="正常",
+            effective_at="2026-09-22 12:00:00",idempotency_key="synthetic-normal-again")
+        self.assertEqual(self._cycle()["id"],original)
+
+    def test_conflicting_backfill_preserves_manual_clear_and_isolates_member(self) -> None:
+        self._set_baseline_adjustment(2)
+        start_manual_stop(self.conn,member_id=1,group_area="蜂巢",effective_at="2026-01-01 00:00:00",
+            reason="合成减停",idempotency_key="synthetic-stop")
+        self._add_record("2026-01-10 00:00:00")
+        settle_due_cycles(self.conn,"2026-01-31 00:00:00")
+        decision=clear_manual_stop(self.conn,member_id=1,group_area="蜂巢",effective_at="2026-02-02 00:00:00",
+            reason="合成清除",idempotency_key="synthetic-clear")
+        cycle=dict(self._cycle())
+        deducted=self._business_state()["deduct_count"]
+        record_id=self._raw_record(1,"蜂巢","2026-01-11 00:00:00")
+        self.conn.execute("UPDATE violation_records SET action='禁言2小时' WHERE id=?",(record_id,))
+        process_violation_record(self.conn,record_id,ingest_time="2026-02-03 00:00:00")
+        self.assertEqual(self._business_state()["deduct_count"],deducted)
+        self.assertEqual(dict(self._cycle()),cycle)
+        original=self.conn.execute("SELECT is_effective FROM v102_policy_events WHERE id=?",(decision.event_id,)).fetchone()
+        self.assertEqual(original[0],1)
+        self.assertEqual(self._policy_state()["pending_action_type"],"replay_review")
+        self._other_member()
+        other_id=self._raw_record(2,"蜂窝","2026-02-03 00:00:00")
+        process_violation_record(self.conn,other_id,ingest_time="2026-02-03 00:00:00")
+        settle_due_cycles(self.conn,"2026-03-01 00:00:00")
+        self.assertEqual(self._business_state()["deduct_count"],deducted)
+        self.assertEqual(self.conn.execute("SELECT deduct_count FROM member_group_states WHERE member_id=2").fetchone()[0],1)
+        process_violation_record(self.conn,record_id,ingest_time="2026-03-01 00:00:00")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM v102_pending_actions WHERE action_type='replay_review' AND status='pending'").fetchone()[0],1)
+        with self.assertRaisesRegex(ValueError,"复核"):
+            start_manual_stop(self.conn,member_id=1,group_area="蜂巢",effective_at="2026-03-01 00:00:00",
+                reason="不能覆盖待办",idempotency_key="synthetic-blocked-stop")
+        withdraw_violation_record(self.conn,record_id,effective_at="2026-03-01 00:01:00",reason="撤回合成补录")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM v102_pending_actions WHERE action_type='replay_review' AND status='pending'").fetchone()[0],0)
+
 
 
 class PolicyNotificationReliabilityTests(unittest.TestCase):
