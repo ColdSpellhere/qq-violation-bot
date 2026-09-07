@@ -27,6 +27,7 @@ from .rules import (
     normalize_literal_text,
 )
 from .outbox import AlertOutbox, event_identity
+from .person_profiles import PersonProfileIndex
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _FUTURE_EVENT_TOLERANCE_SECONDS = 60
@@ -107,6 +108,15 @@ class ContentAlertService:
         self._rule_store = rule_store
         self._background_rule_store = background_rule_store
         self._managed_catalog = managed_catalog
+        try:
+            self._person_profiles = PersonProfileIndex.load(
+                rule_store.path.with_name("person_profiles.json")
+            )
+        except FileNotFoundError:
+            self._person_profiles = PersonProfileIndex()
+        except (OSError, ValueError, TypeError, KeyError):
+            logger.warning("content_alert person profiles unavailable; using pending descriptions")
+            self._person_profiles = PersonProfileIndex()
         self._source_group_labels = {
             int(group_id): str(label)
             for group_id, label in source_group_labels.items()
@@ -445,6 +455,7 @@ class ContentAlertService:
                 strict_hidden=strict_hidden,
                 political_alert=political_alert,
                 max_chars=match_budget,
+                person_profiles=self._person_profiles,
             )
         )
         return "\n".join(
@@ -559,6 +570,7 @@ def _render_matches(
     strict_hidden: bool,
     political_alert: bool = False,
     max_chars: int | None = None,
+    person_profiles: PersonProfileIndex | None = None,
 ) -> str:
     if strict_hidden:
         # Constant wording prevents a protected hit from leaking a manual
@@ -605,6 +617,17 @@ def _render_matches(
         )
         context_term = _one_line(str(getattr(item, "context_term", "")), limit=64)
         context_class = str(getattr(item, "context_class", ""))
+        introduction = ""
+        if (
+            "political_cn" in getattr(item, "category_ids", ())
+            and getattr(item, "subject_type", "") == "leader_name"
+        ):
+            profile = person_profiles.lookup(item) if person_profiles is not None else None
+            introduction = (
+                f"；词库人物简介（仅姓名匹配）：任职：{profile.offices}；公开履历：{profile.activities}"
+                if profile is not None
+                else "；词库人物简介：待补充（资料未核实或同名身份待确认）"
+            )
         key = (term, category_names, context_term, context_class)
         if not term or not category_names or key in seen_managed:
             continue
@@ -623,11 +646,12 @@ def _render_matches(
                 (
                     "managed",
                     "省部级及以上姓名+"
-                    + f"{_CONTEXT_CLASS_LABELS[context_class]}：{term} / {context_term}",
+                    + f"{_CONTEXT_CLASS_LABELS[context_class]}：{term} / {context_term}"
+                    + introduction,
                 )
             )
         else:
-            target.append(("managed", f"{'/'.join(category_names)}：{term}"))
+            target.append(("managed", f"{'/'.join(category_names)}：{term}{introduction}"))
     omitted_managed = len(managed_matches) - len(displayed_managed_matches)
     return _fit_rendered_match_items(
         (
