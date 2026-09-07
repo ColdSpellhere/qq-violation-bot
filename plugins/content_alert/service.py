@@ -114,7 +114,7 @@ class ContentAlertService:
             )
         except FileNotFoundError:
             self._person_profiles = PersonProfileIndex()
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
             logger.warning("content_alert person profiles unavailable; using pending descriptions")
             self._person_profiles = PersonProfileIndex()
         self._source_group_labels = {
@@ -624,7 +624,7 @@ def _render_matches(
         ):
             profile = person_profiles.lookup(item) if person_profiles is not None else None
             introduction = (
-                f"；词库人物简介（仅姓名匹配）：任职：{profile.offices}；公开履历：{profile.activities}"
+                f"；词库人物简介（仅姓名匹配）：{profile.describe()}"
                 if profile is not None
                 else "；词库人物简介：待补充（资料未核实或同名身份待确认）"
             )
